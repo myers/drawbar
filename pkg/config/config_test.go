@@ -126,3 +126,75 @@ func TestValidate(t *testing.T) {
 	cfg.Runner.Labels = nil
 	assert.Error(t, cfg.Validate(), "should fail without labels")
 }
+
+func TestValidate_Capacity(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.Capacity = 0
+	assert.ErrorContains(t, cfg.Validate(), "capacity")
+}
+
+func TestValidate_FetchInterval(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.FetchInterval = 10 * time.Millisecond
+	assert.ErrorContains(t, cfg.Validate(), "fetch_interval")
+}
+
+func TestValidate_FetchTimeout(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.FetchTimeout = 1 * time.Millisecond // less than fetch_interval
+	assert.ErrorContains(t, cfg.Validate(), "fetch_timeout")
+}
+
+func TestValidate_Timeout(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.Timeout = 30 * time.Second
+	assert.ErrorContains(t, cfg.Validate(), "timeout")
+}
+
+func TestValidate_CacheDir(t *testing.T) {
+	cfg := validConfig()
+	cfg.Cache.Enabled = true
+	cfg.Cache.Dir = ""
+	assert.ErrorContains(t, cfg.Validate(), "cache.dir")
+}
+
+func TestValidate_SnapshotClass(t *testing.T) {
+	cfg := validConfig()
+	cfg.Snapshot.Enabled = true
+	cfg.Snapshot.Class = ""
+	assert.ErrorContains(t, cfg.Validate(), "snapshot.class")
+}
+
+func TestValidate_SnapshotStorageClass(t *testing.T) {
+	cfg := validConfig()
+	cfg.Snapshot.Enabled = true
+	cfg.Snapshot.Class = "zfs"
+	cfg.Snapshot.StorageClass = ""
+	assert.ErrorContains(t, cfg.Validate(), "snapshot.storage_class")
+}
+
+func TestValidate_SnapshotRetention(t *testing.T) {
+	cfg := validConfig()
+	cfg.Snapshot.Enabled = true
+	cfg.Snapshot.Class = "zfs"
+	cfg.Snapshot.StorageClass = "openebs-zfs"
+	cfg.Snapshot.RetentionDays = 0
+	assert.ErrorContains(t, cfg.Validate(), "retention_days")
+}
+
+func TestValidate_LogLevel(t *testing.T) {
+	cfg := validConfig()
+	cfg.Log.Level = "trace"
+	assert.ErrorContains(t, cfg.Validate(), "log.level")
+
+	for _, level := range []string{"debug", "info", "warn", "error"} {
+		cfg.Log.Level = level
+		assert.NoError(t, cfg.Validate(), "level %q should be valid", level)
+	}
+}
+
+func validConfig() *Config {
+	cfg := Default()
+	cfg.Server.URL = "http://localhost:3000"
+	return cfg
+}

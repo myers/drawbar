@@ -141,14 +141,56 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// Validate checks that required fields are set.
+// Validate checks that required fields are set and values are sane.
 func (c *Config) Validate() error {
+	// Server.
 	if c.Server.URL == "" {
 		return fmt.Errorf("server.url is required (set via config or SERVER_URL)")
 	}
+
+	// Runner.
 	if len(c.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must have at least one entry")
 	}
+	if c.Runner.Capacity < 1 {
+		return fmt.Errorf("runner.capacity must be >= 1 (got %d)", c.Runner.Capacity)
+	}
+	if c.Runner.FetchInterval < 100*time.Millisecond {
+		return fmt.Errorf("runner.fetch_interval must be >= 100ms (got %s)", c.Runner.FetchInterval)
+	}
+	if c.Runner.FetchTimeout < c.Runner.FetchInterval {
+		return fmt.Errorf("runner.fetch_timeout (%s) must be >= fetch_interval (%s)", c.Runner.FetchTimeout, c.Runner.FetchInterval)
+	}
+	if c.Runner.Timeout < 1*time.Minute {
+		return fmt.Errorf("runner.timeout must be >= 1m (got %s)", c.Runner.Timeout)
+	}
+
+	// Cache.
+	if c.Cache.Enabled && c.Cache.Dir == "" {
+		return fmt.Errorf("cache.dir is required when cache is enabled")
+	}
+
+	// Snapshot.
+	if c.Snapshot.Enabled {
+		if c.Snapshot.Class == "" {
+			return fmt.Errorf("snapshot.class is required when snapshot caching is enabled")
+		}
+		if c.Snapshot.StorageClass == "" {
+			return fmt.Errorf("snapshot.storage_class is required when snapshot caching is enabled")
+		}
+		if c.Snapshot.RetentionDays < 1 {
+			return fmt.Errorf("snapshot.retention_days must be >= 1 (got %d)", c.Snapshot.RetentionDays)
+		}
+	}
+
+	// Log.
+	switch c.Log.Level {
+	case "debug", "info", "warn", "error":
+		// valid
+	default:
+		return fmt.Errorf("log.level must be one of: debug, info, warn, error (got %q)", c.Log.Level)
+	}
+
 	return nil
 }
 
