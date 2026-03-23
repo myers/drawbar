@@ -1,0 +1,46 @@
+name: Build and Publish
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: moby/buildkit:buildx-stable-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: chaos-inc/buildkit-build@v1
+        with:
+          tags: fj.monoloco.net/${{ github.repository }}:test-${{ github.sha }}
+
+  push-image:
+    runs-on: ubuntu-latest
+    container: moby/buildkit:buildx-stable-1
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: chaos-inc/buildkit-build@v1
+        with:
+          tags: fj.monoloco.net/${{ github.repository }}:latest
+          push: true
+          build-args: |
+            VERSION=${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
+
+  push-helm:
+    runs-on: ubuntu-latest
+    container: alpine/helm:3.17.3
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push Helm chart
+        run: |
+          mkdir -p ~/.config/helm/registry
+          AUTH=$(echo -n "${REGISTRY_USER}:${REGISTRY_TOKEN}" | base64)
+          echo "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"${AUTH}\"}}}" > ~/.config/helm/registry/config.json
+          helm package deploy/helm/drawbar
+          helm push drawbar-*.tgz oci://fj.monoloco.net/chaos-inc

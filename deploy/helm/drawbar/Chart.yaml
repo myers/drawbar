@@ -1,0 +1,5 @@
+apiVersion: v2
+name: drawbar
+version: 0.1.0
+appVersion: "dev"
+description: Kubernetes-native CI runner for Gitea/Forgejo Actions — no DinD

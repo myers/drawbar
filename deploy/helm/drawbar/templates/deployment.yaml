@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "drawbar.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: drawbar
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: drawbar
+  template:
+    metadata:
+      labels:
+        app: drawbar
+    spec:
+      serviceAccountName: {{ include "drawbar.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/config/config.yaml
+            - --job-namespace={{ include "drawbar.jobNamespace" . }}
+            - --secret-name={{ include "drawbar.fullname" . }}-credentials
+          env:
+            - name: CONTROLLER_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            {{- if .Values.server.registrationToken }}
+            - name: SERVER_REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "drawbar.fullname" . }}-registration
+                  key: token
+            {{- end }}
+            {{- if .Values.cache.enabled }}
+            - name: CACHE_SERVICE_NAME
+              value: "{{ include "drawbar.fullname" . }}-cache"
+            - name: CACHE_PVC_NAME
+              value: "{{ include "drawbar.fullname" . }}-cache"
+            {{- end }}
+          ports:
+            - containerPort: 8081
+              name: health
+          {{- if .Values.cache.enabled }}
+            - containerPort: {{ .Values.cache.port }}
+              name: cache
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- if .Values.cache.enabled }}
+            - name: cache
+              mountPath: {{ .Values.cache.dir }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "drawbar.fullname" . }}-config
+        {{- if .Values.cache.enabled }}
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ include "drawbar.fullname" . }}-cache
+        {{- end }}

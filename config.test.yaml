@@ -1,0 +1,16 @@
+server:
+  url: http://localhost:9080
+  registration_token: HdVkzDPvCCgJdPjS7qIb1xgdvwYG3otMOSF8dIFZ
+
+runner:
+  name: k8s-runner-test
+  labels:
+    - "ubuntu-latest:docker://node:22-bookworm"
+  capacity: 1
+  fetch_interval: 2s
+  fetch_timeout: 30s
+  timeout: 5m
+  git_clone_url: http://gitea.gitea.svc:80
+
+log:
+  level: info

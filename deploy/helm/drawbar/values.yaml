@@ -1,0 +1,49 @@
+image:
+  repository: fj.monoloco.net/chaos-inc/drawbar
+  tag: latest
+  pullPolicy: IfNotPresent
+
+server:
+  url: ""
+  registrationToken: ""
+  insecure: false
+
+runner:
+  name: k8s-runner
+  labels:
+    - "ubuntu-latest:docker://node:24-trixie"
+  capacity: 1
+  fetchInterval: 2s
+  fetchTimeout: 30s
+  timeout: 30m
+  gitCloneUrl: ""  # defaults to server.url
+  jobNamespace: ""  # defaults to release namespace
+
+  # K8s secrets to mount into job pods (e.g., BuildKit TLS certs)
+  jobSecrets: []
+  # - name: buildkit-client-certs
+  #   mountPath: /certs
+  # - name: registry-creds  # no mountPath = inject as env vars
+
+cache:
+  enabled: true
+  storage: 5Gi
+  port: 9300
+  dir: /cache
+
+log:
+  level: info
+
+serviceAccount:
+  create: true
+  name: ""
+
+rbac:
+  create: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi

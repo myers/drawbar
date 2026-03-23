@@ -1,0 +1,16 @@
+{{- if .Values.cache.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "drawbar.fullname" . }}-cache
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: drawbar
+spec:
+  selector:
+    app: drawbar
+  ports:
+    - port: {{ .Values.cache.port }}
+      targetPort: {{ .Values.cache.port }}
+      name: cache
+{{- end }}

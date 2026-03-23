@@ -1,0 +1,65 @@
+{{- if .Values.rbac.create }}
+# Role for credential storage in the controller namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "drawbar.fullname" . }}-credentials
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "drawbar.fullname" . }}-credentials
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "drawbar.fullname" . }}-credentials
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "drawbar.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Role for job execution in the job namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "drawbar.fullname" . }}-jobs
+  namespace: {{ include "drawbar.jobNamespace" . }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # pods/exec is used by k8s.WatchJob to read the entrypoint's state.jsonl
+  # from inside the runner container for real-time step lifecycle tracking.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "drawbar.fullname" . }}-jobs
+  namespace: {{ include "drawbar.jobNamespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "drawbar.fullname" . }}-jobs
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "drawbar.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
