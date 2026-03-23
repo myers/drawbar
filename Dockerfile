@@ -22,6 +22,9 @@ RUN CGO_ENABLED=0 go build \
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+# Optional CA cert for MITM proxy environments (glob matches nothing if file absent)
+COPY mitmproxy-ca-cert.cr[t] /usr/local/share/ca-certificates/
+RUN update-ca-certificates 2>/dev/null || true
 RUN useradd -u 1000 -m runner
 COPY --from=builder /out/controller /controller
 COPY --from=builder /out/entrypoint /entrypoint

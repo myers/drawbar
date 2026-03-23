@@ -103,7 +103,8 @@ func (c *CheckoutSpec) ToStepSpecs() []types.StepSpec {
 
 	cloneURL := c.buildCloneURL()
 
-	// Step 1: git clone (all values passed as args, not shell-interpolated).
+	// Step 1: git clone. Workspace is always emptyDir (ZFS snapshot cache
+	// only bind-mounts specific paths like target/, not the whole workspace).
 	cloneArgs := []string{"git", "clone"}
 	if c.FetchDepth > 0 {
 		cloneArgs = append(cloneArgs, fmt.Sprintf("--depth=%d", c.FetchDepth))
@@ -119,10 +120,8 @@ func (c *CheckoutSpec) ToStepSpecs() []types.StepSpec {
 	})
 
 	// Step 2: fetch specific SHA and checkout.
-	// For shallow clones, the SHA may not be in the initial clone. Fetch it
-	// into FETCH_HEAD and check that out, since a direct `git checkout <sha>`
-	// fails on shallow clones even after fetching (the object is only in
-	// FETCH_HEAD, not reachable from local refs).
+	// For shallow clones, the SHA may not be the branch tip. Fetch it into
+	// FETCH_HEAD and check that out.
 	if c.SHA != "" && c.FetchDepth > 0 {
 		specs = append(specs, types.StepSpec{
 			Name: "Checkout: fetch",
@@ -150,3 +149,4 @@ func (c *CheckoutSpec) buildCloneURL() string {
 	// Never embed the token in the URL — use GIT_ASKPASS instead.
 	return fmt.Sprintf("%s/%s.git", c.ServerURL, c.Repository)
 }
+

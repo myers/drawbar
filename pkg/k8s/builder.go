@@ -45,8 +45,9 @@ type JobConfig struct {
 	Timeout          int64  // ActiveDeadlineSeconds
 	CachePVCName     string // PVC for action cache (empty = skip)
 	JobSecrets       []JobSecretMount // k8s Secrets to mount into job pods
-	EvalContext      *types.EvalContext // evaluation context for runtime if: conditions
-	WorkspacePVCName string // if set, use PVC instead of emptyDir for /workspace
+	EvalContext       *types.EvalContext // evaluation context for runtime if: conditions
+	SnapshotPVCName  string   // PVC for ZFS snapshot cache (empty = disabled)
+	SnapshotPaths    []string // paths to bind-mount from snapshot PVC into /workspace (e.g., "target", "node_modules")
 }
 
 // BuildJob creates a k8s Job with the single-container architecture.
@@ -81,18 +82,22 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		return nil, fmt.Errorf("marshaling manifest: %w", err)
 	}
 
-	// Volumes.
-	workspaceVol := corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
-	if cfg.WorkspacePVCName != "" {
-		workspaceVol = corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: cfg.WorkspacePVCName,
-			},
-		}
-	}
+	// Volumes. Workspace is always emptyDir (fresh clone each job).
 	volumes := []corev1.Volume{
-		{Name: "workspace", VolumeSource: workspaceVol},
+		{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: "shim", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	}
+
+	// ZFS snapshot cache PVC — bind-mount declared paths into /workspace.
+	if cfg.SnapshotPVCName != "" && len(cfg.SnapshotPaths) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: "snapshot-cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: cfg.SnapshotPVCName,
+				},
+			},
+		})
 	}
 
 	// Action cache PVC (if any steps use actions).
@@ -200,14 +205,27 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		{Name: "shim", MountPath: "/shim"},
 	}
 
-	// Add subPath mounts for each action.
+	// Add subPath mounts for each unique action directory.
+	mountedActions := make(map[string]bool)
 	for _, step := range cfg.Steps {
-		if step.ActionDir != "" && cfg.CachePVCName != "" {
+		if step.ActionDir != "" && cfg.CachePVCName != "" && !mountedActions[step.ActionDir] {
+			mountedActions[step.ActionDir] = true
 			runnerMounts = append(runnerMounts, corev1.VolumeMount{
 				Name:      "actions-cache",
 				MountPath: "/actions/" + step.ActionDir,
 				SubPath:   "actions-repo-cache/" + step.ActionDir,
 				ReadOnly:  true,
+			})
+		}
+	}
+
+	// Add snapshot cache bind mounts into /workspace.
+	for _, cachePath := range cfg.SnapshotPaths {
+		if cfg.SnapshotPVCName != "" {
+			runnerMounts = append(runnerMounts, corev1.VolumeMount{
+				Name:      "snapshot-cache",
+				MountPath: "/workspace/" + cachePath,
+				SubPath:   cachePath,
 			})
 		}
 	}

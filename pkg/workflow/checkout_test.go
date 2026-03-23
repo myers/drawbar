@@ -126,26 +126,23 @@ func TestCheckoutSpec_ToStepSpecs_WithToken(t *testing.T) {
 	steps := spec.ToStepSpecs()
 	require.Len(t, steps, 3) // clone, fetch, checkout
 
-	// Clone step uses structured args (no shell injection possible).
-	cloneStep := steps[0]
-	assert.Equal(t, "Checkout: clone", cloneStep.Name)
-	assert.Contains(t, cloneStep.Args, "git")
-	assert.Contains(t, cloneStep.Args, "--depth=1")
-	assert.Contains(t, cloneStep.Args, "--branch=main")
-	assert.Contains(t, cloneStep.Args, "http://gitea.svc/owner/repo.git")
-	// Token must NOT appear in the clone URL.
-	for _, arg := range cloneStep.Args {
+	// Clone step.
+	assert.Equal(t, "Checkout: clone", steps[0].Name)
+	assert.Contains(t, steps[0].Args, "--depth=1")
+	assert.Contains(t, steps[0].Args, "--branch=main")
+	assert.Contains(t, steps[0].Args, "http://gitea.svc/owner/repo.git")
+	// Token NOT in clone URL.
+	for _, arg := range steps[0].Args {
 		assert.NotContains(t, arg, "mytoken")
 	}
-	// Token delivered via GIT_ASKPASS env var.
-	assert.Equal(t, "/shim/askpass.sh", cloneStep.Env["GIT_ASKPASS"])
-	assert.Equal(t, "mytoken", cloneStep.Env["GIT_AUTH_TOKEN"])
+	assert.Equal(t, "/shim/askpass.sh", steps[0].Env["GIT_ASKPASS"])
+	assert.Equal(t, "mytoken", steps[0].Env["GIT_AUTH_TOKEN"])
 
-	// Fetch step.
+	// Fetch specific SHA.
 	assert.Equal(t, "Checkout: fetch", steps[1].Name)
 	assert.Equal(t, []string{"git", "-C", "/workspace", "fetch", "--depth=1", "origin", "--", "abc123"}, steps[1].Args)
 
-	// Checkout step (uses FETCH_HEAD for shallow clones).
+	// Checkout FETCH_HEAD.
 	assert.Equal(t, "Checkout: checkout", steps[2].Name)
 	assert.Equal(t, []string{"git", "-C", "/workspace", "checkout", "FETCH_HEAD"}, steps[2].Args)
 }
@@ -163,11 +160,9 @@ func TestCheckoutSpec_FullClone(t *testing.T) {
 	steps := spec.ToStepSpecs()
 	require.Len(t, steps, 2) // clone + checkout (no fetch for full clone)
 
-	// No --depth in clone args.
 	for _, arg := range steps[0].Args {
 		assert.NotContains(t, arg, "--depth")
 	}
-	// Direct checkout (no fetch needed for full clone).
 	assert.Equal(t, "Checkout: checkout", steps[1].Name)
 	assert.Equal(t, []string{"git", "-C", "/workspace", "checkout", "--", "abc123"}, steps[1].Args)
 }
@@ -184,7 +179,6 @@ func TestCheckoutSpec_NoToken(t *testing.T) {
 	require.Len(t, steps, 1) // clone only (no SHA)
 
 	assert.Contains(t, steps[0].Args, "http://gitea.svc/owner/repo.git")
-	// No GIT_ASKPASS when no token.
 	assert.Nil(t, steps[0].Env)
 }
 

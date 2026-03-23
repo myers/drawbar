@@ -677,15 +677,16 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		// Build evaluation context for runtime if: conditions.
 		evalCtx := buildEvalContext(task, parsed.Env)
 
-		// ZFS snapshot cache: look up or create workspace PVC.
-		workspacePVCName := ""
+		// ZFS snapshot cache: create PVC for cached paths (bind-mounted into /workspace).
+		snapshotPVCName := ""
 		var snapshotCacheKey string
+		var snapshotPaths []string
 		if cfg.SnapshotManager != nil {
-			snapshotCacheKey = extractCacheKey(steps, eval)
-			if snapshotCacheKey != "" {
+			snapshotCacheKey, snapshotPaths, restoreKeys := extractCacheInfo(steps)
+			if snapshotCacheKey != "" && len(snapshotPaths) > 0 {
 				repository := taskCtx["repository"].GetStringValue()
-				pvcName := fmt.Sprintf("ws-%d", task.GetId())
-				snap, err := cfg.SnapshotManager.FindSnapshot(ctx, repository, snapshotCacheKey)
+				pvcName := fmt.Sprintf("cache-%d", task.GetId())
+				snap, err := cfg.SnapshotManager.FindSnapshot(ctx, repository, snapshotCacheKey, restoreKeys)
 				if err != nil {
 					slog.Warn("snapshot lookup failed", "error", err)
 				}
@@ -695,9 +696,11 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 					_, err = cfg.SnapshotManager.CreateEmptyPVC(ctx, pvcName)
 				}
 				if err != nil {
-					slog.Warn("failed to create workspace PVC, falling back to emptyDir", "error", err)
+					slog.Warn("failed to create snapshot cache PVC", "error", err)
 				} else {
-					workspacePVCName = pvcName
+					snapshotPVCName = pvcName
+					slog.Info("snapshot cache PVC ready", "pvc", pvcName, "paths", snapshotPaths,
+						"restored", snap != nil)
 				}
 			}
 		}
@@ -716,7 +719,8 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			CachePVCName:     jobCachePVCName,
 			JobSecrets:       secretMounts,
 			EvalContext:      evalCtx,
-			WorkspacePVCName: workspacePVCName,
+			SnapshotPVCName:  snapshotPVCName,
+			SnapshotPaths:    snapshotPaths,
 		})
 		if err != nil {
 			slog.Error("failed to build k8s job", "error", err)
@@ -756,16 +760,20 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		}
 
 		// ZFS snapshot cache: snapshot on success, always delete PVC.
-		if workspacePVCName != "" && cfg.SnapshotManager != nil {
+		if snapshotPVCName != "" && cfg.SnapshotManager != nil {
 			if result == runnerv1.Result_RESULT_SUCCESS && snapshotCacheKey != "" {
 				repository := taskCtx["repository"].GetStringValue()
 				snapName := fmt.Sprintf("snap-%d", task.GetId())
-				if _, err := cfg.SnapshotManager.SnapshotPVC(ctx, workspacePVCName, snapName, repository, snapshotCacheKey); err != nil {
-					slog.Warn("failed to snapshot workspace", "error", err)
+				if _, err := cfg.SnapshotManager.SnapshotPVC(ctx, snapshotPVCName, snapName, repository, snapshotCacheKey); err != nil {
+					slog.Warn("failed to snapshot cache", "error", err)
+				} else {
+					if err := cfg.SnapshotManager.WaitForSnapshot(ctx, snapName); err != nil {
+						slog.Warn("snapshot not ready", "error", err)
+					}
 				}
 			}
-			if err := cfg.SnapshotManager.DeletePVC(ctx, workspacePVCName); err != nil {
-				slog.Warn("failed to delete workspace PVC", "error", err)
+			if err := cfg.SnapshotManager.DeletePVC(ctx, snapshotPVCName); err != nil {
+				slog.Warn("failed to delete cache PVC", "error", err)
 			}
 		}
 
@@ -873,18 +881,43 @@ func convertJobSecrets(secrets []config.JobSecret) []k8s.JobSecretMount {
 	return mounts
 }
 
-// extractCacheKey finds the cache key from actions/cache steps in the workflow.
-// Returns empty string if no cache step is found.
-func extractCacheKey(steps []types.StepSpec, eval *expressions.Evaluator) string {
+// extractCacheInfo finds the cache key, paths, and restore-keys from cache steps.
+// Returns empty key if no cache step found. Paths are relative to /workspace.
+func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, restoreKeys []string) {
+	seen := make(map[string]bool)
 	for _, step := range steps {
-		// The step name for actions/cache typically contains "actions/cache".
-		// But we can't rely on the name since it's been transformed.
-		// Instead, check the env for INPUT_KEY which is set by buildActionEnv.
-		if key, ok := step.Env["INPUT_KEY"]; ok && key != "" {
-			return key
+		k, ok := step.Env["INPUT_KEY"]
+		if !ok || k == "" {
+			continue
+		}
+		if key == "" {
+			key = k
+		}
+		// INPUT_PATH may contain multiple paths separated by newlines.
+		if p, ok := step.Env["INPUT_PATH"]; ok && p != "" {
+			for _, entry := range strings.Split(p, "\n") {
+				entry = strings.TrimSpace(entry)
+				// Sanitize: must be relative, no traversal.
+				if entry == "" || strings.HasPrefix(entry, "/") || strings.Contains(entry, "..") {
+					continue
+				}
+				if !seen[entry] {
+					seen[entry] = true
+					paths = append(paths, entry)
+				}
+			}
+		}
+		// INPUT_RESTORE-KEYS: one prefix per line.
+		if rk, ok := step.Env["INPUT_RESTORE-KEYS"]; ok && rk != "" {
+			for _, entry := range strings.Split(rk, "\n") {
+				entry = strings.TrimSpace(entry)
+				if entry != "" {
+					restoreKeys = append(restoreKeys, entry)
+				}
+			}
 		}
 	}
-	return ""
+	return key, paths, restoreKeys
 }
 
 // parseTimeoutMinutes converts a string timeout-minutes value to float64.

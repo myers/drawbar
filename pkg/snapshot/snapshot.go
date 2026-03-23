@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
@@ -47,7 +48,37 @@ func HashCacheKey(key string) string {
 }
 
 // FindSnapshot looks up the most recent VolumeSnapshot matching a repo + cache key.
-func (m *Manager) FindSnapshot(ctx context.Context, repo, cacheKey string) (*snapshotv1.VolumeSnapshot, error) {
+// If no exact match, tries each restoreKey prefix in order (most recent snapshot
+// whose raw cache key starts with the prefix).
+func (m *Manager) FindSnapshot(ctx context.Context, repo, cacheKey string, restoreKeys []string) (*snapshotv1.VolumeSnapshot, error) {
+	// Try exact match first (fast — uses label selector on hashed key).
+	snap, err := m.findByExactKey(ctx, repo, cacheKey)
+	if err != nil {
+		return nil, err
+	}
+	if snap != nil {
+		slog.Info("snapshot cache hit (exact)", "snapshot", snap.Name, "key", cacheKey)
+		return snap, nil
+	}
+
+	// Try restore-keys prefix match (slower — lists all snapshots for the repo).
+	if len(restoreKeys) > 0 {
+		snap, matchedKey, err := m.findByPrefix(ctx, repo, restoreKeys)
+		if err != nil {
+			return nil, err
+		}
+		if snap != nil {
+			slog.Info("snapshot cache hit (restore-key)", "snapshot", snap.Name,
+				"matched_prefix", matchedKey,
+				"original_key", snap.Annotations[annotationKeyRaw])
+			return snap, nil
+		}
+	}
+
+	return nil, nil // cache miss
+}
+
+func (m *Manager) findByExactKey(ctx context.Context, repo, cacheKey string) (*snapshotv1.VolumeSnapshot, error) {
 	selector := fmt.Sprintf("%s=%s,%s=%s,%s=%s",
 		labelManagedBy, managerName,
 		labelRepository, sanitizeLabelValue(repo),
@@ -60,21 +91,56 @@ func (m *Manager) FindSnapshot(ctx context.Context, repo, cacheKey string) (*sna
 	if err != nil {
 		return nil, fmt.Errorf("listing snapshots: %w", err)
 	}
+	return newestSnapshot(list.Items), nil
+}
 
-	if len(list.Items) == 0 {
-		return nil, nil // cache miss
+func (m *Manager) findByPrefix(ctx context.Context, repo string, prefixes []string) (*snapshotv1.VolumeSnapshot, string, error) {
+	// List all snapshots for this repo.
+	selector := fmt.Sprintf("%s=%s,%s=%s",
+		labelManagedBy, managerName,
+		labelRepository, sanitizeLabelValue(repo),
+	)
+
+	list, err := m.SnapshotClient.SnapshotV1().VolumeSnapshots(m.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("listing snapshots for prefix match: %w", err)
 	}
 
-	// Return the most recently created snapshot.
-	latest := &list.Items[0]
-	for i := range list.Items {
-		if list.Items[i].CreationTimestamp.After(latest.CreationTimestamp.Time) {
-			latest = &list.Items[i]
+	// Try each prefix in order (first match wins).
+	for _, prefix := range prefixes {
+		prefix = strings.TrimSpace(prefix)
+		if prefix == "" {
+			continue
+		}
+		var best *snapshotv1.VolumeSnapshot
+		for i := range list.Items {
+			raw := list.Items[i].Annotations[annotationKeyRaw]
+			if strings.HasPrefix(raw, prefix) {
+				if best == nil || list.Items[i].CreationTimestamp.After(best.CreationTimestamp.Time) {
+					best = &list.Items[i]
+				}
+			}
+		}
+		if best != nil {
+			return best, prefix, nil
 		}
 	}
+	return nil, "", nil
+}
 
-	slog.Info("found cached snapshot", "snapshot", latest.Name, "repo", repo, "cache_key", cacheKey)
-	return latest, nil
+func newestSnapshot(items []snapshotv1.VolumeSnapshot) *snapshotv1.VolumeSnapshot {
+	if len(items) == 0 {
+		return nil
+	}
+	latest := &items[0]
+	for i := range items {
+		if items[i].CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = &items[i]
+		}
+	}
+	return latest
 }
 
 // CreatePVCFromSnapshot creates a PVC backed by a VolumeSnapshot (ZFS clone).
@@ -167,6 +233,27 @@ func (m *Manager) SnapshotPVC(ctx context.Context, pvcName, snapshotName, repo, 
 	}
 	slog.Info("created workspace snapshot", "snapshot", snapshotName, "pvc", pvcName, "repo", repo)
 	return created, nil
+}
+
+// WaitForSnapshot polls until the snapshot's readyToUse is true or the context is cancelled.
+func (m *Manager) WaitForSnapshot(ctx context.Context, name string) error {
+	for {
+		snap, err := m.SnapshotClient.SnapshotV1().VolumeSnapshots(m.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("getting snapshot %s: %w", name, err)
+		}
+		if snap.Status != nil && snap.Status.ReadyToUse != nil && *snap.Status.ReadyToUse {
+			return nil
+		}
+		if snap.Status != nil && snap.Status.Error != nil && snap.Status.Error.Message != nil {
+			return fmt.Errorf("snapshot %s failed: %s", name, *snap.Status.Error.Message)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // DeletePVC deletes a workspace PVC.

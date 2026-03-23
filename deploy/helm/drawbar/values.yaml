@@ -31,6 +31,13 @@ cache:
   port: 9300
   dir: /cache
 
+snapshot:
+  enabled: false
+  class: ""          # VolumeSnapshotClass name (e.g., "openebs-zfs-snapshot")
+  storageClass: ""   # StorageClass for PVCs from snapshots (e.g., "openebs-zfs")
+  size: "10Gi"       # Workspace PVC size
+  retentionDays: 7   # GC snapshots older than this
+
 log:
   level: info
 

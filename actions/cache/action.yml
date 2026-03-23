@@ -1,0 +1,15 @@
+name: 'Drawbar Cache'
+description: 'Declare paths for ZFS snapshot caching. Bind-mounted into /workspace by the drawbar controller — no upload/download needed.'
+inputs:
+  key:
+    description: 'Cache key. Exact match triggers a cache hit.'
+    required: true
+  path:
+    description: 'Paths to cache, relative to workspace. One per line.'
+    required: true
+  restore-keys:
+    description: 'Ordered list of prefix keys to fall back to if exact key misses. One per line.'
+    required: false
+runs:
+  using: 'sh'
+  main: 'main.sh'

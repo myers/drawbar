@@ -39,7 +39,7 @@ func TestHashCacheKey(t *testing.T) {
 
 func TestFindSnapshot_Miss(t *testing.T) {
 	m, _, _ := newTestManager()
-	snap, err := m.FindSnapshot(context.Background(), "myorg/myrepo", "some-key")
+	snap, err := m.FindSnapshot(context.Background(), "myorg/myrepo", "some-key", nil)
 	require.NoError(t, err)
 	assert.Nil(t, snap)
 }
@@ -62,7 +62,7 @@ func TestFindSnapshot_Hit(t *testing.T) {
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	snap, err := m.FindSnapshot(ctx, "myorg/myrepo", "my-cache-key")
+	snap, err := m.FindSnapshot(ctx, "myorg/myrepo", "my-cache-key", nil)
 	require.NoError(t, err)
 	require.NotNil(t, snap)
 	assert.Equal(t, "snap-1", snap.Name)

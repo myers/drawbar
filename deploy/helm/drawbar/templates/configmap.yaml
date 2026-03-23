@@ -30,5 +30,13 @@ data:
       enabled: {{ .Values.cache.enabled }}
       dir: {{ .Values.cache.dir | quote }}
       port: {{ .Values.cache.port }}
+    {{- if .Values.snapshot.enabled }}
+    snapshot:
+      enabled: true
+      class: {{ .Values.snapshot.class | quote }}
+      storage_class: {{ .Values.snapshot.storageClass | quote }}
+      size: {{ .Values.snapshot.size | quote }}
+      retention_days: {{ .Values.snapshot.retentionDays }}
+    {{- end }}
     log:
       level: {{ .Values.log.level | quote }}
