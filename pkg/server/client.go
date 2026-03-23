@@ -1,4 +1,4 @@
-// Adapted from code.forgejo.org/forgejo/runner internal/pkg/client/
+// Adapted from gitea.com/gitea/act_runner internal/pkg/client/
 // Original: Copyright 2022 The Gitea Authors. All rights reserved.
 // SPDX-License-Identifier: MIT
 
@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"code.forgejo.org/forgejo/actions-proto/ping/v1/pingv1connect"
-	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
+	"code.gitea.io/actions-proto-go/ping/v1/pingv1connect"
+	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
 	gouuid "github.com/google/uuid"
 )

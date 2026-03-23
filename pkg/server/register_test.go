@@ -12,9 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pingv1 "code.forgejo.org/forgejo/actions-proto/ping/v1"
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
-	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
+	pingv1 "code.gitea.io/actions-proto-go/ping/v1"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
 
 	corev1 "k8s.io/api/core/v1"

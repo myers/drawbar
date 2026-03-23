@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"code.forgejo.org/forgejo/runner/v12/act/exprparser"
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/exprparser"
+	"github.com/nektos/act/pkg/model"
 )
 
 // Evaluator wraps exprparser for evaluating GitHub Actions expressions.
@@ -18,7 +18,7 @@ type Evaluator struct {
 // NewEvaluator creates an evaluator from an EvaluationEnvironment.
 func NewEvaluator(env *exprparser.EvaluationEnvironment) *Evaluator {
 	return &Evaluator{
-		interp: exprparser.NewInterpreter(env, exprparser.Config{
+		interp: exprparser.NewInterpeter(env, exprparser.Config{
 			Context: "step", // Required for success()/failure()/cancelled() functions.
 		}),
 		env: env,
@@ -34,7 +34,7 @@ func (e *Evaluator) Interpolate(input string) string {
 	}
 
 	// Use RewriteSubExpression to handle mixed text + expressions.
-	expr := exprparser.RewriteSubExpression(input, true)
+	expr := rewriteSubExpression(input, true)
 	evaluated, err := e.interp.Evaluate(expr, exprparser.DefaultStatusCheckNone)
 	if err != nil {
 		slog.Warn("expression evaluation failed", "input", input, "error", err)
@@ -65,7 +65,7 @@ func (e *Evaluator) EvalCondition(expr string) (bool, error) {
 		expr = strings.TrimSpace(expr)
 	}
 
-	rewritten := exprparser.RewriteSubExpression(expr, false)
+	rewritten := rewriteSubExpression(expr, false)
 	evaluated, err := e.interp.Evaluate(rewritten, exprparser.DefaultStatusCheckSuccess)
 	if err != nil {
 		return false, fmt.Errorf("evaluating condition %q: %w", expr, err)

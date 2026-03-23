@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"connectrpc.com/connect"
 	gouuid "github.com/google/uuid"
 )
@@ -117,18 +117,10 @@ func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouu
 	*requestKey = gouuid.New()
 	*tasksVersion = resp.Msg.GetTasksVersion()
 
-	// Handle primary task.
+	// Handle task.
 	if task := resp.Msg.GetTask(); task != nil && task.GetId() != 0 {
 		p.log.Info("received task", "id", task.GetId())
 		p.dispatchTask(ctx, task)
-	}
-
-	// Handle additional tasks (multi-capacity).
-	for _, task := range resp.Msg.GetAdditionalTasks() {
-		if task != nil && task.GetId() != 0 {
-			p.log.Info("received additional task", "id", task.GetId())
-			p.dispatchTask(ctx, task)
-		}
 	}
 }
 

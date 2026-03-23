@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"github.com/myers/drawbar/pkg/reporter"
 	"github.com/myers/drawbar/pkg/types"
 	corev1 "k8s.io/api/core/v1"

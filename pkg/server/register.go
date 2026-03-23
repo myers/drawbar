@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
-	pingv1 "code.forgejo.org/forgejo/actions-proto/ping/v1"
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	pingv1 "code.gitea.io/actions-proto-go/ping/v1"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"connectrpc.com/connect"
 
 	corev1 "k8s.io/api/core/v1"

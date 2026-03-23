@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"code.forgejo.org/forgejo/runner/v12/act/model"
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	"github.com/nektos/act/pkg/model"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 )
 
 // ParsedJob contains the extracted job information from a task's workflow payload.
@@ -27,7 +27,7 @@ func ParseTask(task *runnerv1.Task) (*ParsedJob, error) {
 		return nil, fmt.Errorf("task %d has empty workflow payload", task.GetId())
 	}
 
-	workflow, err := model.ReadWorkflow(bytes.NewReader(task.GetWorkflowPayload()), true)
+	workflow, err := model.ReadWorkflow(bytes.NewReader(task.GetWorkflowPayload()))
 	if err != nil {
 		return nil, fmt.Errorf("parsing workflow: %w", err)
 	}

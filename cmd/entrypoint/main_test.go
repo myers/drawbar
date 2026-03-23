@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/model"
 	"github.com/myers/drawbar/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

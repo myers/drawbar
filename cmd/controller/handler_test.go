@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
-	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
 	"github.com/myers/drawbar/pkg/actions"
 	forgeserver "github.com/myers/drawbar/pkg/server"
 	"github.com/myers/drawbar/pkg/k8s"

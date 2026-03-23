@@ -1,8 +1,8 @@
 package types
 
 import (
-	"code.forgejo.org/forgejo/runner/v12/act/exprparser"
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/exprparser"
+	"github.com/nektos/act/pkg/model"
 )
 
 // StepSpec describes a single workflow step.

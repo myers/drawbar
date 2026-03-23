@@ -6,12 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"github.com/nektos/act/pkg/model"
 	"github.com/myers/drawbar/pkg/config"
 	"github.com/myers/drawbar/pkg/server"
 	"github.com/myers/drawbar/pkg/labels"
@@ -292,58 +291,20 @@ func TestNewLogrusLogger(t *testing.T) {
 
 func TestStartCacheServer(t *testing.T) {
 	cacheDir := t.TempDir()
-	credFile := filepath.Join(t.TempDir(), "creds.json")
-
-	store := &server.FileStore{Path: credFile}
-	// Pre-save registration so cache secret can be persisted.
-	require.NoError(t, store.Save(context.Background(), &server.Registration{
-		ID: 1, UUID: "uuid", Token: "tok", Address: "http://localhost",
-	}))
-
-	cfg := config.CacheConfig{
-		Enabled: true,
-		Dir:     cacheDir,
-		Port:    0, // let OS pick port
-	}
-
-	proxy, err := startCacheServer(cfg, store, context.Background())
-	require.NoError(t, err)
-	require.NotNil(t, proxy)
-
-	// Cache secret should have been generated and persisted.
-	reg, err := store.Load(context.Background())
-	require.NoError(t, err)
-	assert.NotEmpty(t, reg.CacheSecret, "cache secret should be persisted")
-
-	// Cache dir should have been created.
-	_, err = os.Stat(cacheDir)
-	assert.NoError(t, err)
-}
-
-func TestStartCacheServer_ExistingSecret(t *testing.T) {
-	cacheDir := t.TempDir()
-	credFile := filepath.Join(t.TempDir(), "creds.json")
-
-	store := &server.FileStore{Path: credFile}
-	require.NoError(t, store.Save(context.Background(), &server.Registration{
-		ID: 1, UUID: "uuid", Token: "tok", Address: "http://localhost",
-		CacheSecret: "pre-existing-secret-value-that-is-long-enough",
-	}))
-
 	cfg := config.CacheConfig{
 		Enabled: true,
 		Dir:     cacheDir,
 		Port:    0,
 	}
 
-	proxy, err := startCacheServer(cfg, store, context.Background())
+	handler, err := startCacheServer(cfg)
 	require.NoError(t, err)
-	require.NotNil(t, proxy)
+	require.NotNil(t, handler)
+	defer handler.Close()
 
-	// Secret should remain unchanged.
-	reg, err := store.Load(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, "pre-existing-secret-value-that-is-long-enough", reg.CacheSecret)
+	assert.NotEmpty(t, handler.ExternalURL())
+	_, err = os.Stat(cacheDir)
+	assert.NoError(t, err)
 }
 
 // --- setupLogging / parseLabels ---

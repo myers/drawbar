@@ -3,9 +3,9 @@ package expressions
 import (
 	"strings"
 
-	"code.forgejo.org/forgejo/runner/v12/act/exprparser"
-	"code.forgejo.org/forgejo/runner/v12/act/model"
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	"github.com/nektos/act/pkg/exprparser"
+	"github.com/nektos/act/pkg/model"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 )
 
 // BuildGithubContext extracts a GithubContext from the task's Context protobuf struct.

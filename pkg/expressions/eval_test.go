@@ -3,9 +3,9 @@ package expressions
 import (
 	"testing"
 
-	"code.forgejo.org/forgejo/runner/v12/act/exprparser"
-	"code.forgejo.org/forgejo/runner/v12/act/model"
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	"github.com/nektos/act/pkg/exprparser"
+	"github.com/nektos/act/pkg/model"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"

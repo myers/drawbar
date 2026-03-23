@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"connectrpc.com/connect"
 	gouuid "github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -62,29 +62,6 @@ func TestPoller_DispatchesTask(t *testing.T) {
 	p.Drain(time.Second)
 
 	assert.Equal(t, int64(42), handled.Load())
-}
-
-func TestPoller_AdditionalTasks(t *testing.T) {
-	var count atomic.Int64
-	handler := func(_ context.Context, _ *runnerv1.Task) {
-		count.Add(1)
-	}
-
-	mock := &mockPollerClient{
-		interval: 10 * time.Millisecond,
-		responses: []*runnerv1.FetchTaskResponse{{
-			Task:            &runnerv1.Task{Id: 1},
-			AdditionalTasks: []*runnerv1.Task{{Id: 2}, {Id: 3}},
-		}},
-	}
-
-	p := NewPoller(mock, handler, 3, time.Second, false, slog.Default())
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	p.Run(ctx)
-	p.Drain(time.Second)
-
-	assert.Equal(t, int64(3), count.Load())
 }
 
 func TestPoller_NoTask(t *testing.T) {

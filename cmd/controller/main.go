@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,12 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
-	"code.forgejo.org/forgejo/runner/v12/act/artifactcache"
-	"code.forgejo.org/forgejo/runner/v12/act/cacheproxy"
-	"code.forgejo.org/forgejo/runner/v12/act/exprparser"
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"github.com/nektos/act/pkg/artifactcache"
+	"github.com/nektos/act/pkg/exprparser"
 
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/model"
 
 	snapshotclient "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
 
@@ -179,13 +176,13 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	}
 
 	// Start cache server if enabled.
-	var cacheProxy *cacheproxy.Handler
+	var cacheHandler *artifactcache.Handler
 	if cfg.Cache.Enabled {
-		cacheProxy, err = startCacheServer(cfg.Cache, deps.store, ctx)
+		cacheHandler, err = startCacheServer(cfg.Cache)
 		if err != nil {
 			return fmt.Errorf("starting cache server: %w", err)
 		}
-		slog.Info("cache server started", "proxy_port", cfg.Cache.Port)
+		slog.Info("cache server started", "url", cacheHandler.ExternalURL())
 	}
 
 	// Set up action repo cache.
@@ -245,9 +242,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		GitCloneURL:      cfg.Runner.GitCloneURL,
 		ActionsURL:       cfg.Runner.ActionsURL,
 		ControllerImage:  cfg.Runner.ControllerImage,
-		CacheProxy:       cacheProxy,
-		CachePort:        cfg.Cache.Port,
-		CacheServiceName: cfg.Cache.ServiceName,
+		CacheHandler:     cacheHandler,
 		CachePVCName:     cfg.Cache.PVCName,
 		JobSecrets:       cfg.Runner.JobSecrets,
 		ActionCache:      actionCache,
@@ -357,62 +352,29 @@ func readyzHandler(registered *atomic.Bool) http.HandlerFunc {
 	}
 }
 
-func startCacheServer(cfg config.CacheConfig, store server.CredentialStore, ctx context.Context) (*cacheproxy.Handler, error) {
-	// Load or generate cache secret.
-	reg, err := store.Load(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("loading credentials for cache secret: %w", err)
-	}
-
-	secret := ""
-	if reg != nil {
-		secret = reg.CacheSecret
-	}
-	if secret == "" {
-		secretBytes := make([]byte, 64)
-		if _, err := rand.Read(secretBytes); err != nil {
-			return nil, fmt.Errorf("generating cache secret: %w", err)
-		}
-		secret = hex.EncodeToString(secretBytes)
-
-		// Persist the secret.
-		if reg != nil {
-			reg.CacheSecret = secret
-			if err := store.Save(ctx, reg); err != nil {
-				slog.Warn("failed to persist cache secret", "error", err)
-			}
-		}
-	}
-
-	// Ensure cache dir exists.
+func startCacheServer(cfg config.CacheConfig) (*artifactcache.Handler, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating cache dir %s: %w", cfg.Dir, err)
 	}
 
-	// Start internal cache server (BoltDB + filesystem storage).
-	logrusLogger := newLogrusLogger()
-	cacheHandler, err := artifactcache.StartHandler(cfg.Dir, "", 0, secret, logrusLogger)
-	if err != nil {
-		return nil, fmt.Errorf("starting cache handler: %w", err)
+	// Retry with exponential backoff — BoltDB takes an exclusive file lock,
+	// so during rolling updates the new pod must wait for the old one to release it.
+	logger := newLogrusLogger()
+	backoff := 1 * time.Second
+	for attempt := range 8 {
+		handler, err := artifactcache.StartHandler(cfg.Dir, "", cfg.Port, logger)
+		if err == nil {
+			return handler, nil
+		}
+		if attempt == 7 {
+			return nil, fmt.Errorf("starting cache handler (gave up after 8 attempts): %w", err)
+		}
+		slog.Warn("cache server start failed, retrying (BoltDB lock?)",
+			"attempt", attempt+1, "backoff", backoff, "error", err)
+		time.Sleep(backoff)
+		backoff *= 2
 	}
-	slog.Info("cache storage server started", "url", cacheHandler.ExternalURL())
-
-	// Start cache proxy (per-job auth layer).
-	proxy, err := cacheproxy.StartHandler(
-		cacheHandler.ExternalURL(), // target: internal cache server
-		"",                         // outbound IP: auto-detect
-		cfg.Port,                   // listen port
-		"",                         // no host override
-		secret,                     // HMAC secret
-		logrusLogger,               // logger
-		cacheHandler,               // closer: shut down cache when proxy shuts down
-	)
-	if err != nil {
-		cacheHandler.Close()
-		return nil, fmt.Errorf("starting cache proxy: %w", err)
-	}
-
-	return proxy, nil
+	return nil, fmt.Errorf("unreachable")
 }
 
 // newLogrusLogger creates a logrus logger for cache packages (which require logrus).
@@ -434,9 +396,7 @@ type TaskHandlerConfig struct {
 	GitCloneURL      string
 	ActionsURL       string
 	ControllerImage  string
-	CacheProxy       *cacheproxy.Handler
-	CachePort        uint16
-	CacheServiceName string
+	CacheHandler     *artifactcache.Handler
 	CachePVCName     string
 	JobSecrets       []config.JobSecret
 	ActionCache      *actions.ActionCache
@@ -477,6 +437,17 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		evalEnv := expressions.BuildEnvironment(task, parsed.Env)
 		eval := expressions.NewEvaluator(evalEnv)
 
+		// Resolve actions URL and token for action loading.
+		resolvedActionsURL := cfg.ActionsURL
+		if resolvedActionsURL == "" {
+			resolvedActionsURL = taskCtx["gitea_default_actions_url"].GetStringValue()
+		}
+		if resolvedActionsURL == "" {
+			resolvedActionsURL = "https://github.com"
+		}
+		actionToken := taskCtx["token"].GetStringValue()
+		ectx := actions.NewExpandCtx(cfg.ActionCache, resolvedActionsURL, actionToken)
+
 		// Build step specs — all steps are included, with raw if: expressions.
 		steps := make([]types.StepSpec, 0, len(parsed.Steps))
 		for _, step := range parsed.Steps {
@@ -506,7 +477,7 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 				steps = append(steps, types.StepSpec{
 					ID:              stepID,
 					Name:            name,
-					Shell:           step.RawShell,
+					Shell:           step.Shell,
 					Script:          script,
 					Env:             env,
 					If:              ifExpr,
@@ -549,24 +520,14 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 					continue
 				}
 
-				// Resolve default actions URL.
-				resolvedActionsURL := cfg.ActionsURL
-				if resolvedActionsURL == "" {
-					resolvedActionsURL = taskCtx["gitea_default_actions_url"].GetStringValue()
-				}
-				if resolvedActionsURL == "" {
-					resolvedActionsURL = "https://code.forgejo.org"
-				}
-
-				token := taskCtx["token"].GetStringValue()
-				meta, err := cfg.ActionCache.LoadAction(ref, resolvedActionsURL, token)
+				meta, err := cfg.ActionCache.LoadAction(ref, resolvedActionsURL, actionToken)
 				if err != nil {
 					slog.Error("failed to load action", "action", ref.String(), "error", err)
 					reportFailure(ctx, cfg.ServerClient, task, fmt.Sprintf("Failed to load action %s: %v", ref.String(), err))
 					return
 				}
 
-				actionSpecs, err := meta.ToStepSpecs(step.With, step.GetEnv())
+				actionSpecs, err := meta.ToStepSpecs(step.With, step.GetEnv(), ectx)
 				if err != nil {
 					slog.Error("failed to build action steps", "action", ref.String(), "error", err)
 					reportFailure(ctx, cfg.ServerClient, task, fmt.Sprintf("Failed to build action %s: %v", ref.String(), err))
@@ -595,6 +556,8 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 					})
 				}
 				actionsToClone = append(actionsToClone, meta)
+				actionsToClone = append(actionsToClone, ectx.Nested...)
+				ectx.Nested = nil // reset for next action
 			}
 		}
 
@@ -635,32 +598,13 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		}
 
 		// Inject cache URL if cache is enabled.
-		if cfg.CacheProxy != nil {
-			repository := taskCtx["repository"].GetStringValue()
-			runIDStr := taskCtx["run_id"].GetStringValue()
-			eventName := taskCtx["event_name"].GetStringValue()
-			ref := taskCtx["ref"].GetStringValue()
-			runtimeToken := taskCtx["gitea_runtime_token"].GetStringValue()
-
-			writeIsolationKey := ""
-			if eventName == "pull_request" || eventName == "pull_request_target" {
-				writeIsolationKey = ref
+		if cfg.CacheHandler != nil {
+			cacheURL := cfg.CacheHandler.ExternalURL()
+			baseEnv["ACTIONS_CACHE_URL"] = cacheURL
+			if runtimeToken := taskCtx["gitea_runtime_token"].GetStringValue(); runtimeToken != "" {
+				baseEnv["ACTIONS_RUNTIME_TOKEN"] = runtimeToken
 			}
-
-			timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-			runData := cfg.CacheProxy.CreateRunData(repository, runIDStr, timestamp, writeIsolationKey)
-			cacheRunID, err := cfg.CacheProxy.AddRun(runData)
-			if err != nil {
-				slog.Warn("failed to register cache run", "error", err)
-			} else {
-				cacheURL := fmt.Sprintf("http://%s.%s.svc:%d/%s/",
-					cfg.CacheServiceName, cfg.Namespace, cfg.CachePort, cacheRunID)
-				baseEnv["ACTIONS_CACHE_URL"] = cacheURL
-				if runtimeToken != "" {
-					baseEnv["ACTIONS_RUNTIME_TOKEN"] = runtimeToken
-				}
-				slog.Info("cache URL injected", "url", cacheURL)
-			}
+			slog.Info("cache URL injected", "url", cacheURL)
 		}
 
 		// Artifact server URL (Forgejo handles artifacts server-side).
@@ -682,7 +626,8 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		var snapshotCacheKey string
 		var snapshotPaths []string
 		if cfg.SnapshotManager != nil {
-			snapshotCacheKey, snapshotPaths, restoreKeys := extractCacheInfo(steps)
+			var restoreKeys []string
+			snapshotCacheKey, snapshotPaths, restoreKeys = extractCacheInfo(steps)
 			if snapshotCacheKey != "" && len(snapshotPaths) > 0 {
 				repository := taskCtx["repository"].GetStringValue()
 				pvcName := fmt.Sprintf("cache-%d", task.GetId())

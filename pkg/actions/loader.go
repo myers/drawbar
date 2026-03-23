@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/model"
 	"github.com/myers/drawbar/pkg/types"
 )
 
@@ -145,8 +145,28 @@ func tryReadActionFile(path string) (*model.Action, error) {
 	defer f.Close()
 	return model.ReadAction(f)
 }
+// ExpandCtx carries state through recursive composite action expansion.
+type ExpandCtx struct {
+	Cache      *ActionCache
+	ActionsURL string
+	Token      string
+	visited    map[string]bool // cycle detection
+	Nested     []*ActionMeta   // actions discovered during expansion (for cache PVC mounts)
+}
+
+// NewExpandCtx creates an expansion context for recursive action loading.
+func NewExpandCtx(cache *ActionCache, actionsURL, token string) *ExpandCtx {
+	return &ExpandCtx{
+		Cache:      cache,
+		ActionsURL: actionsURL,
+		Token:      token,
+		visited:    make(map[string]bool),
+	}
+}
+
 // ToStepSpecs converts an action into one or more StepSpecs.
-func (m *ActionMeta) ToStepSpecs(stepWith map[string]string, stepEnv map[string]string) ([]types.StepSpec, error) {
+// If ectx is non-nil, nested uses: inside composite actions are recursively expanded.
+func (m *ActionMeta) ToStepSpecs(stepWith map[string]string, stepEnv map[string]string, ectx *ExpandCtx) ([]types.StepSpec, error) {
 	action := m.Action
 	env := buildActionEnv(m, stepWith, stepEnv)
 
@@ -159,23 +179,12 @@ func (m *ActionMeta) ToStepSpecs(stepWith map[string]string, stepEnv map[string]
 		return m.dockerStepSpecs(env)
 
 	case model.ActionRunsUsingComposite:
-		return m.compositeStepSpecs(stepWith, stepEnv)
+		return m.compositeStepSpecs(stepWith, stepEnv, ectx)
 
 	case model.ActionRunsUsingGo:
 		return []types.StepSpec{{
 			Name:   m.Ref.String(),
 			Script: fmt.Sprintf("cd /actions/%s && go run .", m.Dir),
-			Env:    env,
-		}}, nil
-
-	case model.ActionRunsUsingSh:
-		main := action.Runs.Main
-		if main == "" {
-			main = "entrypoint.sh"
-		}
-		return []types.StepSpec{{
-			Name:   m.Ref.String(),
-			Script: fmt.Sprintf("sh /actions/%s/%s", m.actionPath(), main),
 			Env:    env,
 		}}, nil
 
@@ -241,7 +250,7 @@ func (m *ActionMeta) dockerStepSpecs(env map[string]string) ([]types.StepSpec, e
 	return []types.StepSpec{spec}, nil
 }
 
-func (m *ActionMeta) compositeStepSpecs(stepWith map[string]string, stepEnv map[string]string) ([]types.StepSpec, error) {
+func (m *ActionMeta) compositeStepSpecs(stepWith map[string]string, stepEnv map[string]string, ectx *ExpandCtx) ([]types.StepSpec, error) {
 	var specs []types.StepSpec
 	for _, step := range m.Action.Runs.Steps {
 		if step.Run != "" {
@@ -254,13 +263,43 @@ func (m *ActionMeta) compositeStepSpecs(stepWith map[string]string, stepEnv map[
 			}
 			specs = append(specs, types.StepSpec{
 				Name:   step.Name,
-				Shell:  step.RawShell,
+				Shell:  step.Shell,
 				Script: step.Run,
 				Env:    env,
 			})
 		} else if step.Uses != "" {
-			slog.Warn("nested action in composite not yet fully supported",
-				"parent", m.Ref.String(), "nested", step.Uses)
+			if ectx == nil || ectx.Cache == nil {
+				slog.Warn("nested action in composite skipped (no expansion context)",
+					"parent", m.Ref.String(), "nested", step.Uses)
+				continue
+			}
+
+			ref, err := ParseActionRef(step.Uses)
+			if err != nil {
+				slog.Warn("unsupported nested action reference",
+					"parent", m.Ref.String(), "uses", step.Uses, "error", err)
+				continue
+			}
+
+			refKey := ref.String()
+			if ectx.visited[refKey] {
+				return nil, fmt.Errorf("circular composite action: %s → %s", m.Ref.String(), refKey)
+			}
+			ectx.visited[refKey] = true
+
+			nested, err := ectx.Cache.LoadAction(ref, ectx.ActionsURL, ectx.Token)
+			if err != nil {
+				return nil, fmt.Errorf("loading nested action %s in %s: %w", refKey, m.Ref.String(), err)
+			}
+
+			nestedSpecs, err := nested.ToStepSpecs(step.With, step.GetEnv(), ectx)
+			delete(ectx.visited, refKey)
+			if err != nil {
+				return nil, fmt.Errorf("expanding nested action %s: %w", refKey, err)
+			}
+
+			ectx.Nested = append(ectx.Nested, nested)
+			specs = append(specs, nestedSpecs...)
 		}
 	}
 	return specs, nil

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"code.forgejo.org/forgejo/runner/v12/act/model"
+	"github.com/nektos/act/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -142,7 +142,7 @@ func TestToStepSpecs_Node_MainOnly(t *testing.T) {
 		Using: model.ActionRunsUsingNode20,
 		Main:  "dist/index.js",
 	})
-	specs, err := m.ToStepSpecs(nil, nil)
+	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 1)
 	assert.Contains(t, specs[0].Script, "node /actions/test-action-v1/dist/index.js")
@@ -155,7 +155,7 @@ func TestToStepSpecs_Node_PreMainPost(t *testing.T) {
 		Main:  "index.js",
 		Post:  "cleanup.js",
 	})
-	specs, err := m.ToStepSpecs(nil, nil)
+	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 3)
 	assert.Contains(t, specs[0].Name, "Pre")
@@ -170,7 +170,7 @@ func TestToStepSpecs_Node_NoMain(t *testing.T) {
 		Using: model.ActionRunsUsingNode20,
 		Main:  "",
 	})
-	_, err := m.ToStepSpecs(nil, nil)
+	_, err := m.ToStepSpecs(nil, nil, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no main entry point")
 }
@@ -180,7 +180,7 @@ func TestToStepSpecs_Docker(t *testing.T) {
 		Using: model.ActionRunsUsingDocker,
 		Image: "docker://alpine:3.18",
 	})
-	specs, err := m.ToStepSpecs(nil, nil)
+	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 1)
 	assert.Equal(t, "alpine:3.18", specs[0].Image)
@@ -191,7 +191,7 @@ func TestToStepSpecs_Docker_Dockerfile(t *testing.T) {
 		Using: model.ActionRunsUsingDocker,
 		Image: "Dockerfile",
 	})
-	_, err := m.ToStepSpecs(nil, nil)
+	_, err := m.ToStepSpecs(nil, nil, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Dockerfile build")
 }
@@ -203,7 +203,7 @@ func TestToStepSpecs_Docker_Entrypoint(t *testing.T) {
 		Entrypoint: "/entrypoint.sh",
 		Args:       []string{"--flag", "value"},
 	})
-	specs, err := m.ToStepSpecs(nil, nil)
+	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 1)
 	assert.Equal(t, []string{"/entrypoint.sh", "--flag", "value"}, specs[0].Cmd)
@@ -211,30 +211,15 @@ func TestToStepSpecs_Docker_Entrypoint(t *testing.T) {
 
 func TestToStepSpecs_Go(t *testing.T) {
 	m := testMeta(model.ActionRuns{Using: model.ActionRunsUsingGo})
-	specs, err := m.ToStepSpecs(nil, nil)
+	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 1)
 	assert.Contains(t, specs[0].Script, "go run .")
 }
 
-func TestToStepSpecs_Sh(t *testing.T) {
-	m := testMeta(model.ActionRuns{Using: model.ActionRunsUsingSh})
-	specs, err := m.ToStepSpecs(nil, nil)
-	require.NoError(t, err)
-	require.Len(t, specs, 1)
-	assert.Contains(t, specs[0].Script, "entrypoint.sh")
-}
-
-func TestToStepSpecs_Sh_CustomMain(t *testing.T) {
-	m := testMeta(model.ActionRuns{Using: model.ActionRunsUsingSh, Main: "run.sh"})
-	specs, err := m.ToStepSpecs(nil, nil)
-	require.NoError(t, err)
-	assert.Contains(t, specs[0].Script, "run.sh")
-}
-
 func TestToStepSpecs_Unsupported(t *testing.T) {
 	m := testMeta(model.ActionRuns{Using: "unknown"})
-	_, err := m.ToStepSpecs(nil, nil)
+	_, err := m.ToStepSpecs(nil, nil, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported action type")
 }
@@ -248,7 +233,7 @@ func TestToStepSpecs_Composite(t *testing.T) {
 		},
 	})
 	stepEnv := map[string]string{"FOO": "bar"}
-	specs, err := m.ToStepSpecs(nil, stepEnv)
+	specs, err := m.ToStepSpecs(nil, stepEnv, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 2)
 	assert.Equal(t, "Greet", specs[0].Name)
