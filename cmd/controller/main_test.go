@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -396,4 +397,101 @@ func TestCollectSecrets_NoContext(t *testing.T) {
 	}
 	secrets := collectSecrets(task)
 	assert.Contains(t, secrets, "val-a")
+}
+
+// --- buildGitHubEnv ---
+
+func TestBuildGitHubEnv(t *testing.T) {
+	taskCtx := map[string]*structpb.Value{
+		"server_url":       structpb.NewStringValue("https://gitea.example.com"),
+		"repository":       structpb.NewStringValue("myorg/myrepo"),
+		"repository_owner": structpb.NewStringValue("myorg"),
+		"run_id":           structpb.NewStringValue("42"),
+		"sha":              structpb.NewStringValue("abc123"),
+		"ref":              structpb.NewStringValue("refs/heads/main"),
+		"event_name":       structpb.NewStringValue("push"),
+		"token":            structpb.NewStringValue("secret-token"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	assert.Equal(t, "https://gitea.example.com", env["GITHUB_SERVER_URL"])
+	assert.Equal(t, "myorg/myrepo", env["GITHUB_REPOSITORY"])
+	assert.Equal(t, "myorg", env["GITHUB_REPOSITORY_OWNER"])
+	assert.Equal(t, "42", env["GITHUB_RUN_ID"])
+	assert.Equal(t, "abc123", env["GITHUB_SHA"])
+	assert.Equal(t, "refs/heads/main", env["GITHUB_REF"])
+	assert.Equal(t, "push", env["GITHUB_EVENT_NAME"])
+	assert.Equal(t, "secret-token", env["GITHUB_TOKEN"])
+}
+
+func TestBuildGitHubEnv_EmptyContext(t *testing.T) {
+	env := make(map[string]string)
+	buildGitHubEnv(env, map[string]*structpb.Value{})
+	// No keys should be set for missing context values.
+	assert.Empty(t, env)
+}
+
+// --- BuildKit auto-detection ---
+
+func TestIsBuildKitImage(t *testing.T) {
+	assert.True(t, isBuildKitImage("moby/buildkit:rootless"))
+	assert.True(t, isBuildKitImage("moby/buildkit:latest"))
+	assert.True(t, isBuildKitImage("docker.io/moby/buildkit:v0.20"))
+	assert.False(t, isBuildKitImage("postgres:16"))
+	assert.False(t, isBuildKitImage("alpine"))
+}
+
+func TestConvertServices_BuildKitAutoDetect(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"buildkit": {
+			Image: "moby/buildkit:rootless",
+			Ports: []string{"1234"},
+		},
+	}
+
+	result := convertServices(services)
+	require.Len(t, result, 1)
+	svc := result[0]
+
+	// Should have custom SecurityContext with unconfined seccomp.
+	require.NotNil(t, svc.SecurityContext)
+	require.NotNil(t, svc.SecurityContext.SeccompProfile)
+	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, svc.SecurityContext.SeccompProfile.Type)
+
+	// Should have SETUID+SETGID caps added.
+	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))
+	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETGID"))
+
+	// Should inject --oci-worker-no-process-sandbox and --addr as Args.
+	assert.Contains(t, svc.Args, "--oci-worker-no-process-sandbox")
+	assert.Contains(t, svc.Args, "--addr=tcp://0.0.0.0:1234")
+
+	// Cmd should remain empty (don't override image entrypoint).
+	assert.Empty(t, svc.Cmd)
+}
+
+func TestConvertServices_BuildKitNoDoubleInject(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"buildkit": {
+			Image: "moby/buildkit:rootless",
+			Ports: []string{"1234"},
+			Cmd:   []string{"--oci-worker-no-process-sandbox"},
+		},
+	}
+
+	result := convertServices(services)
+	require.Len(t, result, 1)
+
+	// The Cmd is set by the user (override entrypoint); Args should
+	// still get the flag since user set it in Cmd, not Args.
+	// But the auto-detect checks Args, so it will add it.
+	count := 0
+	for _, arg := range result[0].Args {
+		if arg == "--oci-worker-no-process-sandbox" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "should not double-inject in Args")
 }

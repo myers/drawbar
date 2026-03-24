@@ -116,12 +116,12 @@ func TestBuildActionEnv(t *testing.T) {
 	assert.Equal(t, "hello", env["MY_VAR"])
 	// Action runs.env is included.
 	assert.Equal(t, "from-action", env["ACTION_ENV"])
-	// Input defaults set as INPUT_ vars, hyphens become underscores.
-	assert.Equal(t, "default-key", env["INPUT_MY_KEY"])
+	// Input defaults set as INPUT_ vars, hyphens preserved (matches GitHub Actions behavior).
+	assert.Equal(t, "default-key", env["INPUT_MY-KEY"])
 	// stepWith overrides input defaults.
 	assert.Equal(t, "/workspace/src", env["INPUT_PATH"])
 	// Inputs without defaults are not set.
-	_, hasNoDefault := env["INPUT_NO_DEFAULT"]
+	_, hasNoDefault := env["INPUT_NO-DEFAULT"]
 	assert.False(t, hasNoDefault)
 	// GITHUB_ACTION_PATH is set.
 	assert.Equal(t, "/actions/actions-cache-v4", env["GITHUB_ACTION_PATH"])
@@ -145,7 +145,10 @@ func TestToStepSpecs_Node_MainOnly(t *testing.T) {
 	specs, err := m.ToStepSpecs(nil, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, specs, 1)
-	assert.Contains(t, specs[0].Script, "node /actions/test-action-v1/dist/index.js")
+	// Node actions use direct exec (Args) to preserve hyphenated env var names.
+	require.Len(t, specs[0].Args, 2)
+	assert.Equal(t, "node", specs[0].Args[0])
+	assert.Contains(t, specs[0].Args[1], "/actions/test-action-v1/dist/index.js")
 }
 
 func TestToStepSpecs_Node_PreMainPost(t *testing.T) {
@@ -159,10 +162,10 @@ func TestToStepSpecs_Node_PreMainPost(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, specs, 3)
 	assert.Contains(t, specs[0].Name, "Pre")
-	assert.Contains(t, specs[0].Script, "setup.js")
-	assert.Contains(t, specs[1].Script, "index.js")
+	assert.Contains(t, specs[0].Args[1], "setup.js")
+	assert.Contains(t, specs[1].Args[1], "index.js")
 	assert.Contains(t, specs[2].Name, "Post")
-	assert.Contains(t, specs[2].Script, "cleanup.js")
+	assert.Contains(t, specs[2].Args[1], "cleanup.js")
 }
 
 func TestToStepSpecs_Node_NoMain(t *testing.T) {

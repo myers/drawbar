@@ -36,9 +36,13 @@ import (
 	"github.com/myers/drawbar/pkg/version"
 	"github.com/myers/drawbar/pkg/workflow"
 
+	"google.golang.org/protobuf/types/known/structpb"
+
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 // cliFlags holds the parsed command-line flags.
@@ -548,6 +552,7 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 						Name:            as.Name,
 						Shell:           as.Shell,
 						Script:          as.Script,
+						Args:            as.Args,
 						Env:             as.Env,
 						ActionDir:       meta.Dir,
 						If:              asIf,
@@ -606,6 +611,11 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			}
 			slog.Info("cache URL injected", "url", cacheURL)
 		}
+
+		// Standard GITHUB_* env vars from task context. Actions like
+		// upload-artifact and download-artifact depend on these to construct
+		// API paths. Also used by user scripts via $GITHUB_REPOSITORY etc.
+		buildGitHubEnv(baseEnv, taskCtx)
 
 		// Artifact server URL (Forgejo handles artifacts server-side).
 		buildArtifactEnv(baseEnv, taskCtx["server_url"].GetStringValue(), cfg.GitCloneURL)
@@ -799,9 +809,94 @@ func convertServices(services map[string]*model.ContainerSpec) []k8s.ServiceSpec
 			}
 			svc.Ports = append(svc.Ports, port)
 		}
+		if isBuildKitImage(spec.Image) {
+			applyBuildKitDefaults(&svc)
+		}
 		result = append(result, svc)
 	}
 	return result
+}
+
+// isBuildKitImage returns true if the image looks like a BuildKit image.
+func isBuildKitImage(image string) bool {
+	return strings.Contains(image, "moby/buildkit")
+}
+
+// applyBuildKitDefaults sets the SecurityContext and command flags needed for
+// BuildKit in k8s. The rootless image (moby/buildkit:rootless) uses rootlesskit
+// which invokes newuidmap/newgidmap — these setuid helpers need SETUID+SETGID
+// caps. Seccomp must be Unconfined so rootlesskit can create user namespaces.
+// --oci-worker-no-process-sandbox avoids needing SYS_ADMIN for the OCI worker.
+func applyBuildKitDefaults(svc *k8s.ServiceSpec) {
+	svc.SecurityContext = &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(true), // needed for newuidmap (setuid binary)
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+			Add:  []corev1.Capability{"SETUID", "SETGID"},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeUnconfined,
+		},
+	}
+	// Inject flags as arguments (not command override) so the image's
+	// entrypoint (rootlesskit buildkitd) is preserved.
+	hasFlag := func(f string) bool {
+		for _, arg := range svc.Args {
+			if arg == f || strings.HasPrefix(arg, f+"=") {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasFlag("--oci-worker-no-process-sandbox") {
+		svc.Args = append(svc.Args, "--oci-worker-no-process-sandbox")
+	}
+
+	// Expose a TCP listener for each declared port so buildctl can connect.
+	// By default BuildKit only listens on a Unix socket.
+	if !hasFlag("--addr") {
+		for _, port := range svc.Ports {
+			svc.Args = append(svc.Args, fmt.Sprintf("--addr=tcp://0.0.0.0:%d", port))
+		}
+	}
+}
+
+// buildGitHubEnv injects the standard GITHUB_* env vars from the task context.
+// These are required by many actions (upload-artifact, download-artifact, etc.)
+// and are also available to user scripts.
+func buildGitHubEnv(env map[string]string, taskCtx map[string]*structpb.Value) {
+	get := func(key string) string {
+		if v, ok := taskCtx[key]; ok {
+			return v.GetStringValue()
+		}
+		return ""
+	}
+	set := func(envKey, ctxKey string) {
+		if v := get(ctxKey); v != "" {
+			env[envKey] = v
+		}
+	}
+
+	set("GITHUB_SERVER_URL", "server_url")
+	set("GITHUB_REPOSITORY", "repository")
+	set("GITHUB_REPOSITORY_OWNER", "repository_owner")
+	set("GITHUB_RUN_ID", "run_id")
+	set("GITHUB_RUN_NUMBER", "run_number")
+	set("GITHUB_RUN_ATTEMPT", "run_attempt")
+	set("GITHUB_ACTOR", "actor")
+	set("GITHUB_EVENT_NAME", "event_name")
+	set("GITHUB_SHA", "sha")
+	set("GITHUB_REF", "ref")
+	set("GITHUB_REF_NAME", "ref_name")
+	set("GITHUB_REF_TYPE", "ref_type")
+	set("GITHUB_HEAD_REF", "head_ref")
+	set("GITHUB_BASE_REF", "base_ref")
+	set("GITHUB_RETENTION_DAYS", "retention_days")
+	set("GITHUB_TOKEN", "token")
+	set("GITHUB_ACTION", "action")
+	set("GITHUB_JOB", "job")
+	set("GITHUB_WORKFLOW", "workflow")
 }
 
 // buildArtifactEnv sets ACTIONS_RUNTIME_URL and ACTIONS_RESULTS_URL in the env map.

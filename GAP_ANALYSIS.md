@@ -15,44 +15,27 @@ All items from the initial gap analysis (vs act_runner) are done:
 - Config validation
 - Dependencies swapped from Forgejo GPLv3 to Gitea MIT
 - ZFS snapshot cache with bind mounts + restore-keys
+- BuildKit sidecar for container builds (auto-detected, rootless, `drawbar/build-push` action)
 
 ## Remaining Gaps — Production Blockers
 
-### 1. Container builds (BuildKit sidecar)
-
-**Impact**: Can't build Docker images in CI without this.
-
-Docker actions (`docker/build-push-action`, `docker/login-action`) require a Docker daemon, which we don't have. The solution is not DinD but a **BuildKit sidecar** — drawbar already supports service containers as init-container sidecars.
-
-A workflow would look like:
-```yaml
-services:
-  buildkit:
-    image: moby/buildkit:latest
-    ports:
-      - 1234
-
-steps:
-  - run: buildctl --addr tcp://localhost:1234 build ...
-```
-
-**Work needed**:
-- Verify BuildKit works as a service container (TCP port, no privileged mode needed if using rootless BuildKit)
-- Document the pattern
-- Possibly create a `drawbar/build-push` action that wraps `buildctl`
-
-### 2. Artifact upload/download verification
+### 1. Artifact upload/download verification
 
 **Impact**: Multi-job workflows that pass data between jobs won't work if broken.
 
-We set `ACTIONS_RUNTIME_URL` and `ACTIONS_RESULTS_URL` but have never tested `actions/upload-artifact` / `actions/download-artifact` end-to-end. These actions talk to the Gitea server's artifact API, not our cache server.
+**Status**: Upload verified, download needs second-job dispatch testing.
+- All env vars injected correctly: `ACTIONS_RUNTIME_URL`, `ACTIONS_RESULTS_URL`, `ACTIONS_RUNTIME_TOKEN`, `GITHUB_*`
+- `actions/upload-artifact@v4` does NOT work — throws `GHESNotSupportedError` for non-github.com servers
+- `actions/upload-artifact@v3` works — successfully uploads artifacts via the pipeline API
+- Gitea's `ROOT_URL` must match the k8s service URL for signed upload URLs to be reachable
+- Node action INPUT_ env vars with hyphens now preserved (direct exec, no shell)
 
 **Work needed**:
-- E2E test: workflow with two jobs, first uploads artifact, second downloads it
-- Verify the URLs resolve correctly through the k8s service mesh
-- Test with both small (text) and large (binary) artifacts
+- Test download in a real multi-job workflow (needs Gitea to dispatch the dependent job)
+- Test with large binary artifacts
+- Document that v3 artifacts must be used (v4 blocks GHES/Gitea)
 
-### 3. GITHUB_STEP_SUMMARY
+### 2. GITHUB_STEP_SUMMARY
 
 **Impact**: Workflows that generate markdown summaries (test reports, coverage) won't display them.
 
@@ -63,7 +46,7 @@ We create the `GITHUB_STEP_SUMMARY` file for each step but never send the conten
 - If yes, read the summary file after each step and include it in the report
 - If no, this is a server-side limitation (skip)
 
-### 4. OIDC token support
+### 3. OIDC token support
 
 **Impact**: Can't use `aws-actions/configure-aws-credentials`, `google-github-actions/auth`, or similar cloud auth actions.
 
@@ -74,7 +57,7 @@ These actions request an OIDC token from the runner via `ACTIONS_ID_TOKEN_REQUES
 - If yes, inject `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` into the job environment
 - If no, this is a server-side limitation
 
-### 5. Production hardening
+### 4. Production hardening
 
 **Impact**: Unknown failure modes in real workloads.
 
@@ -85,7 +68,7 @@ Zero production users means zero real-world bug reports. Need sustained use on a
 - Run for 2-4 weeks, fix issues as they arise
 - Monitor: job success rate, cache hit rate, pod scheduling latency
 
-### 6. Documentation
+### 5. Documentation
 
 **Impact**: No one can use it without docs.
 

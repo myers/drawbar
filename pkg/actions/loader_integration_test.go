@@ -166,7 +166,7 @@ runs:
 	require.Len(t, specs, 3)
 	assert.Equal(t, "Before", specs[0].Name)
 	assert.Equal(t, "echo before", specs[0].Script)
-	assert.Contains(t, specs[1].Script, "node /actions/")
+	assert.Contains(t, specs[1].Args[1], "/actions/")
 	assert.Equal(t, "After", specs[2].Name)
 
 	// Nested action should be tracked

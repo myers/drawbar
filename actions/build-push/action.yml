@@ -1,0 +1,80 @@
+name: 'Build and Push (BuildKit)'
+description: 'Build a container image with BuildKit and optionally push to a registry.'
+inputs:
+  context:
+    description: 'Build context path'
+    default: '.'
+  dockerfile:
+    description: 'Path to Dockerfile (relative to context)'
+    default: 'Dockerfile'
+  image:
+    description: 'Image name with tag (e.g., registry.example.com/org/repo:latest)'
+    required: true
+  push:
+    description: 'Push the image after building'
+    default: 'false'
+  build-args:
+    description: 'Build arguments (one per line, KEY=VALUE)'
+    default: ''
+  registry:
+    description: 'Registry hostname for authentication (e.g., gitea.example.com)'
+    default: ''
+  username:
+    description: 'Registry username'
+    default: ''
+  password:
+    description: 'Registry password or token'
+    default: ''
+  buildkit-addr:
+    description: 'BuildKit daemon address'
+    default: 'tcp://localhost:1234'
+runs:
+  using: 'composite'
+  steps:
+    - name: Build with BuildKit
+      shell: sh
+      run: |
+        set -eu
+
+        ADDR="${INPUT_BUILDKIT_ADDR:-tcp://localhost:1234}"
+        CONTEXT="${INPUT_CONTEXT:-.}"
+        DOCKERFILE="${INPUT_DOCKERFILE:-Dockerfile}"
+        IMAGE="${INPUT_IMAGE}"
+        PUSH="${INPUT_PUSH:-false}"
+        BUILD_ARGS="${INPUT_BUILD_ARGS:-}"
+        REGISTRY="${INPUT_REGISTRY:-}"
+        USERNAME="${INPUT_USERNAME:-}"
+        PASSWORD="${INPUT_PASSWORD:-}"
+
+        # Build --opt build-arg flags.
+        ARG_FLAGS=""
+        if [ -n "$BUILD_ARGS" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] && ARG_FLAGS="$ARG_FLAGS --opt build-arg:$line"
+          done <<EOF
+        $BUILD_ARGS
+        EOF
+        fi
+
+        # Registry authentication via docker config (buildctl reads it).
+        if [ -n "$REGISTRY" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+          mkdir -p "$HOME/.docker"
+          AUTH=$(printf '%s:%s' "$USERNAME" "$PASSWORD" | base64)
+          printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+        fi
+
+        # Determine output type.
+        if [ "$PUSH" = "true" ]; then
+          OUTPUT="type=image,name=${IMAGE},push=true"
+        else
+          OUTPUT="type=image,name=${IMAGE}"
+        fi
+
+        # shellcheck disable=SC2086
+        buildctl --addr "$ADDR" build \
+          --frontend dockerfile.v0 \
+          --local context="$CONTEXT" \
+          --local dockerfile="$CONTEXT" \
+          --opt filename="$DOCKERFILE" \
+          $ARG_FLAGS \
+          --output "$OUTPUT"

@@ -198,11 +198,14 @@ func (m *ActionMeta) nodeStepSpecs(env map[string]string) ([]types.StepSpec, err
 	action := m.Action
 	actionPath := m.actionPath()
 
+	// Node actions use direct exec (Args) instead of shell mode (Script)
+	// because POSIX shells strip env vars with hyphens in their names
+	// (e.g., INPUT_INCLUDE-HIDDEN-FILES), which breaks @actions/core getInput.
 	if action.Runs.Pre != "" {
 		specs = append(specs, types.StepSpec{
-			Name:   fmt.Sprintf("Pre %s", m.Ref.String()),
-			Script: fmt.Sprintf("node /actions/%s/%s", actionPath, action.Runs.Pre),
-			Env:    env,
+			Name: fmt.Sprintf("Pre %s", m.Ref.String()),
+			Args: []string{"node", fmt.Sprintf("/actions/%s/%s", actionPath, action.Runs.Pre)},
+			Env:  env,
 		})
 	}
 
@@ -210,16 +213,16 @@ func (m *ActionMeta) nodeStepSpecs(env map[string]string) ([]types.StepSpec, err
 		return nil, fmt.Errorf("action %s has no main entry point", m.Ref.String())
 	}
 	specs = append(specs, types.StepSpec{
-		Name:   m.Ref.String(),
-		Script: fmt.Sprintf("node /actions/%s/%s", actionPath, action.Runs.Main),
-		Env:    env,
+		Name: m.Ref.String(),
+		Args: []string{"node", fmt.Sprintf("/actions/%s/%s", actionPath, action.Runs.Main)},
+		Env:  env,
 	})
 
 	if action.Runs.Post != "" {
 		specs = append(specs, types.StepSpec{
-			Name:   fmt.Sprintf("Post %s", m.Ref.String()),
-			Script: fmt.Sprintf("node /actions/%s/%s", actionPath, action.Runs.Post),
-			Env:    env,
+			Name: fmt.Sprintf("Post %s", m.Ref.String()),
+			Args: []string{"node", fmt.Sprintf("/actions/%s/%s", actionPath, action.Runs.Post)},
+			Env:  env,
 		})
 	}
 
@@ -323,12 +326,12 @@ func buildActionEnv(meta *ActionMeta, stepWith map[string]string, stepEnv map[st
 	}
 	for name, input := range meta.Action.Inputs {
 		if input.Default != "" {
-			envKey := "INPUT_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+			envKey := "INPUT_" + strings.ToUpper(name)
 			env[envKey] = input.Default
 		}
 	}
 	for k, v := range stepWith {
-		envKey := "INPUT_" + strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
+		envKey := "INPUT_" + strings.ToUpper(k)
 		env[envKey] = v
 	}
 	env["GITHUB_ACTION_PATH"] = "/actions/" + meta.actionPath()

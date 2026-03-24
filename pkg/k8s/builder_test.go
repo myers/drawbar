@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestBuildJob_SingleContainer(t *testing.T) {
@@ -91,7 +92,7 @@ func TestBuildJob_WithActions(t *testing.T) {
 		ControllerImage: "runner:latest",
 		CachePVCName:    "runner-cache",
 		Steps: []types.StepSpec{
-			{ID: "cache", Name: "actions/cache", Script: "node /actions/ac/dist/index.js", ActionDir: "ac"},
+			{ID: "cache", Name: "actions/cache", Args: []string{"node", "/actions/ac/dist/index.js"}, ActionDir: "ac"},
 		},
 	}
 
@@ -193,4 +194,57 @@ func TestGenerateWaitScript(t *testing.T) {
 		{Name: "pg", Ports: []int32{5432}},
 	})
 	assert.Contains(t, script, "5432")
+}
+
+func TestBuildJob_ServiceSecurityOverride(t *testing.T) {
+	// A service with a custom SecurityContext (e.g., BuildKit needing
+	// unconfined seccomp) should use that context, while the runner
+	// container retains the default hardened context.
+	buildkitSC := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(true),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+			Add:  []corev1.Capability{"SETUID", "SETGID"},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeUnconfined,
+		},
+	}
+
+	cfg := JobConfig{
+		TaskID:          99,
+		Namespace:       "default",
+		Image:           "node:24-trixie",
+		ControllerImage: "runner:latest",
+		Services: []ServiceSpec{
+			{
+				Name:            "buildkit",
+				Image:           "moby/buildkit:rootless",
+				Ports:           []int32{1234},
+				SecurityContext: buildkitSC,
+			},
+		},
+		Steps: []types.StepSpec{
+			{ID: "build", Name: "Build", Script: "buildctl build"},
+		},
+	}
+
+	job, err := BuildJob(cfg)
+	require.NoError(t, err)
+
+	initCs := job.Spec.Template.Spec.InitContainers
+	// svc-buildkit + wait-for-services + setup-shim
+	require.Len(t, initCs, 3)
+
+	// Sidecar should have the custom SecurityContext with unconfined seccomp.
+	sidecar := initCs[0]
+	assert.Equal(t, "svc-buildkit", sidecar.Name)
+	require.NotNil(t, sidecar.SecurityContext)
+	require.NotNil(t, sidecar.SecurityContext.SeccompProfile)
+	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, sidecar.SecurityContext.SeccompProfile.Type)
+
+	// Runner container should NOT have unconfined seccomp (default hardened).
+	runner := job.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "runner", runner.Name)
+	assert.Nil(t, runner.SecurityContext.SeccompProfile)
 }

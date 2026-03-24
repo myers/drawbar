@@ -18,11 +18,13 @@ import (
 
 // ServiceSpec describes a service container (sidecar) for a workflow job.
 type ServiceSpec struct {
-	Name  string
-	Image string
-	Env   map[string]string
-	Ports []int32
-	Cmd   []string
+	Name            string
+	Image           string
+	Env             map[string]string
+	Ports           []int32
+	Cmd             []string                // overrides Docker ENTRYPOINT
+	Args            []string                // overrides Docker CMD (appended to entrypoint)
+	SecurityContext *corev1.SecurityContext  // nil = use default hardened context
 }
 
 // JobSecretMount describes a k8s Secret to mount into job pods.
@@ -139,11 +141,15 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 
 	// 1. Service sidecars.
 	for _, svc := range cfg.Services {
+		sc := containerSecurity
+		if svc.SecurityContext != nil {
+			sc = svc.SecurityContext
+		}
 		container := corev1.Container{
 			Name:            "svc-" + sanitizeK8sName(svc.Name),
 			Image:           svc.Image,
 			RestartPolicy:   ptr.To(corev1.ContainerRestartPolicyAlways),
-			SecurityContext: containerSecurity,
+			SecurityContext: sc,
 		}
 		for k, v := range svc.Env {
 			container.Env = append(container.Env, corev1.EnvVar{Name: k, Value: v})
@@ -153,6 +159,9 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		}
 		if len(svc.Cmd) > 0 {
 			container.Command = svc.Cmd
+		}
+		if len(svc.Args) > 0 {
+			container.Args = svc.Args
 		}
 		initContainers = append(initContainers, container)
 	}

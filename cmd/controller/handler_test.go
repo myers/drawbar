@@ -480,6 +480,26 @@ jobs:
 	handler(ctx, task)
 
 	env.assertResult(runnerv1.Result_RESULT_SUCCESS)
+
+	// Verify the job manifest uses direct exec (Args) for node actions,
+	// not shell mode (Script), to preserve hyphenated INPUT_ env vars.
+	jobs, err := env.k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, jobs.Items)
+	shimArgs := jobs.Items[0].Spec.Template.Spec.InitContainers
+	var shimContainer *corev1.Container
+	for i, c := range shimArgs {
+		if c.Name == "setup-shim" {
+			shimContainer = &shimArgs[i]
+			break
+		}
+	}
+	require.NotNil(t, shimContainer)
+	manifest := shimContainer.Args[0]
+	// The manifest should contain "args":["node","/actions/..."] for the node action step.
+	assert.Contains(t, manifest, `"args":["node"`)
+	// And should NOT contain a non-empty "command" for the action step (Script mode).
+	// The only "command" should be empty for the action step.
 }
 
 // --- Services ---
@@ -566,6 +586,98 @@ jobs:
 
 	// Local action is unsupported → no steps → failure.
 	env.assertResult(runnerv1.Result_RESULT_FAILURE)
+}
+
+// --- BuildKit sidecar ---
+
+func TestMakeTaskHandler_BuildKitSidecar(t *testing.T) {
+	env := newHandlerTestEnv(t)
+	env.spawnPod("test-ns", 50)
+
+	task := &runnerv1.Task{
+		Id: 50,
+		WorkflowPayload: []byte(`name: Build Image
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      buildkit:
+        image: moby/buildkit:rootless
+        ports:
+          - 1234
+    steps:
+      - run: buildctl --addr tcp://localhost:1234 build --frontend dockerfile.v0
+`),
+		Context: defaultTaskContext(),
+		Secrets: map[string]string{},
+	}
+
+	handler := makeTaskHandler(TaskHandlerConfig{
+		K8sClient:    env.k8sClient,
+		ServerClient: env.forgejoClient,
+		Labels:       labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")},
+		Namespace:    "test-ns",
+		Timeout:      5 * time.Minute,
+		WatchConfig:  defaultWatchConfig(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	handler(ctx, task)
+
+	env.assertResult(runnerv1.Result_RESULT_SUCCESS)
+
+	jobs, err := env.k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, jobs.Items)
+
+	initContainers := jobs.Items[0].Spec.Template.Spec.InitContainers
+
+	// Find the BuildKit sidecar.
+	var buildkitContainer *corev1.Container
+	for i, c := range initContainers {
+		if c.Name == "svc-buildkit" {
+			buildkitContainer = &initContainers[i]
+			break
+		}
+	}
+	require.NotNil(t, buildkitContainer, "should have svc-buildkit init container")
+	assert.Equal(t, "moby/buildkit:rootless", buildkitContainer.Image)
+
+	// Sidecar should have RestartPolicy Always.
+	require.NotNil(t, buildkitContainer.RestartPolicy)
+	assert.Equal(t, corev1.ContainerRestartPolicyAlways, *buildkitContainer.RestartPolicy)
+
+	// Sidecar should have unconfined seccomp + SETUID/SETGID caps (needed for rootless BuildKit).
+	require.NotNil(t, buildkitContainer.SecurityContext)
+	require.NotNil(t, buildkitContainer.SecurityContext.SeccompProfile)
+	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, buildkitContainer.SecurityContext.SeccompProfile.Type)
+	assert.True(t, *buildkitContainer.SecurityContext.AllowPrivilegeEscalation)
+	assert.Contains(t, buildkitContainer.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))
+	assert.Contains(t, buildkitContainer.SecurityContext.Capabilities.Add, corev1.Capability("SETGID"))
+
+	// Sidecar should have --oci-worker-no-process-sandbox as an argument
+	// (not command override, so the image entrypoint is preserved).
+	assert.Contains(t, buildkitContainer.Args, "--oci-worker-no-process-sandbox")
+	// Should expose TCP listener for the declared port.
+	assert.Contains(t, buildkitContainer.Args, "--addr=tcp://0.0.0.0:1234")
+
+	// Wait-for-services should probe port 1234.
+	var waitContainer *corev1.Container
+	for i, c := range initContainers {
+		if c.Name == "wait-for-services" {
+			waitContainer = &initContainers[i]
+			break
+		}
+	}
+	require.NotNil(t, waitContainer, "should have wait-for-services")
+	assert.Contains(t, waitContainer.Args[0], "1234")
+
+	// Runner container should retain hardened security context (no unconfined seccomp).
+	runner := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "runner", runner.Name)
+	assert.Nil(t, runner.SecurityContext.SeccompProfile)
 }
 
 // --- Git helpers ---
