@@ -136,6 +136,7 @@ func runEntrypoint(manifestPath, workDir string) bool {
 		env["FORGEJO_STEP_SUMMARY"] = summaryFile
 		env["GITHUB_WORKSPACE"] = "/workspace"
 		env["FORGEJO_WORKSPACE"] = "/workspace"
+		env["RUNNER_TEMP"] = "/tmp"
 
 		// Execute the step.
 		// Apply per-step timeout if configured.
