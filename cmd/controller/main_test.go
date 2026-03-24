@@ -278,6 +278,33 @@ func TestReadyzHandler_NotReady(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
+// --- metricsHandler ---
+
+func TestMetricsHandler(t *testing.T) {
+	var active atomic.Int64
+	active.Store(2)
+	handler := metricsHandler(&active, 3)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/active-jobs", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"active":2,"capacity":3}`, w.Body.String())
+}
+
+func TestMetricsHandler_Zero(t *testing.T) {
+	var active atomic.Int64
+	handler := metricsHandler(&active, 1)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/active-jobs", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	assert.JSONEq(t, `{"active":0,"capacity":1}`, w.Body.String())
+}
+
 // --- startCacheServer ---
 
 func TestStartCacheServer(t *testing.T) {

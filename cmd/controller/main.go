@@ -233,6 +233,9 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		}()
 	}
 
+	// Shared counter for active jobs (exposed via /metrics/active-jobs for KEDA).
+	var activeJobs atomic.Int64
+
 	// Create task handler.
 	handler := makeTaskHandler(TaskHandlerConfig{
 		K8sClient:        deps.k8sClient,
@@ -250,6 +253,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		ActionCache:      actionCache,
 		WatchConfig:      deps.watchCfg,
 		SnapshotManager:  snapMgr,
+		ActiveJobs:       &activeJobs,
 	})
 
 	// Create poller.
@@ -268,7 +272,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	// Start health server.
 	var registered atomic.Bool
 	registered.Store(true)
-	go startHealthServer(&registered)
+	go startHealthServer(&registered, &activeJobs, int64(cfg.Runner.Capacity))
 
 	slog.Info("runner is online, polling for tasks", "job_namespace", deps.namespace)
 	poller.Run(ctx)
@@ -327,10 +331,11 @@ func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, names
 	}
 }
 
-func startHealthServer(registered *atomic.Bool) {
+func startHealthServer(registered *atomic.Bool, activeJobs *atomic.Int64, capacity int64) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/readyz", readyzHandler(registered))
+	mux.HandleFunc("/metrics/active-jobs", metricsHandler(activeJobs, capacity))
 	slog.Info("health server listening", "port", 8081)
 	if err := http.ListenAndServe(":8081", mux); err != nil {
 		slog.Error("health server error", "error", err)
@@ -340,6 +345,13 @@ func startHealthServer(registered *atomic.Bool) {
 func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
+}
+
+func metricsHandler(activeJobs *atomic.Int64, capacity int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"active":%d,"capacity":%d}`, activeJobs.Load(), capacity)
+	}
 }
 
 func readyzHandler(registered *atomic.Bool) http.HandlerFunc {
@@ -378,11 +390,16 @@ type TaskHandlerConfig struct {
 	ActionCache      *actions.ActionCache
 	WatchConfig      k8s.WatchConfig    // optional; zero value uses defaults
 	SnapshotManager  *snapshot.Manager   // optional; nil = no ZFS snapshot cache
+	ActiveJobs       *atomic.Int64       // shared counter for metrics endpoint
 }
 
 // makeTaskHandler returns a TaskHandler that executes workflow jobs as k8s Jobs.
 func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 	return func(ctx context.Context, task *runnerv1.Task) {
+		if cfg.ActiveJobs != nil {
+			cfg.ActiveJobs.Add(1)
+			defer cfg.ActiveJobs.Add(-1)
+		}
 		slog.Info("executing task", "id", task.GetId())
 
 		// Parse workflow.
