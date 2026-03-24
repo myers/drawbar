@@ -37,15 +37,13 @@ type Reporter struct {
 }
 
 // logMasker replaces secret values with *** in log output.
+// It stores the raw pairs so new values can be added dynamically (::add-mask::).
 type logMasker struct {
+	pairs    []string
 	replacer *strings.Replacer
 }
 
 func newLogMasker(secrets []string) *logMasker {
-	if len(secrets) == 0 {
-		return nil
-	}
-	// Build replacer: each secret value → "***"
 	var pairs []string
 	for _, s := range secrets {
 		// Skip secrets of 3 characters or fewer to avoid excessive false-positive
@@ -56,13 +54,19 @@ func newLogMasker(secrets []string) *logMasker {
 		}
 	}
 	if len(pairs) == 0 {
-		return nil
+		return &logMasker{}
 	}
-	return &logMasker{replacer: strings.NewReplacer(pairs...)}
+	return &logMasker{pairs: pairs, replacer: strings.NewReplacer(pairs...)}
+}
+
+// add appends a new secret value to the masker and rebuilds the replacer.
+func (m *logMasker) add(value string) {
+	m.pairs = append(m.pairs, value, "***")
+	m.replacer = strings.NewReplacer(m.pairs...)
 }
 
 func (m *logMasker) mask(content string) string {
-	if m == nil {
+	if m == nil || m.replacer == nil {
 		return content
 	}
 	return m.replacer.Replace(content)
@@ -92,6 +96,19 @@ func (r *Reporter) SetSecrets(secrets []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.masker = newLogMasker(secrets)
+}
+
+// AddMask dynamically adds a secret value to the masker (for ::add-mask::).
+func (r *Reporter) AddMask(value string) {
+	if len(value) <= 3 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.masker == nil {
+		r.masker = &logMasker{}
+	}
+	r.masker.add(value)
 }
 
 // AddLog appends a log row and associates it with the current step.
@@ -268,14 +285,16 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 	}
 	r.mu.Unlock()
 
-	// Retry final log + state upload.
+	// Retry final log + state upload with exponential backoff.
 	var lastErr error
+	backoff := 100 * time.Millisecond
 	for attempt := range 10 {
 		if err := r.flushLogs(ctx, true); err != nil {
 			slog.Warn("final log flush failed, retrying",
 				"attempt", attempt+1, "error", err)
 			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+			time.Sleep(backoff)
+			backoff *= 2
 			continue
 		}
 
@@ -283,7 +302,8 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 			slog.Warn("final state flush failed, retrying",
 				"attempt", attempt+1, "error", err)
 			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+			time.Sleep(backoff)
+			backoff *= 2
 			continue
 		}
 

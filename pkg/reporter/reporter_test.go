@@ -317,14 +317,14 @@ func TestReporter_EmptyFlush(t *testing.T) {
 
 func TestNewLogMasker_NoSecrets(t *testing.T) {
 	m := newLogMasker(nil)
-	assert.Nil(t, m)
+	assert.Equal(t, "unchanged", m.mask("unchanged"))
 	m = newLogMasker([]string{})
-	assert.Nil(t, m)
+	assert.Equal(t, "unchanged", m.mask("unchanged"))
 }
 
 func TestNewLogMasker_ShortSecretsSkipped(t *testing.T) {
 	m := newLogMasker([]string{"ab", "x", "yes"})
-	assert.Nil(t, m) // all ≤3 chars, so nothing to mask
+	assert.Equal(t, "ab x yes", m.mask("ab x yes")) // all ≤3 chars, nothing masked
 }
 
 func TestNewLogMasker_MasksLongSecrets(t *testing.T) {

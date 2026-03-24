@@ -35,8 +35,9 @@ type LogStreamer interface {
 // WatchConfig controls polling behavior.
 type WatchConfig struct {
 	PollInterval time.Duration
-	Executor     PodExecutor // optional; defaults to SPDYExecutor
-	Streamer     LogStreamer  // optional; defaults to K8sLogStreamer
+	Executor     PodExecutor                // optional; defaults to SPDYExecutor
+	Streamer     LogStreamer                 // optional; defaults to K8sLogStreamer
+	CommandProc  *reporter.CommandProcessor  // optional; if set, parses workflow commands from log lines
 }
 
 // DefaultWatchConfig returns production defaults.
@@ -101,7 +102,7 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	// Stream logs and poll state in parallel.
 	logDone := make(chan error, 1)
 	go func() {
-		logDone <- streamLogs(ctx, streamer, namespace, podName, "runner", rep)
+		logDone <- streamLogs(ctx, streamer, namespace, podName, "runner", rep, cfg.CommandProc)
 	}()
 
 	stateDone := make(chan error, 1)
@@ -156,7 +157,9 @@ func pollStateFileWith(ctx context.Context, executor PodExecutor, namespace, pod
 }
 
 // streamLogs follows container logs and routes each line to the reporter.
-func streamLogs(ctx context.Context, streamer LogStreamer, namespace, podName, container string, rep *reporter.Reporter) error {
+// If cmdProc is non-nil, workflow commands (::add-mask::, ::debug::, etc.) are
+// parsed and handled before the line is sent to the reporter.
+func streamLogs(ctx context.Context, streamer LogStreamer, namespace, podName, container string, rep *reporter.Reporter, cmdProc *reporter.CommandProcessor) error {
 	stream, err := streamer.StreamLogs(ctx, namespace, podName, container)
 	if err != nil {
 		return fmt.Errorf("opening log stream for %s: %w", container, err)
@@ -168,7 +171,13 @@ func streamLogs(ctx context.Context, streamer LogStreamer, namespace, podName, c
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			line = strings.TrimRight(line, "\n\r")
-			rep.AddLog(line)
+			if cmdProc != nil {
+				if processed := cmdProc.ProcessLine(line); processed != nil {
+					rep.AddLog(*processed)
+				}
+			} else {
+				rep.AddLog(line)
+			}
 		}
 		if err != nil {
 			if err == io.EOF {

@@ -339,7 +339,7 @@ func TestStreamLogs(t *testing.T) {
 	rep := reporter.New(mc, 1, 1, time.Hour)
 	rep.StartStep(0)
 
-	err := streamLogs(context.Background(), streamer, "ns", "pod", "runner", rep)
+	err := streamLogs(context.Background(), streamer, "ns", "pod", "runner", rep, nil)
 	assert.NoError(t, err)
 
 	// Flush to capture logs.
@@ -360,7 +360,7 @@ func TestStreamLogs_Error(t *testing.T) {
 	streamer := &mockLogStreamer{err: fmt.Errorf("connection refused")}
 	rep := newTestReporter(1, 1)
 
-	err := streamLogs(context.Background(), streamer, "ns", "pod", "runner", rep)
+	err := streamLogs(context.Background(), streamer, "ns", "pod", "runner", rep, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "connection refused")
 }

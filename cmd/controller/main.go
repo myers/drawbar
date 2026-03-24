@@ -261,6 +261,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		handler,
 		int64(cfg.Runner.Capacity),
 		cfg.Runner.FetchTimeout,
+		cfg.Runner.Ephemeral,
 		deps.logger,
 	)
 
@@ -740,6 +741,8 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		if watchCfg.PollInterval == 0 {
 			watchCfg = k8s.DefaultWatchConfig()
 		}
+		debugEnabled := task.GetSecrets()["ACTIONS_STEP_DEBUG"] == "true"
+		watchCfg.CommandProc = reporter.NewCommandProcessor(rep, debugEnabled)
 		result, err := k8s.WatchJob(ctx, cfg.K8sClient, cfg.RestConfig, cfg.Namespace, created.Name, rep, watchCfg)
 		if err != nil {
 			slog.Error("job watch error", "error", err)
