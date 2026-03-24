@@ -20,6 +20,7 @@ All items from the initial gap analysis (vs act_runner) are done:
 - GITHUB_* env vars injected into all steps
 - Node actions run via direct exec (preserves hyphenated INPUT_* env vars)
 - Artifact upload/download verified E2E (v3 actions, text + 100KB binary, multi-job with `needs:`)
+- Documentation (README, Helm values, BuildKit guide, ZFS cache guide, artifact guidance)
 
 ## Remaining Gaps — Production Blockers
 
@@ -33,16 +34,6 @@ Zero production users means zero real-world bug reports. Need sustained use on a
 - Deploy on a real project (Rust CI with BuildKit for container builds)
 - Run for 2-4 weeks, fix issues as they arise
 - Monitor: job success rate, cache hit rate, pod scheduling latency
-
-### 2. Documentation
-
-**Impact**: No one can use it without docs.
-
-**Work needed**:
-- README with quick start, architecture diagram, configuration reference
-- Helm chart values documentation
-- BuildKit sidecar pattern guide
-- ZFS snapshot cache setup guide (OpenEBS + loopback for dev, real ZFS for prod)
 
 ## Architecture Advantages (vs act_runner)
 
