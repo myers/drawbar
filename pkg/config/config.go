@@ -28,6 +28,7 @@ type RunnerConfig struct {
 	Name            string        `yaml:"name"`
 	Labels          []string      `yaml:"labels"`
 	Capacity        int           `yaml:"capacity"`
+	Ephemeral       bool          `yaml:"ephemeral"`
 	FetchInterval   time.Duration `yaml:"fetch_interval"`
 	FetchTimeout    time.Duration `yaml:"fetch_timeout"`
 	Timeout         time.Duration `yaml:"timeout"`
@@ -171,6 +172,9 @@ func (c *Config) applyEnvOverrides() {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Runner.Capacity = n
 		}
+	}
+	if v := os.Getenv("RUNNER_EPHEMERAL"); v != "" {
+		c.Runner.Ephemeral = v == "true" || v == "1"
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		c.Log.Level = v
