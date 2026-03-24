@@ -1,130 +1,115 @@
-# Gap Analysis: drawbar vs Gitea act_runner
+# Gap Analysis: drawbar — Production Readiness
 
-Date: 2026-03-23
+Updated: 2026-03-23
 
-## Architecture Differences
+## Completed
 
-| Aspect | drawbar | act_runner |
-|--------|---------|------------|
-| **Execution model** | K8s Jobs — one pod per job, no DinD | Docker containers via nektos/act |
-| **Step isolation** | Single container, all steps sequential | Per-step containers possible |
-| **Privileges** | Drops ALL capabilities, unprivileged | Requires Docker socket or DinD (privileged) |
-| **Scaling** | K8s-native (HPA, node pools) | Process-level (run more instances) |
-| **Workflow engine** | Custom (parser + entrypoint binary) | nektos/act (full GitHub Actions compat) |
+All items from the initial gap analysis (vs act_runner) are done:
 
-## Where act_runner is better
+- Workflow commands (`::add-mask::`, `::group::`, `::debug::`, etc.)
+- Exponential backoff on connection failures
+- Task versioning (was already implemented)
+- Ephemeral mode (`RUNNER_EPHEMERAL=true`)
+- Reporter exponential backoff
+- Nested composite action expansion
+- Config validation
+- Dependencies swapped from Forgejo GPLv3 to Gitea MIT
+- ZFS snapshot cache with bind mounts + restore-keys
 
-### 1. Workflow compatibility — the biggest gap
-- act_runner delegates to nektos/act which has years of GitHub Actions compat work
-- Handles edge cases we don't: `::add-mask::`, `::group::`, `::warning::`, `::error::` workflow commands
-- Our entrypoint doesn't process any workflow commands at all
+## Remaining Gaps — Production Blockers
 
-### 2. Docker actions (`runs.using: docker`)
-- act_runner runs Docker actions natively (it has a Docker daemon)
-- We can't — single-container architecture means no container spawning
-- This blocks popular actions like `docker/build-push-action`
+### 1. Container builds (BuildKit sidecar)
 
-### 3. Retry/resilience
-- act_runner uses `avast/retry-go` with exponential backoff for reporter.Close()
-- Our reporter retries 10x with linear 100ms backoff — less robust
-- act_runner has rate limiting on polling (`golang.org/x/time/rate`)
-- Our poller has no backoff on connection failures
+**Impact**: Can't build Docker images in CI without this.
 
-### 4. Task versioning optimization
-- act_runner tracks `tasksVersion` — server can skip DB query if nothing changed
-- Our poller always does a full fetch (more server load)
+Docker actions (`docker/build-push-action`, `docker/login-action`) require a Docker daemon, which we don't have. The solution is not DinD but a **BuildKit sidecar** — drawbar already supports service containers as init-container sidecars.
 
-### 5. Workflow commands
-- act_runner processes `::add-mask::`, `::debug::`, `::group::`, `::stop-commands::`
-- We process none — secrets are only masked from the initial task payload
+A workflow would look like:
+```yaml
+services:
+  buildkit:
+    image: moby/buildkit:latest
+    ports:
+      - 1234
 
-### 6. Ephemeral mode
-- act_runner supports `ephemeral: true` — pick up one job then exit
-- Useful for K8s autoscaling patterns (scale-to-zero)
-- We don't have this
+steps:
+  - run: buildctl --addr tcp://localhost:1234 build ...
+```
 
-### 7. Host execution mode
-- act_runner can run directly on the host (no container)
-- We're K8s-only — can't run bare-metal CI
+**Work needed**:
+- Verify BuildKit works as a service container (TCP port, no privileged mode needed if using rootless BuildKit)
+- Document the pattern
+- Possibly create a `drawbar/build-push` action that wraps `buildctl`
 
-### 8. Volume validation
-- act_runner has glob-pattern validation for Docker volume mounts
-- Security feature we don't need (no Docker) but worth noting
+### 2. Artifact upload/download verification
 
-## Where drawbar is better
+**Impact**: Multi-job workflows that pass data between jobs won't work if broken.
 
-### 1. Security — significantly ahead
-- We drop ALL capabilities, disallow privilege escalation
-- act_runner requires privileged DinD or Docker socket mount — both major attack vectors
-- Our `GIT_ASKPASS` approach never embeds tokens in clone URLs
-- Structured args for checkout commands prevent shell injection
-- No Docker socket = no container escape risk
+We set `ACTIONS_RUNTIME_URL` and `ACTIONS_RESULTS_URL` but have never tested `actions/upload-artifact` / `actions/download-artifact` end-to-end. These actions talk to the Gitea server's artifact API, not our cache server.
 
-### 2. Kubernetes-native design
-- Native K8s Jobs with proper labeling, RBAC, resource limits
-- Service containers as proper init-container sidecars (not Docker network hacks)
-- VolumeSnapshot-based workspace caching (ZFS/LVM instant clones)
-- PVC-backed action cache (shared across jobs)
-- Health endpoints (`/healthz`, `/readyz`) for K8s probes
+**Work needed**:
+- E2E test: workflow with two jobs, first uploads artifact, second downloads it
+- Verify the URLs resolve correctly through the k8s service mesh
+- Test with both small (text) and large (binary) artifacts
 
-### 3. ZFS snapshot caching
-- Instant workspace restoration from VolumeSnapshot
-- act_runner has no equivalent — every job starts from scratch
-- Can save minutes on large monorepos
+### 3. GITHUB_STEP_SUMMARY
 
-### 4. Per-job cache auth (cacheproxy)
-- HMAC-based per-job cache authentication
-- act_runner's cache server has no per-job isolation
+**Impact**: Workflows that generate markdown summaries (test reports, coverage) won't display them.
 
-### 5. Built-in checkout
-- No dependency on external `actions/checkout` action
-- Faster (no node.js startup), more secure (structured args)
-- Works offline — no need to fetch action from registry
+We create the `GITHUB_STEP_SUMMARY` file for each step but never send the content to the server. Gitea/Forgejo may support this via the UpdateTask API.
 
-### 6. Observability
-- Structured JSON logging (slog)
-- act_runner uses logrus (less structured)
+**Work needed**:
+- Check if Gitea's UpdateTask proto has a field for step summaries
+- If yes, read the summary file after each step and include it in the report
+- If no, this is a server-side limitation (skip)
 
-## Gaps to close (priority order)
+### 4. OIDC token support
 
-### Critical — blocks real-world adoption
+**Impact**: Can't use `aws-actions/configure-aws-credentials`, `google-github-actions/auth`, or similar cloud auth actions.
 
-1. **Workflow commands** (`::add-mask::`, `::group::`, `::error::`, `::warning::`)
-   - Without `::add-mask::`, dynamically generated secrets leak in logs
-   - Location: `cmd/entrypoint/main.go` — parse stdout lines for `::` prefix
-   - Scope: entrypoint stdout/stderr processing, reporter mask list
+These actions request an OIDC token from the runner via `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. We don't set these env vars.
 
-2. **Exponential backoff on connection failures**
-   - If Gitea goes down, we hammer it every 2s forever
-   - Location: `pkg/server/poller.go` — add backoff after errors
+**Work needed**:
+- Check if Gitea provides OIDC token fields in the task context
+- If yes, inject `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` into the job environment
+- If no, this is a server-side limitation
 
-3. **Task versioning**
-   - Reduces polling load — important at scale
-   - act_runner sends `tasksVersion` in FetchTask, server skips DB query if unchanged
+### 5. Production hardening
 
-### Important — improves reliability
+**Impact**: Unknown failure modes in real workloads.
 
-4. **Ephemeral mode**
-   - Pick up one job, exit. K8s Job recreates the runner pod.
-   - Enables scale-to-zero with KEDA or similar
+Zero production users means zero real-world bug reports. Need sustained use on a real project.
 
-5. **Retry with exponential backoff in reporter**
-   - Our 10x100ms linear retry is weak for network blips
-   - Should use exponential backoff (100ms, 200ms, 400ms, 800ms...)
+**Work needed**:
+- Deploy on a real project (Rust CI with BuildKit for container builds)
+- Run for 2-4 weeks, fix issues as they arise
+- Monitor: job success rate, cache hit rate, pod scheduling latency
 
-6. **`::add-mask::` at minimum**
-   - Even without full workflow command support, mask handling is critical
-   - Many actions dynamically generate tokens and use `::add-mask::`
+### 6. Documentation
 
-### Nice to have
+**Impact**: No one can use it without docs.
 
-7. **Standalone cache server mode** (act_runner has `cache-server` subcommand)
-8. **Config file validation** (JSON schema or similar)
-9. **GitHub mirror support** (for actions hosted on github.com)
-10. **Nested composite action expansion**
+**Work needed**:
+- README with quick start, architecture diagram, configuration reference
+- Helm chart values documentation
+- BuildKit sidecar pattern guide
+- ZFS snapshot cache setup guide (OpenEBS + loopback for dev, real ZFS for prod)
 
-## Features we should NOT try to match
+## Architecture Advantages (vs act_runner)
 
-- **Docker execution mode** — this is our architectural differentiator. DinD-free is the whole point.
-- **Host execution mode** — we're K8s-native, that's our value prop.
-- **Per-step containers** — would require fundamental redesign for marginal benefit.
+These are permanent differentiators, not gaps to close:
+
+| Feature | drawbar | act_runner |
+|---------|---------|------------|
+| Security | Drop ALL caps, no Docker socket | Requires privileged DinD |
+| Build cache | ZFS snapshot bind mounts (instant) | HTTP tar.gz (minutes) |
+| K8s integration | Native Jobs, RBAC, health probes | Pod with DinD sidecar |
+| Scaling | Ephemeral mode + KEDA | Process-level only |
+| Checkout | Built-in, structured args (no injection) | External action (node.js) |
+| Container builds | BuildKit sidecar (rootless) | DinD (privileged) |
+
+## Won't Fix
+
+- **Docker actions** — replaced by BuildKit sidecar pattern, which is more secure
+- **Host execution mode** — we're K8s-native, that's the value prop
+- **Per-step containers** — single container is simpler and sufficient
