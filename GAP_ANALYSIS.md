@@ -19,26 +19,11 @@ All items from the initial gap analysis (vs act_runner) are done:
 - OIDC token support (`ACTIONS_ID_TOKEN_REQUEST_*` from Gitea task context)
 - GITHUB_* env vars injected into all steps
 - Node actions run via direct exec (preserves hyphenated INPUT_* env vars)
+- Artifact upload/download verified E2E (v3 actions, text + 100KB binary, multi-job with `needs:`)
 
 ## Remaining Gaps — Production Blockers
 
-### 1. Artifact upload/download verification
-
-**Impact**: Multi-job workflows that pass data between jobs won't work if broken.
-
-**Status**: Upload verified, download needs second-job dispatch testing.
-- All env vars injected correctly: `ACTIONS_RUNTIME_URL`, `ACTIONS_RESULTS_URL`, `ACTIONS_RUNTIME_TOKEN`, `GITHUB_*`
-- `actions/upload-artifact@v4` does NOT work — throws `GHESNotSupportedError` for non-github.com servers
-- `actions/upload-artifact@v3` works — successfully uploads artifacts via the pipeline API
-- Gitea's `ROOT_URL` must match the k8s service URL for signed upload URLs to be reachable
-- Node action INPUT_ env vars with hyphens now preserved (direct exec, no shell)
-
-**Work needed**:
-- Test download in a real multi-job workflow (needs Gitea to dispatch the dependent job)
-- Test with large binary artifacts
-- Document that v3 artifacts must be used (v4 blocks GHES/Gitea)
-
-### 2. Production hardening
+### 1. Production hardening
 
 **Impact**: Unknown failure modes in real workloads.
 
@@ -49,7 +34,7 @@ Zero production users means zero real-world bug reports. Need sustained use on a
 - Run for 2-4 weeks, fix issues as they arise
 - Monitor: job success rate, cache hit rate, pod scheduling latency
 
-### 3. Documentation
+### 2. Documentation
 
 **Impact**: No one can use it without docs.
 
