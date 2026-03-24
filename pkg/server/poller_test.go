@@ -55,7 +55,7 @@ func TestPoller_DispatchesTask(t *testing.T) {
 		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 42}}},
 	}
 
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
@@ -78,7 +78,7 @@ func TestPoller_AdditionalTasks(t *testing.T) {
 		}},
 	}
 
-	p := NewPoller(mock, handler, 3, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 3, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
@@ -98,7 +98,7 @@ func TestPoller_NoTask(t *testing.T) {
 		responses: []*runnerv1.FetchTaskResponse{{}},
 	}
 
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
@@ -113,7 +113,7 @@ func TestPoller_FetchError_DeadlineExceeded(t *testing.T) {
 	}
 
 	handler := func(_ context.Context, _ *runnerv1.Task) {}
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	// Should not panic or crash.
@@ -123,7 +123,7 @@ func TestPoller_FetchError_DeadlineExceeded(t *testing.T) {
 func TestPoller_ContextCancellation(t *testing.T) {
 	mock := &mockPollerClient{interval: 10 * time.Millisecond}
 	handler := func(_ context.Context, _ *runnerv1.Task) {}
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -153,13 +153,39 @@ func TestDrain_WaitsForTasks(t *testing.T) {
 		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
 	}
 
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
 	p.Drain(time.Second)
 
 	assert.True(t, finished.Load())
+}
+
+func TestPoller_Ephemeral(t *testing.T) {
+	var taskCount atomic.Int32
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		taskCount.Add(1)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{
+			{Task: &runnerv1.Task{Id: 1}},
+			{Task: &runnerv1.Task{Id: 2}}, // should never be picked up
+		},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, true, slog.Default())
+
+	start := time.Now()
+	p.Run(context.Background()) // should return after first task
+	p.Drain(time.Second)
+	elapsed := time.Since(start)
+
+	assert.Equal(t, int32(1), taskCount.Load(), "ephemeral mode should handle exactly one task")
+	assert.Less(t, elapsed, 2*time.Second, "should exit promptly after task completes")
 }
 
 func TestDrain_Timeout(t *testing.T) {
@@ -172,7 +198,7 @@ func TestDrain_Timeout(t *testing.T) {
 		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
 	}
 
-	p := NewPoller(mock, handler, 1, time.Second, slog.Default())
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)

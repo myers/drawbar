@@ -14,50 +14,74 @@ import (
 // TaskHandler is called when a task is received from Forgejo.
 type TaskHandler func(ctx context.Context, task *runnerv1.Task)
 
-// Poller continuously fetches tasks from Forgejo.
+// Poller continuously fetches tasks from the server.
 type Poller struct {
 	client       PollerClient
 	handler      TaskHandler
 	fetchTimeout time.Duration
 	capacity     int64
+	ephemeral    bool // if true, stop polling after first task completes
 	log          *slog.Logger
 	sem          chan struct{} // concurrency semaphore
 	wg           sync.WaitGroup
+	backoff      time.Duration // current backoff duration (0 = no backoff)
+	stopPoll     context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
 }
 
+const (
+	backoffMin = 2 * time.Second
+	backoffMax = 60 * time.Second
+)
+
 // NewPoller creates a poller that calls handler for each received task.
-func NewPoller(client PollerClient, handler TaskHandler, capacity int64, fetchTimeout time.Duration, log *slog.Logger) *Poller {
+// If ephemeral is true, the poller stops after the first task completes.
+func NewPoller(client PollerClient, handler TaskHandler, capacity int64, fetchTimeout time.Duration, ephemeral bool, log *slog.Logger) *Poller {
 	return &Poller{
 		client:       client,
 		handler:      handler,
 		fetchTimeout: fetchTimeout,
 		capacity:     capacity,
+		ephemeral:    ephemeral,
 		log:          log,
 		sem:          make(chan struct{}, capacity),
 	}
 }
 
-// Run starts the poll loop. Blocks until ctx is cancelled.
+// Run starts the poll loop. Blocks until ctx is cancelled (or until the first
+// task completes in ephemeral mode).
 func (p *Poller) Run(ctx context.Context) {
+	pollCtx, stopPoll := context.WithCancel(ctx)
+	defer stopPoll()
+	p.stopPoll = stopPoll
+
 	var tasksVersion int64
 	requestKey := gouuid.New()
 
-	ticker := time.NewTicker(p.client.FetchInterval())
+	interval := p.client.FetchInterval()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	p.log.Info("poller started",
-		"interval", p.client.FetchInterval(),
+		"interval", interval,
 		"capacity", p.capacity,
+		"ephemeral", p.ephemeral,
 		"endpoint", p.client.Endpoint(),
 	)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-pollCtx.Done():
 			p.log.Info("poller stopping")
 			return
 		case <-ticker.C:
 			p.poll(ctx, &tasksVersion, &requestKey)
+
+			// Adjust ticker: use backoff duration if set, otherwise normal interval.
+			if p.backoff > 0 {
+				ticker.Reset(p.backoff)
+			} else {
+				ticker.Reset(interval)
+			}
 		}
 	}
 }
@@ -79,14 +103,17 @@ func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouu
 		// deadline_exceeded is normal when no tasks are available (server holds connection).
 		if connect.CodeOf(err) == connect.CodeDeadlineExceeded {
 			p.log.Debug("no tasks available", "error", err)
+			p.backoff = 0 // server is reachable, clear backoff
 		} else {
 			p.log.Error("fetch task failed", "error", err)
+			p.increaseBackoff()
 		}
 		// Keep the same request key for retry (idempotency).
 		return
 	}
 
-	// Successful response — rotate request key and update version.
+	// Successful response — clear backoff, rotate request key, update version.
+	p.backoff = 0
 	*requestKey = gouuid.New()
 	*tasksVersion = resp.Msg.GetTasksVersion()
 
@@ -120,6 +147,23 @@ func (p *Poller) dispatchTask(ctx context.Context, task *runnerv1.Task) {
 		defer func() { <-p.sem }()
 		p.handler(ctx, task)
 	}()
+
+	if p.ephemeral && p.stopPoll != nil {
+		p.log.Info("ephemeral mode: task dispatched, stopping poller")
+		p.stopPoll()
+	}
+}
+
+func (p *Poller) increaseBackoff() {
+	if p.backoff == 0 {
+		p.backoff = backoffMin
+	} else {
+		p.backoff *= 2
+		if p.backoff > backoffMax {
+			p.backoff = backoffMax
+		}
+	}
+	p.log.Warn("backing off", "duration", p.backoff)
 }
 
 // Drain waits for all in-flight tasks to complete, up to the given timeout.
