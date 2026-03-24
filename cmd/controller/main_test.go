@@ -426,6 +426,36 @@ func TestBuildGitHubEnv(t *testing.T) {
 	assert.Equal(t, "secret-token", env["GITHUB_TOKEN"])
 }
 
+func TestBuildGitHubEnv_OIDC(t *testing.T) {
+	taskCtx := map[string]*structpb.Value{
+		"server_url": structpb.NewStringValue("https://gitea.example.com"),
+		"forgejo_actions_id_token_request_token": structpb.NewStringValue("oidc-jwt-token"),
+		"forgejo_actions_id_token_request_url":   structpb.NewStringValue("https://gitea.example.com/api/actions/_apis/pipelines/workflows/1/idtoken"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	assert.Equal(t, "oidc-jwt-token", env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"])
+	assert.Equal(t, "https://gitea.example.com/api/actions/_apis/pipelines/workflows/1/idtoken", env["ACTIONS_ID_TOKEN_REQUEST_URL"])
+}
+
+func TestBuildGitHubEnv_OIDC_NotPresent(t *testing.T) {
+	// When Gitea doesn't inject OIDC fields (disabled or fork PR), env vars should be absent.
+	taskCtx := map[string]*structpb.Value{
+		"server_url": structpb.NewStringValue("https://gitea.example.com"),
+		"token":      structpb.NewStringValue("test-token"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	_, hasToken := env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+	_, hasURL := env["ACTIONS_ID_TOKEN_REQUEST_URL"]
+	assert.False(t, hasToken, "OIDC token should not be set when not in context")
+	assert.False(t, hasURL, "OIDC URL should not be set when not in context")
+}
+
 func TestBuildGitHubEnv_EmptyContext(t *testing.T) {
 	env := make(map[string]string)
 	buildGitHubEnv(env, map[string]*structpb.Value{})

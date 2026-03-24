@@ -897,6 +897,12 @@ func buildGitHubEnv(env map[string]string, taskCtx map[string]*structpb.Value) {
 	set("GITHUB_ACTION", "action")
 	set("GITHUB_JOB", "job")
 	set("GITHUB_WORKFLOW", "workflow")
+
+	// OIDC token support. Gitea/Forgejo injects these into the task context
+	// when OIDC is enabled. Cloud auth actions (aws-actions/configure-aws-credentials,
+	// google-github-actions/auth) require these env vars.
+	set("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "forgejo_actions_id_token_request_token")
+	set("ACTIONS_ID_TOKEN_REQUEST_URL", "forgejo_actions_id_token_request_url")
 }
 
 // buildArtifactEnv sets ACTIONS_RUNTIME_URL and ACTIONS_RESULTS_URL in the env map.

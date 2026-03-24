@@ -16,6 +16,9 @@ All items from the initial gap analysis (vs act_runner) are done:
 - Dependencies swapped from Forgejo GPLv3 to Gitea MIT
 - ZFS snapshot cache with bind mounts + restore-keys
 - BuildKit sidecar for container builds (auto-detected, rootless, `drawbar/build-push` action)
+- OIDC token support (`ACTIONS_ID_TOKEN_REQUEST_*` from Gitea task context)
+- GITHUB_* env vars injected into all steps
+- Node actions run via direct exec (preserves hyphenated INPUT_* env vars)
 
 ## Remaining Gaps — Production Blockers
 
@@ -35,29 +38,7 @@ All items from the initial gap analysis (vs act_runner) are done:
 - Test with large binary artifacts
 - Document that v3 artifacts must be used (v4 blocks GHES/Gitea)
 
-### 2. GITHUB_STEP_SUMMARY
-
-**Impact**: Workflows that generate markdown summaries (test reports, coverage) won't display them.
-
-We create the `GITHUB_STEP_SUMMARY` file for each step but never send the content to the server. Gitea/Forgejo may support this via the UpdateTask API.
-
-**Work needed**:
-- Check if Gitea's UpdateTask proto has a field for step summaries
-- If yes, read the summary file after each step and include it in the report
-- If no, this is a server-side limitation (skip)
-
-### 3. OIDC token support
-
-**Impact**: Can't use `aws-actions/configure-aws-credentials`, `google-github-actions/auth`, or similar cloud auth actions.
-
-These actions request an OIDC token from the runner via `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. We don't set these env vars.
-
-**Work needed**:
-- Check if Gitea provides OIDC token fields in the task context
-- If yes, inject `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` into the job environment
-- If no, this is a server-side limitation
-
-### 4. Production hardening
+### 2. Production hardening
 
 **Impact**: Unknown failure modes in real workloads.
 
@@ -68,7 +49,7 @@ Zero production users means zero real-world bug reports. Need sustained use on a
 - Run for 2-4 weeks, fix issues as they arise
 - Monitor: job success rate, cache hit rate, pod scheduling latency
 
-### 5. Documentation
+### 3. Documentation
 
 **Impact**: No one can use it without docs.
 
@@ -96,3 +77,4 @@ These are permanent differentiators, not gaps to close:
 - **Docker actions** — replaced by BuildKit sidecar pattern, which is more secure
 - **Host execution mode** — we're K8s-native, that's the value prop
 - **Per-step containers** — single container is simpler and sufficient
+- **GITHUB_STEP_SUMMARY** — Gitea's runner proto (`StepState`, `UpdateTaskRequest`) has no summary field; server-side limitation
