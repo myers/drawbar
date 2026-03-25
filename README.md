@@ -260,6 +260,67 @@ All config values can be overridden with environment variables:
 | `SNAPSHOT_RETENTION_DAYS` | `snapshot.retention_days` |
 | `LOG_LEVEL` | `log.level` |
 
+## Autoscaling with KEDA
+
+drawbar exposes a `/metrics/active-jobs` JSON endpoint on port 8081 that reports active job count and capacity:
+
+```json
+{"active": 1, "capacity": 1}
+```
+
+[KEDA](https://keda.sh) can use this to scale the drawbar deployment based on load.
+
+### Setup
+
+1. Install KEDA:
+
+```bash
+kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.19.0/keda-2.19.0.yaml
+```
+
+2. Create a Service for the metrics endpoint:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: runner-metrics
+  namespace: drawbar
+spec:
+  selector:
+    app: drawbar                    # match your deployment pod labels
+  ports:
+  - port: 8081
+    targetPort: 8081
+```
+
+3. Create a ScaledObject:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: drawbar-scaler
+  namespace: drawbar
+spec:
+  scaleTargetRef:
+    name: runner-runner             # your drawbar Deployment name
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 5                # check every 5 seconds
+  cooldownPeriod: 30                # scale down 30s after jobs finish
+  triggers:
+  - type: metrics-api
+    metadata:
+      targetValue: "1"
+      url: "http://runner-metrics.drawbar.svc:8081/metrics/active-jobs"
+      valueLocation: "active"
+```
+
+When active jobs reach the threshold, KEDA scales up additional replicas. When jobs finish, it scales back down after the cooldown period. Multiple replicas can share the same cache PVC (SQLite WAL mode allows concurrent access).
+
+**Note**: If using Forgejo, you can alternatively use KEDA's native `forgejo-runner` scaler which polls the Forgejo API directly for pending jobs. This provides better scaling signals (pending queue depth vs active count) but requires Forgejo-specific API endpoints that Gitea doesn't have.
+
 ## Known Issues
 
 See [BUGS.md](BUGS.md) for known bugs and [GITEA_FETCHTASK_BUG.md](GITEA_FETCHTASK_BUG.md) for a Gitea server-side issue affecting task reliability under concurrent load (fixed in Forgejo, not yet in Gitea).
