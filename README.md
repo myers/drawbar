@@ -321,6 +321,80 @@ When active jobs reach the threshold, KEDA scales up additional replicas. When j
 
 **Note**: If using Forgejo, you can alternatively use KEDA's native `forgejo-runner` scaler which polls the Forgejo API directly for pending jobs. This provides better scaling signals (pending queue depth vs active count) but requires Forgejo-specific API endpoints that Gitea doesn't have.
 
+## Troubleshooting
+
+### Runner not picking up tasks
+
+```bash
+# Check the controller is registered and polling
+kubectl logs -n drawbar -l app=drawbar --tail=20
+
+# Look for: "runner is online, polling for tasks"
+# If missing: check server.url, registration token, network connectivity
+```
+
+If the runner polls but never receives tasks:
+- Verify the runner appears in Gitea's admin UI under Runners
+- Check the runner labels match your workflow's `runs-on:`
+- If using Gitea (not Forgejo): see [GITEA_FETCHTASK_BUG.md](GITEA_FETCHTASK_BUG.md) for a known issue with lost tasks under concurrent load
+
+### Job pod stuck in Init or CrashLoopBackOff
+
+```bash
+# Check which init container is failing
+kubectl describe pod -n drawbar <pod-name>
+
+# Check service sidecar logs (e.g., BuildKit, postgres)
+kubectl logs -n drawbar <pod-name> -c svc-buildkit
+
+# Check the setup-shim init container
+kubectl logs -n drawbar <pod-name> -c setup-shim
+```
+
+Common causes:
+- **Image pull failure**: job image or service image can't be pulled (check registry access, image name)
+- **BuildKit sidecar crash**: if `moby/buildkit:rootless` fails with `newuidmap: operation not permitted`, the drawbar image may be outdated (auto-detection of seccomp/caps was added recently)
+- **wait-for-services timeout**: service container is listening on a different port than declared
+
+### Step fails inside job pod
+
+```bash
+# Get the runner container logs (all step output goes here)
+kubectl logs -n drawbar <pod-name> -c runner
+```
+
+The runner container's stdout/stderr contains all step output, including `::error::` and `::debug::` workflow commands. Each step failure prints `Step N (name) failed with exit code X`.
+
+### Node action fails silently (exit 0, no output)
+
+This usually means the action caught an error internally. Common causes:
+- **`actions/upload-artifact@v4`**: throws `GHESNotSupportedError` on non-github.com servers. Use `@v3` instead.
+- **Missing env vars**: check that `GITHUB_RUN_ID`, `GITHUB_REPOSITORY`, `ACTIONS_RUNTIME_TOKEN` are set. Run a `run: env | sort` step to inspect.
+- **`RUNNER_TEMP` not set**: some actions require this (drawbar sets it to `/tmp`).
+
+### Cache not working
+
+```bash
+# Check cache server is running
+kubectl logs -n drawbar -l app=drawbar | grep "cache server"
+
+# Test the cache endpoint from inside the cluster
+kubectl run test --rm -i --restart=Never --image=alpine -- \
+  wget -qO- http://runner-runner-cache.drawbar.svc:9300/_apis/artifactcache/cache?keys=test&version=v1
+```
+
+The cache uses SQLite WAL (`cache.db`), not BoltDB. If upgrading from an older version, the old `bolt.db` is ignored — cache entries repopulate on next CI run.
+
+### Artifacts not uploading
+
+- Use `actions/upload-artifact@v3` (v4 doesn't work with Gitea/Forgejo)
+- Gitea's `ROOT_URL` must be reachable from job pods — if it's set to `localhost`, signed upload URLs won't work. Set it to the k8s service URL (e.g., `http://gitea.gitea.svc:80/`)
+- Check that `ACTIONS_RUNTIME_TOKEN` is set (requires cache to be enabled, or `gitea_runtime_token` in task context)
+
+### Log level
+
+Set `log.level: debug` in the Helm values (or `LOG_LEVEL=debug` env var) for verbose output from the controller, including expression evaluation, action loading, and cache operations.
+
 ## Known Issues
 
 See [BUGS.md](BUGS.md) for known bugs and [GITEA_FETCHTASK_BUG.md](GITEA_FETCHTASK_BUG.md) for a Gitea server-side issue affecting task reliability under concurrent load (fixed in Forgejo, not yet in Gitea).
