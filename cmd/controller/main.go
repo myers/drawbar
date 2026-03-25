@@ -488,34 +488,6 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 					ContinueOnError: continueOnError,
 					TimeoutMinutes:  timeout,
 				})
-			} else if workflow.IsCheckout(step) {
-				// uses: actions/checkout — built-in git clone via structured args
-				spec, err := workflow.ResolveCheckout(task, step, cfg.GitCloneURL)
-				if err != nil {
-					slog.Error("failed to resolve checkout", "error", err)
-					reportFailure(ctx, cfg.ServerClient, task, fmt.Sprintf("Checkout error: %v", err))
-					return
-				}
-				checkoutSpecs := spec.ToStepSpecs()
-				for j, cs := range checkoutSpecs {
-					csID := stepID
-					if j > 0 {
-						csID = fmt.Sprintf("%s-checkout-%d", stepID, j)
-					}
-					csIf := ""
-					if j == 0 {
-						csIf = ifExpr // only first checkout sub-step gets the condition
-					}
-					steps = append(steps, types.StepSpec{
-						ID:              csID,
-						Name:            cs.Name,
-						Args:            cs.Args,
-						Env:             cs.Env,
-						If:              csIf,
-						ContinueOnError: continueOnError,
-						TimeoutMinutes:  timeout,
-					})
-				}
 			} else if step.Uses != "" {
 				// Generic action (node, docker, composite, go, sh).
 				ref, err := actions.ParseActionRef(step.Uses)
@@ -531,14 +503,25 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 					return
 				}
 
-				actionSpecs, err := meta.ToStepSpecs(step.With, step.GetEnv(), ectx)
+				// Interpolate with: and env: values — action input defaults
+			// (e.g., actions/checkout's token: ${{ github.token }}) contain
+			// expressions that must be resolved before execution.
+			interpolatedWith := eval.InterpolateMap(step.With)
+			interpolatedEnv := eval.InterpolateMap(step.GetEnv())
+			actionSpecs, err := meta.ToStepSpecs(interpolatedWith, interpolatedEnv, ectx)
 				if err != nil {
 					slog.Error("failed to build action steps", "action", ref.String(), "error", err)
 					reportFailure(ctx, cfg.ServerClient, task, fmt.Sprintf("Failed to build action %s: %v", ref.String(), err))
 					return
 				}
 
-				for j, as := range actionSpecs {
+				// Interpolate action input defaults (from action.yml) that may
+			// contain expressions like ${{ github.token }}.
+			for i := range actionSpecs {
+				actionSpecs[i].Env = eval.InterpolateMap(actionSpecs[i].Env)
+			}
+
+			for j, as := range actionSpecs {
 					asID := stepID
 					if j > 0 {
 						asID = fmt.Sprintf("%s-%d", stepID, j)

@@ -45,7 +45,7 @@ These are permanent differentiators, not gaps to close:
 | Build cache | ZFS snapshot bind mounts (instant) | HTTP tar.gz (minutes) |
 | K8s integration | Native Jobs, RBAC, health probes | Pod with DinD sidecar |
 | Scaling | Ephemeral mode + KEDA | Process-level only |
-| Checkout | Built-in, structured args (no injection) | External action (node.js) |
+| Checkout | actions/checkout@v4 via direct exec | External action (node.js) |
 | Container builds | BuildKit sidecar (rootless) | DinD (privileged) |
 
 ## Won't Fix

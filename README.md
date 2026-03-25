@@ -22,7 +22,7 @@ drawbar replaces DinD with native Kubernetes primitives:
 - **Service containers** — postgres, redis, etc. as k8s native sidecars (k8s 1.28+)
 - **Expression evaluation** — `${{ github.* }}`, `${{ env.* }}`, `${{ secrets.* }}`, step `if:` conditions
 - **Action support** — Node.js, composite, Go, and shell actions via direct exec
-- **Built-in checkout** — `actions/checkout` as native git clone (no Node.js required)
+- **`actions/checkout@v4`** — works natively (loaded as a Node.js action, auth via `GITHUB_TOKEN`)
 - **Action cache server** — GitHub Actions cache protocol with BoltDB + PVC storage
 - **Action repo caching** — actions cloned once to PVC, mounted via k8s subPath (zero copy per build)
 - **BuildKit sidecar** — auto-detected, rootless, unprivileged container builds

@@ -390,43 +390,6 @@ func defaultWatchConfig() k8s.WatchConfig {
 	}
 }
 
-// --- Checkout step ---
-
-func TestMakeTaskHandler_CheckoutStep(t *testing.T) {
-	env := newHandlerTestEnv(t)
-	env.spawnPod("test-ns", 10)
-
-	task := &runnerv1.Task{
-		Id: 10,
-		WorkflowPayload: []byte(`name: CI
-on: [push]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "after checkout"
-`),
-		Context: defaultTaskContext(),
-		Secrets: map[string]string{},
-	}
-
-	handler := makeTaskHandler(TaskHandlerConfig{
-		K8sClient:     env.k8sClient,
-		ServerClient: env.forgejoClient,
-		Labels:        labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")},
-		Namespace:     "test-ns",
-		Timeout:       5 * time.Minute,
-		WatchConfig:   defaultWatchConfig(),
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	handler(ctx, task)
-
-	env.assertResult(runnerv1.Result_RESULT_SUCCESS)
-}
-
 // --- Action step (with pre-cached action) ---
 
 func TestMakeTaskHandler_ActionStep(t *testing.T) {
