@@ -44,11 +44,20 @@ drawbar replaces DinD with native Kubernetes primitives:
 ```bash
 helm install runner oci://fj.monoloco.net/chaos-inc/drawbar \
   --namespace drawbar --create-namespace \
-  --set server.url=https://your-gitea-instance.example.com \
-  --set server.registrationToken=<token>
+  --set server.url=https://gitea.example.com \
+  --set server.registrationToken=<token> \
+  --set runner.gitCloneUrl=http://gitea.gitea.svc:80
 ```
 
 Get a registration token: **Site Administration > Runners > Create Registration Token**.
+
+### URL Configuration
+
+drawbar needs two URLs:
+
+- **`server.url`** — Your Gitea external hostname (e.g., `https://gitea.example.com`). Used for runner registration, API calls, and as `GITHUB_SERVER_URL` in workflows. Gitea's `ROOT_URL` should match this — it's used to generate artifact signed upload URLs that job pods must be able to reach.
+
+- **`runner.gitCloneUrl`** (optional) — Internal k8s service URL for git clone (e.g., `http://gitea.gitea.svc:80`). Job pods use this instead of going through the external ingress, which is faster and avoids TLS/DNS issues. If omitted, `server.url` is used for cloning too.
 
 ## Architecture
 
@@ -388,7 +397,7 @@ The cache uses SQLite WAL (`cache.db`), not BoltDB. If upgrading from an older v
 ### Artifacts not uploading
 
 - Use `actions/upload-artifact@v3` (v4 doesn't work with Gitea/Forgejo)
-- Gitea's `ROOT_URL` must be reachable from job pods — if it's set to `localhost`, signed upload URLs won't work. Set it to the k8s service URL (e.g., `http://gitea.gitea.svc:80/`)
+- Gitea's `ROOT_URL` must be reachable from job pods — if it's set to `localhost`, signed upload URLs won't work. Set it to your external hostname (see [URL Configuration](#url-configuration))
 - Check that `ACTIONS_RUNTIME_TOKEN` is set (requires cache to be enabled, or `gitea_runtime_token` in task context)
 
 ### Log level
