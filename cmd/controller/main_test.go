@@ -14,7 +14,6 @@ import (
 	"github.com/myers/drawbar/pkg/config"
 	"github.com/myers/drawbar/pkg/server"
 	"github.com/myers/drawbar/pkg/labels"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -277,15 +276,6 @@ func TestReadyzHandler_NotReady(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler(w, req)
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-}
-
-// --- newLogrusLogger ---
-
-func TestNewLogrusLogger(t *testing.T) {
-	l := newLogrusLogger()
-	assert.NotNil(t, l)
-	_, ok := l.Formatter.(*logrus.JSONFormatter)
-	assert.True(t, ok, "expected JSON formatter")
 }
 
 // --- startCacheServer ---

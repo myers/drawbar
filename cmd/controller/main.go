@@ -15,14 +15,13 @@ import (
 	"time"
 
 	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
-	"github.com/nektos/act/pkg/artifactcache"
 	"github.com/nektos/act/pkg/exprparser"
-
 	"github.com/nektos/act/pkg/model"
 
 	snapshotclient "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
 
 	"github.com/myers/drawbar/pkg/actions"
+	"github.com/myers/drawbar/pkg/cache"
 	"github.com/myers/drawbar/pkg/config"
 	"github.com/myers/drawbar/pkg/expressions"
 	"github.com/myers/drawbar/pkg/server"
@@ -32,7 +31,6 @@ import (
 	"github.com/myers/drawbar/pkg/snapshot"
 	"github.com/myers/drawbar/pkg/types"
 
-	"github.com/sirupsen/logrus"
 	"github.com/myers/drawbar/pkg/version"
 	"github.com/myers/drawbar/pkg/workflow"
 
@@ -180,7 +178,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	}
 
 	// Start cache server if enabled.
-	var cacheHandler *artifactcache.Handler
+	var cacheHandler *cache.Handler
 	if cfg.Cache.Enabled {
 		cacheHandler, err = startCacheServer(cfg.Cache)
 		if err != nil {
@@ -356,37 +354,11 @@ func readyzHandler(registered *atomic.Bool) http.HandlerFunc {
 	}
 }
 
-func startCacheServer(cfg config.CacheConfig) (*artifactcache.Handler, error) {
+func startCacheServer(cfg config.CacheConfig) (*cache.Handler, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating cache dir %s: %w", cfg.Dir, err)
 	}
-
-	// Retry with exponential backoff — BoltDB takes an exclusive file lock,
-	// so during rolling updates the new pod must wait for the old one to release it.
-	logger := newLogrusLogger()
-	backoff := 1 * time.Second
-	for attempt := range 8 {
-		handler, err := artifactcache.StartHandler(cfg.Dir, "", cfg.Port, logger)
-		if err == nil {
-			return handler, nil
-		}
-		if attempt == 7 {
-			return nil, fmt.Errorf("starting cache handler (gave up after 8 attempts): %w", err)
-		}
-		slog.Warn("cache server start failed, retrying (BoltDB lock?)",
-			"attempt", attempt+1, "backoff", backoff, "error", err)
-		time.Sleep(backoff)
-		backoff *= 2
-	}
-	return nil, fmt.Errorf("unreachable")
-}
-
-// newLogrusLogger creates a logrus logger for cache packages (which require logrus).
-func newLogrusLogger() *logrus.Logger {
-	l := logrus.New()
-	l.SetOutput(os.Stdout)
-	l.SetFormatter(&logrus.JSONFormatter{})
-	return l
+	return cache.StartHandler(cfg.Dir, "", cfg.Port)
 }
 
 // TaskHandlerConfig holds all dependencies for the task handler.
@@ -400,7 +372,7 @@ type TaskHandlerConfig struct {
 	GitCloneURL      string
 	ActionsURL       string
 	ControllerImage  string
-	CacheHandler     *artifactcache.Handler
+	CacheHandler     *cache.Handler
 	CachePVCName     string
 	JobSecrets       []config.JobSecret
 	ActionCache      *actions.ActionCache
