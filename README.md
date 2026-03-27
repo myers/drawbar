@@ -1,5 +1,7 @@
 # drawbar
 
+> **Early Alpha** — written by a coding agent, has not been used yet. YOU HAVE BEEN WARNED.
+
 A Kubernetes-native runner for [Gitea Actions](https://docs.gitea.com/usage/actions/overview) and [Forgejo Actions](https://forgejo.org/docs/latest/user/actions/). Executes workflow jobs as unprivileged Kubernetes pods — no Docker-in-Docker required.
 
 ## Why
