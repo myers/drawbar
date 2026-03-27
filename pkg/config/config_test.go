@@ -26,6 +26,7 @@ func TestLoad_NoFile(t *testing.T) {
 }
 
 func TestLoad_ValidFile(t *testing.T) {
+	t.Setenv("RUNNER_NAME", "")
 	content := `
 server:
   url: http://localhost:3000

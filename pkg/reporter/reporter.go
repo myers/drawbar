@@ -216,13 +216,17 @@ func (r *Reporter) flushLogs(ctx context.Context, noMore bool) error {
 
 func (r *Reporter) flushState(ctx context.Context) error {
 	r.mu.Lock()
-	// Clone the state for sending.
+	steps := make([]*runnerv1.StepState, len(r.state.Steps))
+	for i, s := range r.state.Steps {
+		clone := *s
+		steps[i] = &clone
+	}
 	state := &runnerv1.TaskState{
 		Id:        r.state.Id,
 		Result:    r.state.Result,
 		StartedAt: r.state.StartedAt,
 		StoppedAt: r.state.StoppedAt,
-		Steps:     r.state.Steps,
+		Steps:     steps,
 	}
 	r.mu.Unlock()
 
