@@ -21,6 +21,7 @@ RUN CGO_ENABLED=0 go build \
     -o /out/entrypoint ./cmd/entrypoint/
 
 FROM debian:trixie-slim
+LABEL org.opencontainers.image.source=https://github.com/myers/drawbar
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 # Optional CA cert for MITM proxy environments (glob matches nothing if file absent)
 COPY mitmproxy-ca-cert.cr[t] /usr/local/share/ca-certificates/
