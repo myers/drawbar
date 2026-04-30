@@ -248,7 +248,6 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		ActionsURL:       cfg.Runner.ActionsURL,
 		ControllerImage:  cfg.Runner.ControllerImage,
 		CacheHandler:     cacheHandler,
-		CachePVCName:     cfg.Cache.PVCName,
 		JobSecrets:       cfg.Runner.JobSecrets,
 		ActionCache:      actionCache,
 		WatchConfig:      deps.watchCfg,
@@ -385,7 +384,6 @@ type TaskHandlerConfig struct {
 	ActionsURL       string
 	ControllerImage  string
 	CacheHandler     *cache.Handler
-	CachePVCName     string
 	JobSecrets       []config.JobSecret
 	ActionCache      *actions.ActionCache
 	WatchConfig      k8s.WatchConfig    // optional; zero value uses defaults
@@ -592,12 +590,6 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		// Artifact server URL (Forgejo handles artifacts server-side).
 		buildArtifactEnv(baseEnv, taskCtx["server_url"].GetStringValue(), cfg.GitCloneURL)
 
-		// Determine cache PVC name.
-		jobCachePVCName := ""
-		if len(actionsToClone) > 0 {
-			jobCachePVCName = cfg.CachePVCName
-		}
-
 		secretMounts := convertJobSecrets(cfg.JobSecrets)
 
 		// Build evaluation context for runtime if: conditions.
@@ -632,6 +624,23 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			}
 		}
 
+		// Build ActionFetch list for setup-shim from the resolved actions.
+		var actionFetches []types.ActionFetch
+		if cfg.CacheHandler != nil {
+			cacheBase := cfg.CacheHandler.ExternalURL()
+			seen := map[string]bool{}
+			for _, m := range actionsToClone {
+				if m == nil || m.Dir == "" || seen[m.Dir] {
+					continue
+				}
+				seen[m.Dir] = true
+				actionFetches = append(actionFetches, types.ActionFetch{
+					Dir: m.Dir,
+					URL: fmt.Sprintf("%s/_apis/actions/%s/tar", strings.TrimRight(cacheBase, "/"), m.Dir),
+				})
+			}
+		}
+
 		k8sJob, err := k8s.BuildJob(k8s.JobConfig{
 			TaskID:           task.GetId(),
 			RunID:            runID,
@@ -643,7 +652,7 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			BaseEnv:          baseEnv,
 			Services:         services,
 			Timeout:          timeoutSecs,
-			CachePVCName:     jobCachePVCName,
+			Actions:          actionFetches,
 			JobSecrets:       secretMounts,
 			EvalContext:      evalCtx,
 			SnapshotPVCName:  snapshotPVCName,

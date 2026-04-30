@@ -434,7 +434,6 @@ jobs:
 		Timeout:       5 * time.Minute,
 		ActionsURL:    baseDir,
 		ActionCache:   actionCache,
-		CachePVCName:  "cache-pvc",
 		WatchConfig:   defaultWatchConfig(),
 	})
 
