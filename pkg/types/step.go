@@ -27,6 +27,14 @@ type Manifest struct {
 	Steps   []ManifestStep    `json:"steps"`
 	BaseEnv map[string]string `json:"baseEnv"`
 	Context *EvalContext      `json:"context,omitempty"`
+	Actions []ActionFetch     `json:"actions,omitempty"`
+}
+
+// ActionFetch tells the setup subcommand to fetch an action tarball from the
+// cache server and unpack it into /actions/<Dir>/ before the runner starts.
+type ActionFetch struct {
+	Dir string `json:"dir"`
+	URL string `json:"url"`
 }
 
 // EvalContext holds the serializable evaluation context for runtime if: conditions.
