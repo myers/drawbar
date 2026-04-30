@@ -89,6 +89,7 @@ func StartHandler(dir string, outboundIP string, port uint16) (*Handler, error) 
 	router.POST(urlBase+"/caches/:id", h.middleware(h.commit))
 	router.GET(urlBase+"/artifacts/:id", h.middleware(h.get))
 	router.POST(urlBase+"/clean", h.middleware(h.clean))
+	router.GET("/_apis/actions/:dir/tar", h.middleware(h.serveAction))
 	h.router = router
 
 	h.gcCache()
@@ -382,4 +383,48 @@ func parseContentRange(s string) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("parse %q: %w", s, err)
 	}
 	return start, stop, nil
+}
+
+// GET /_apis/actions/:dir/tar
+func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	dir := params.ByName("dir")
+	if !isSafeActionDir(dir) {
+		http.Error(w, "invalid action dir", http.StatusBadRequest)
+		return
+	}
+	actionPath := filepath.Join(h.dir, "actions-repo-cache", dir)
+	info, err := os.Stat(actionPath)
+	if err != nil || !info.IsDir() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
+	if err := tarDir(w, actionPath, []string{".git"}); err != nil {
+		// Headers are already written; we can't switch to JSON error here.
+		// Log and let the connection drop with a truncated tar — the client
+		// will see archive/tar.ErrHeader on parse and retry.
+		slog.Error("serve action tar", "dir", dir, "error", err)
+	}
+}
+
+// isSafeActionDir validates that dir is a single component matching the charset
+// produced by ActionRef.ActionDir() in pkg/actions/resolve.go: ASCII letters
+// (either case), digits, dash, and underscore. No slashes, no dots — both
+// would let path traversal escape the actions cache root.
+func isSafeActionDir(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

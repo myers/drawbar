@@ -154,3 +154,74 @@ func TestCacheDB_CRUD(t *testing.T) {
 	got, _ = GetCache(db, c.ID)
 	assert.Nil(t, got)
 }
+
+func TestServeAction_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	actionRoot := filepath.Join(dir, "actions-repo-cache", "actions-checkout-v4")
+	require.NoError(t, os.MkdirAll(filepath.Join(actionRoot, "dist"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(actionRoot, "action.yml"), []byte("name: checkout"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(actionRoot, "dist", "index.js"), []byte("body"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(actionRoot, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(actionRoot, ".git", "HEAD"), []byte("ref"), 0o644))
+
+	h, err := StartHandler(dir, "127.0.0.1", 0)
+	require.NoError(t, err)
+	defer h.Close()
+
+	url := h.ExternalURL() + "/_apis/actions/actions-checkout-v4/tar"
+	resp, err := http.Get(url)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "application/x-tar", resp.Header.Get("Content-Type"))
+
+	entries := readTarEntries(t, resp.Body)
+	assert.Equal(t, "name: checkout", entries["action.yml"])
+	assert.Equal(t, "body", entries["dist/index.js"])
+	_, hasGitHead := entries[".git/HEAD"]
+	assert.False(t, hasGitHead, ".git/ must be excluded from the response")
+}
+
+func TestServeAction_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	h, err := StartHandler(dir, "127.0.0.1", 0)
+	require.NoError(t, err)
+	defer h.Close()
+
+	resp, err := http.Get(h.ExternalURL() + "/_apis/actions/does-not-exist/tar")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestServeAction_RejectsInvalidName(t *testing.T) {
+	dir := t.TempDir()
+	h, err := StartHandler(dir, "127.0.0.1", 0)
+	require.NoError(t, err)
+	defer h.Close()
+
+	// Names with characters outside [A-Za-z0-9_-] should be rejected by the validator.
+	for _, name := range []string{"foo.bar", "foo bar", "foo+bar"} {
+		resp, err := http.Get(h.ExternalURL() + "/_apis/actions/" + name + "/tar")
+		require.NoError(t, err, "name=%q", name)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "name=%q should be rejected", name)
+	}
+}
+
+func TestServeAction_AcceptsActionDirCharset(t *testing.T) {
+	// Names matching what ActionRef.ActionDir() produces: lower/upper, digits,
+	// dash, underscore. Each must reach the handler (which then 404s because
+	// the action dir doesn't exist on disk — proving the validator passed it).
+	dir := t.TempDir()
+	h, err := StartHandler(dir, "127.0.0.1", 0)
+	require.NoError(t, err)
+	defer h.Close()
+
+	for _, name := range []string{"Swatinem-rust-cache-v2-7-0", "actions-checkout-v4", "Foo_Bar-1"} {
+		resp, err := http.Get(h.ExternalURL() + "/_apis/actions/" + name + "/tar")
+		require.NoError(t, err, "name=%q", name)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "name=%q must reach handler (404), not be 400-rejected", name)
+	}
+}
