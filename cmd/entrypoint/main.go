@@ -13,7 +13,10 @@ import (
 	"github.com/myers/drawbar/pkg/expressions"
 )
 
-const shimDir = "/shim"
+const (
+	shimDir    = "/shim"
+	actionsDir = "/actions"
+)
 
 // runCommand is the function used to execute commands. Tests can override it.
 var runCommand = func(cmd *exec.Cmd) error { return cmd.Run() }
@@ -27,7 +30,7 @@ func main() {
 		if len(os.Args) < 3 {
 			usage()
 		}
-		if err := runSetup(os.Args[2], "/actions"); err != nil {
+		if err := runSetup(os.Args[2], actionsDir, shimDir); err != nil {
 			fmt.Fprintf(os.Stderr, "setup error: %v\n", err)
 			os.Exit(1)
 		}

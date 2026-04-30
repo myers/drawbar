@@ -59,11 +59,12 @@ func TestRunSetup_HappyPath(t *testing.T) {
 
 	tmp := t.TempDir()
 	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
 	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
 		{Dir: "foo-bar", URL: srv.URL + "/_apis/actions/foo-bar/tar"},
 	})
 
-	err := runSetup(manifestPath, actionsDir)
+	err := runSetup(manifestPath, actionsDir, shimDir)
 	require.NoError(t, err)
 
 	body, err := os.ReadFile(filepath.Join(actionsDir, "foo-bar", "action.yml"))
@@ -95,11 +96,12 @@ func TestRunSetup_RetriesOn5xx(t *testing.T) {
 
 	tmp := t.TempDir()
 	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
 	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
 		{Dir: "foo", URL: srv.URL},
 	})
 
-	err := runSetup(manifestPath, actionsDir)
+	err := runSetup(manifestPath, actionsDir, shimDir)
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), calls.Load(), "should have retried once after the 503")
 }
@@ -116,11 +118,12 @@ func TestRunSetup_FailsAfterMaxRetries(t *testing.T) {
 
 	tmp := t.TempDir()
 	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
 	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
 		{Dir: "foo", URL: srv.URL},
 	})
 
-	err := runSetup(manifestPath, actionsDir)
+	err := runSetup(manifestPath, actionsDir, shimDir)
 	assert.Error(t, err)
 }
 
@@ -134,11 +137,12 @@ func TestRunSetup_FailsFastOn404(t *testing.T) {
 
 	tmp := t.TempDir()
 	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
 	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
 		{Dir: "foo", URL: srv.URL},
 	})
 
-	err := runSetup(manifestPath, actionsDir)
+	err := runSetup(manifestPath, actionsDir, shimDir)
 	assert.Error(t, err)
 	assert.Equal(t, int32(1), calls.Load(), "404 must not be retried")
 }
@@ -155,11 +159,12 @@ func TestRunSetup_RejectsTarTraversal(t *testing.T) {
 
 	tmp := t.TempDir()
 	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
 	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
 		{Dir: "foo", URL: srv.URL},
 	})
 
-	err := runSetup(manifestPath, actionsDir)
+	err := runSetup(manifestPath, actionsDir, shimDir)
 	assert.Error(t, err, "path traversal must be rejected")
 
 	// The escape file must not have been written.

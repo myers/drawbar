@@ -43,13 +43,14 @@ func TestBuildJob_SingleContainer(t *testing.T) {
 	require.Len(t, containers, 1)
 	assert.Equal(t, "runner", containers[0].Name)
 	assert.Equal(t, "node:24-trixie", containers[0].Image)
-	assert.Equal(t, []string{"/shim/entrypoint", "/shim/manifest.json"}, containers[0].Command)
+	assert.Equal(t, []string{"/shim/entrypoint", "run", "/shim/manifest.json"}, containers[0].Command)
 	assert.Equal(t, "/workspace", containers[0].WorkingDir)
 
-	// Volumes: workspace + shim.
-	require.Len(t, job.Spec.Template.Spec.Volumes, 2)
+	// Volumes: workspace + shim + actions.
+	require.Len(t, job.Spec.Template.Spec.Volumes, 3)
 	assert.Equal(t, "workspace", job.Spec.Template.Spec.Volumes[0].Name)
 	assert.Equal(t, "shim", job.Spec.Template.Spec.Volumes[1].Name)
+	assert.Equal(t, "actions", job.Spec.Template.Spec.Volumes[2].Name)
 
 	// Job config.
 	assert.Equal(t, int32(0), *job.Spec.BackoffLimit)
@@ -84,44 +85,74 @@ func TestBuildJob_WithServices(t *testing.T) {
 	assert.Equal(t, "setup-shim", initCs[2].Name)
 }
 
-func TestBuildJob_WithActions(t *testing.T) {
+func TestBuildJob_ActionsEmptyDirAndManifestActions(t *testing.T) {
 	cfg := JobConfig{
 		TaskID:          1,
 		Namespace:       "default",
 		Image:           "node:24-trixie",
 		ControllerImage: "runner:latest",
-		CachePVCName:    "runner-cache",
 		Steps: []types.StepSpec{
-			{ID: "cache", Name: "actions/cache", Args: []string{"node", "/actions/ac/dist/index.js"}, ActionDir: "ac"},
+			{ID: "checkout", Name: "actions/checkout", Args: []string{"node", "/actions/actions-checkout-v4/dist/index.js"}, ActionDir: "actions-checkout-v4"},
+		},
+		Actions: []types.ActionFetch{
+			{Dir: "actions-checkout-v4", URL: "http://drawbar-cache:9300/_apis/actions/actions-checkout-v4/tar"},
 		},
 	}
 
 	job, err := BuildJob(cfg)
 	require.NoError(t, err)
 
-	// Should have actions-cache PVC volume.
-	foundPVC := false
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		if v.Name == "actions-cache" {
-			foundPVC = true
-			assert.Equal(t, "runner-cache", v.PersistentVolumeClaim.ClaimName)
-			assert.True(t, v.PersistentVolumeClaim.ReadOnly)
+	// Pod should have an `actions` emptyDir volume and NO actions-cache PVC.
+	var actionsVol *corev1.Volume
+	for i := range job.Spec.Template.Spec.Volumes {
+		v := &job.Spec.Template.Spec.Volumes[i]
+		if v.Name == "actions" {
+			actionsVol = v
 		}
+		assert.NotEqual(t, "actions-cache", v.Name, "actions-cache PVC must not be present in the pod spec")
 	}
-	assert.True(t, foundPVC, "actions-cache PVC should be present")
+	require.NotNil(t, actionsVol, "actions emptyDir volume must be present")
+	require.NotNil(t, actionsVol.EmptyDir, "actions volume must be emptyDir, not PVC")
 
-	// Runner should have subPath mount.
-	runner := job.Spec.Template.Spec.Containers[0]
-	foundMount := false
-	for _, m := range runner.VolumeMounts {
-		if m.Name == "actions-cache" {
-			foundMount = true
-			assert.Equal(t, "/actions/ac", m.MountPath)
-			assert.Equal(t, "actions-repo-cache/ac", m.SubPath)
-			assert.True(t, m.ReadOnly)
+	// Setup-shim init container must mount /actions (write).
+	var setupShim *corev1.Container
+	for i := range job.Spec.Template.Spec.InitContainers {
+		c := &job.Spec.Template.Spec.InitContainers[i]
+		if c.Name == "setup-shim" {
+			setupShim = c
 		}
 	}
-	assert.True(t, foundMount, "action subPath mount should be present")
+	require.NotNil(t, setupShim, "setup-shim init container must exist")
+	foundShimMount := false
+	for _, m := range setupShim.VolumeMounts {
+		if m.Name == "actions" && m.MountPath == "/actions" {
+			foundShimMount = true
+			assert.False(t, m.ReadOnly, "setup-shim must mount /actions read-write")
+		}
+	}
+	assert.True(t, foundShimMount, "setup-shim must mount /actions")
+
+	// Runner must mount /actions read-only.
+	runner := job.Spec.Template.Spec.Containers[0]
+	foundRunnerMount := false
+	for _, m := range runner.VolumeMounts {
+		if m.Name == "actions" && m.MountPath == "/actions" {
+			foundRunnerMount = true
+			assert.True(t, m.ReadOnly, "runner must mount /actions read-only")
+		}
+		assert.NotEqual(t, "actions-cache", m.Name, "runner must not have actions-cache mounts")
+	}
+	assert.True(t, foundRunnerMount, "runner must mount /actions")
+
+	// Manifest JSON injected into setup-shim args must contain the Actions field.
+	require.NotEmpty(t, setupShim.Args, "setup-shim must have args (the heredoc shell)")
+	shellScript := setupShim.Args[0]
+	assert.Contains(t, shellScript, `"actions":[`)
+	assert.Contains(t, shellScript, "actions-checkout-v4")
+	assert.Contains(t, shellScript, "/_apis/actions/actions-checkout-v4/tar")
+
+	// Setup-shim must invoke `entrypoint setup`.
+	assert.Contains(t, shellScript, "/shim/entrypoint setup /shim/manifest.json")
 }
 
 func TestBuildJob_ManifestInSetupShim(t *testing.T) {

@@ -22,12 +22,16 @@ const (
 	setupMaxAttempts = 3
 )
 
-// runSetup reads a manifest from manifestPath and downloads each
-// manifest.Actions tarball into actionsDir/<Dir>/.
-func runSetup(manifestPath, actionsDir string) error {
+// runSetup reads a manifest from manifestPath, writes the askpass shim into
+// shimDir, and downloads each manifest.Actions tarball into actionsDir/<Dir>/.
+func runSetup(manifestPath, actionsDir, shimDir string) error {
 	manifest, err := loadManifest(manifestPath)
 	if err != nil {
 		return err
+	}
+
+	if err := writeAskpassShim(filepath.Join(shimDir, "askpass.sh")); err != nil {
+		return fmt.Errorf("writing askpass shim: %w", err)
 	}
 
 	if err := os.MkdirAll(actionsDir, 0o755); err != nil {
@@ -40,6 +44,16 @@ func runSetup(manifestPath, actionsDir string) error {
 		}
 	}
 	return nil
+}
+
+// writeAskpassShim writes a tiny shell script git uses for HTTP basic auth.
+// The contents echo $GIT_AUTH_TOKEN — same shape that was previously written
+// from the setup-shim heredoc.
+func writeAskpassShim(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte("#!/bin/sh\necho \"$GIT_AUTH_TOKEN\"\n"), 0o755)
 }
 
 // errFetchNotFound is the sentinel returned when the server returned 404.

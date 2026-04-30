@@ -44,12 +44,12 @@ type JobConfig struct {
 	Steps           []types.StepSpec
 	BaseEnv         map[string]string // env vars injected into all steps
 	Services        []ServiceSpec
-	Timeout          int64  // ActiveDeadlineSeconds
-	CachePVCName     string // PVC for action cache (empty = skip)
-	JobSecrets       []JobSecretMount // k8s Secrets to mount into job pods
-	EvalContext       *types.EvalContext // evaluation context for runtime if: conditions
-	SnapshotPVCName  string   // PVC for ZFS snapshot cache (empty = disabled)
-	SnapshotPaths    []string // paths to bind-mount from snapshot PVC into /workspace (e.g., "target", "node_modules")
+	Timeout         int64               // ActiveDeadlineSeconds
+	Actions         []types.ActionFetch // actions for setup-shim to fetch into /actions/<Dir>/
+	JobSecrets      []JobSecretMount    // k8s Secrets to mount into job pods
+	EvalContext     *types.EvalContext  // evaluation context for runtime if: conditions
+	SnapshotPVCName string              // PVC for ZFS snapshot cache (empty = disabled)
+	SnapshotPaths   []string            // paths to bind-mount from snapshot PVC into /workspace (e.g., "target", "node_modules")
 }
 
 // BuildJob creates a k8s Job with the single-container architecture.
@@ -84,10 +84,13 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		return nil, fmt.Errorf("marshaling manifest: %w", err)
 	}
 
-	// Volumes. Workspace is always emptyDir (fresh clone each job).
+	// Volumes. Workspace and actions are always emptyDir; the actions emptyDir
+	// is populated at init time by the setup-shim subcommand fetching tarballs
+	// from the cache server.
 	volumes := []corev1.Volume{
 		{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: "shim", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "actions", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}
 
 	// ZFS snapshot cache PVC — bind-mount declared paths into /workspace.
@@ -97,26 +100,6 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: cfg.SnapshotPVCName,
-				},
-			},
-		})
-	}
-
-	// Action cache PVC (if any steps use actions).
-	hasActions := false
-	for _, step := range cfg.Steps {
-		if step.ActionDir != "" {
-			hasActions = true
-			break
-		}
-	}
-	if hasActions && cfg.CachePVCName != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: "actions-cache",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: cfg.CachePVCName,
-					ReadOnly:  true,
 				},
 			},
 		})
@@ -193,8 +176,8 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 
 	setupCmd := fmt.Sprintf(
 		"cp /entrypoint /shim/entrypoint && chmod +x /shim/entrypoint && "+
-			"printf '#!/bin/sh\\necho \"$GIT_AUTH_TOKEN\"\\n' > /shim/askpass.sh && chmod +x /shim/askpass.sh && "+
-			"cat > /shim/manifest.json << '%s'\n%s\n%s",
+			"cat > /shim/manifest.json << '%s'\n%s\n%s\n"+
+			"exec /shim/entrypoint setup /shim/manifest.json",
 		delimiter, string(manifestJSON), delimiter)
 
 	initContainers = append(initContainers, corev1.Container{
@@ -205,6 +188,7 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		SecurityContext: containerSecurity,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "shim", MountPath: "/shim"},
+			{Name: "actions", MountPath: "/actions"},
 		},
 	})
 
@@ -212,20 +196,7 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 	runnerMounts := []corev1.VolumeMount{
 		{Name: "workspace", MountPath: "/workspace"},
 		{Name: "shim", MountPath: "/shim"},
-	}
-
-	// Add subPath mounts for each unique action directory.
-	mountedActions := make(map[string]bool)
-	for _, step := range cfg.Steps {
-		if step.ActionDir != "" && cfg.CachePVCName != "" && !mountedActions[step.ActionDir] {
-			mountedActions[step.ActionDir] = true
-			runnerMounts = append(runnerMounts, corev1.VolumeMount{
-				Name:      "actions-cache",
-				MountPath: "/actions/" + step.ActionDir,
-				SubPath:   "actions-repo-cache/" + step.ActionDir,
-				ReadOnly:  true,
-			})
-		}
+		{Name: "actions", MountPath: "/actions", ReadOnly: true},
 	}
 
 	// Add snapshot cache bind mounts into /workspace.
@@ -262,7 +233,7 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 	runner := corev1.Container{
 		Name:            "runner",
 		Image:           cfg.Image,
-		Command:         []string{"/shim/entrypoint", "/shim/manifest.json"},
+		Command:         []string{"/shim/entrypoint", "run", "/shim/manifest.json"},
 		WorkingDir:      "/workspace",
 		VolumeMounts:    runnerMounts,
 		EnvFrom:         envFrom,
@@ -319,6 +290,7 @@ func buildManifest(cfg JobConfig) types.Manifest {
 		Steps:   steps,
 		BaseEnv: cfg.BaseEnv,
 		Context: cfg.EvalContext,
+		Actions: cfg.Actions,
 	}
 }
 
