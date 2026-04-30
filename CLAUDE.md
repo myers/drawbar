@@ -82,11 +82,13 @@ drawbar has three independent caches. Mixing them up is a common source of
 confusion:
 
 1. **Actions source cache** — git clones of action repos themselves, e.g.
-   `actions/checkout@v4`. Lives at `cfg.Cache.Dir/actions-repo-cache/<dir>`.
-   Populated by the controller (`pkg/actions`), read by job pods via a
-   `ReadOnly` PVC mount with `subPath` per action. **Bug 001** documents
-   that this currently breaks on RWO storage because the controller pod
-   already has the PVC mounted RW when a job pod tries to mount it RO.
+   `actions/checkout@v4`. Lives at `cfg.Cache.Dir/actions-repo-cache/<dir>`,
+   mounted only by the controller pod. Job pods receive action contents
+   over HTTP from the cache server (`GET /_apis/actions/<dir>/tar`) into
+   a pod-local `actions` emptyDir. The fetch logic is the `entrypoint
+   setup` subcommand, run as part of the `setup-shim` init container.
+   The HTTP-fetch design fixes bug 001 (shared PVC didn't work on RWO
+   storage); see `docs/superpowers/specs/2026-04-30-actions-cache-http-fetch-design.md`.
 
 2. **Workspace snapshot cache** (`pkg/snapshot`) — per-job PVCs created
    from `VolumeSnapshot` objects, keyed by `(repo, cache-key)`. Designed
