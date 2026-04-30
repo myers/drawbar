@@ -44,7 +44,7 @@ GET /_apis/actions/:dir/tar
 
 Handler reads `cfg.Cache.Dir/actions-repo-cache/<dir>`, streams a tar of its contents excluding the top-level `.git/` directory.
 
-Validation: `dir` must match `[a-zA-Z0-9-]+` (the same charset `pkg/actions/resolve.go` `ActionRef.ActionDir()` produces). Defense-in-depth against URL-path traversal even though httprouter handles it at the routing layer.
+Validation: `dir` must match `[A-Za-z0-9_-]+` (the same charset `pkg/actions/resolve.go` `ActionRef.ActionDir()` produces — letters either case, digits, dash, underscore). Defense-in-depth against URL-path traversal even though httprouter handles it at the routing layer.
 
 Implementation:
 - New helper `tarDir(w io.Writer, root string, excludes []string) error` in `pkg/cache/tar.go`.
