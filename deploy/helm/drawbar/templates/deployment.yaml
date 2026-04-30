@@ -42,8 +42,6 @@ spec:
             {{- if .Values.cache.enabled }}
             - name: CACHE_SERVICE_NAME
               value: "{{ include "drawbar.fullname" . }}-cache"
-            - name: CACHE_PVC_NAME
-              value: "{{ include "drawbar.fullname" . }}-cache"
             {{- end }}
           ports:
             - containerPort: 8081

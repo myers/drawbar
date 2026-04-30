@@ -49,7 +49,6 @@ type CacheConfig struct {
 	Dir         string `yaml:"dir"`           // cache storage directory, default: /cache
 	Port        uint16 `yaml:"port"`          // cache proxy listen port, default: 9300
 	ServiceName string `yaml:"service_name"`  // k8s Service name for cache (set via CACHE_SERVICE_NAME)
-	PVCName     string `yaml:"pvc_name"`      // k8s PVC name for action cache (set via CACHE_PVC_NAME)
 }
 
 // SnapshotConfig controls ZFS-backed workspace caching via VolumeSnapshot CRD.
@@ -243,9 +242,6 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CACHE_SERVICE_NAME"); v != "" {
 		c.Cache.ServiceName = v
-	}
-	if v := os.Getenv("CACHE_PVC_NAME"); v != "" {
-		c.Cache.PVCName = v
 	}
 	// Snapshot config.
 	if v := os.Getenv("SNAPSHOT_ENABLED"); v != "" {

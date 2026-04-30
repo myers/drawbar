@@ -80,7 +80,6 @@ func TestLoad_AllEnvOverrides(t *testing.T) {
 	t.Setenv("CACHE_DIR", "/data/cache")
 	t.Setenv("CACHE_PORT", "9400")
 	t.Setenv("CACHE_SERVICE_NAME", "cache-svc")
-	t.Setenv("CACHE_PVC_NAME", "cache-pvc")
 
 	cfg, err := Load("/nonexistent/config.yaml")
 	require.NoError(t, err)
@@ -99,7 +98,6 @@ func TestLoad_AllEnvOverrides(t *testing.T) {
 	assert.Equal(t, "/data/cache", cfg.Cache.Dir)
 	assert.Equal(t, uint16(9400), cfg.Cache.Port)
 	assert.Equal(t, "cache-svc", cfg.Cache.ServiceName)
-	assert.Equal(t, "cache-pvc", cfg.Cache.PVCName)
 }
 
 func TestLoad_EnvOverrides_InvalidCapacity(t *testing.T) {
