@@ -20,13 +20,34 @@ var runCommand = func(cmd *exec.Cmd) error { return cmd.Run() }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: entrypoint <manifest.json>\n")
-		os.Exit(1)
+		usage()
 	}
+	switch os.Args[1] {
+	case "setup":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		if err := runSetup(os.Args[2], "/actions"); err != nil {
+			fmt.Fprintf(os.Stderr, "setup error: %v\n", err)
+			os.Exit(1)
+		}
+	case "run":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		if !runEntrypoint(os.Args[2], shimDir) {
+			os.Exit(1)
+		}
+	default:
+		usage()
+	}
+}
 
-	if !runEntrypoint(os.Args[1], shimDir) {
-		os.Exit(1)
-	}
+func usage() {
+	fmt.Fprintf(os.Stderr, "usage:\n")
+	fmt.Fprintf(os.Stderr, "  entrypoint setup <manifest.json>   # init: fetch action sources into /actions/\n")
+	fmt.Fprintf(os.Stderr, "  entrypoint run <manifest.json>     # runner: execute steps\n")
+	os.Exit(1)
 }
 
 // runEntrypoint executes all steps in the manifest. Returns true on success.
