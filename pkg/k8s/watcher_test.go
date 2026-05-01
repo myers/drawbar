@@ -151,6 +151,114 @@ func TestWaitForContainerRunning_PodFailed(t *testing.T) {
 	err = waitForContainerRunning(context.Background(), client, "default", "pod1", "runner", 10*time.Millisecond)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "pod failed")
+	assert.Contains(t, err.Error(), "Evicted")
+}
+
+func TestWaitForContainerRunning_PodFailed_InitContainerTerminated(t *testing.T) {
+	// When an init container terminates non-zero and pod-level Reason is
+	// empty, the error must still name the failing container, exit code,
+	// and termination reason — that's the diagnostic info the CI UI gets.
+	client := fake.NewSimpleClientset()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "svc-buildkit",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+							Reason:   "Error",
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := client.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = waitForContainerRunning(context.Background(), client, "default", "pod1", "runner", 10*time.Millisecond)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "pod failed")
+	assert.Contains(t, msg, "init container svc-buildkit")
+	assert.Contains(t, msg, "exit code 1")
+	assert.Contains(t, msg, "Error")
+}
+
+func TestWaitForContainerRunning_PodFailed_SidecarCrashLoopBackOff(t *testing.T) {
+	// A sidecar init container in CrashLoopBackOff has its terminal state
+	// in LastTerminationState, not State (current State is Waiting). The
+	// error must surface the previous-termination reason and exit code so
+	// users can diagnose without kubectl.
+	client := fake.NewSimpleClientset()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "svc-buildkit",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason: "CrashLoopBackOff",
+						},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+							Reason:   "Error",
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := client.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = waitForContainerRunning(context.Background(), client, "default", "pod1", "runner", 10*time.Millisecond)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "init container svc-buildkit")
+	assert.Contains(t, msg, "exit code 1")
+}
+
+func TestWaitForContainerRunning_PodFailed_PrefersFailingInitOverHealthyOnes(t *testing.T) {
+	// With multiple init containers, only the failing one should be named.
+	// (We pick the first non-zero / waiting-with-LastTerminationState entry.)
+	client := fake.NewSimpleClientset()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "svc-postgres",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"},
+					},
+				},
+				{
+					Name: "setup-shim",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 2, Reason: "Error"},
+					},
+				},
+			},
+		},
+	}
+	_, err := client.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = waitForContainerRunning(context.Background(), client, "default", "pod1", "runner", 10*time.Millisecond)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "setup-shim")
+	assert.Contains(t, msg, "exit code 2")
+	assert.NotContains(t, msg, "svc-postgres")
 }
 
 func TestGetContainerResult_Success(t *testing.T) {

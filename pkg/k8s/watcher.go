@@ -310,7 +310,7 @@ func waitForContainerRunning(ctx context.Context, client kubernetes.Interface, n
 		}
 
 		if pod.Status.Phase == corev1.PodFailed {
-			return fmt.Errorf("pod failed: %s", pod.Status.Reason)
+			return fmt.Errorf("pod failed: %s", formatPodFailure(ctx, client, namespace, pod))
 		}
 
 		for _, cs := range pod.Status.ContainerStatuses {
@@ -334,4 +334,92 @@ func waitForContainerRunning(ctx context.Context, client kubernetes.Interface, n
 		case <-time.After(poll):
 		}
 	}
+}
+
+// formatPodFailure produces a diagnostic string for a Phase=Failed pod.
+// pod.Status.Reason alone is frequently empty (it's only set for evictions,
+// preemption, deadline-exceeded, etc.); the actual cause lives in the per-
+// container statuses. We walk init containers first (since failures during
+// pod startup almost always happen there) and then regular containers, and
+// surface the first one that terminated non-zero — falling back to the
+// top-level Reason when nothing more specific is available.
+func formatPodFailure(ctx context.Context, client kubernetes.Interface, namespace string, pod *corev1.Pod) string {
+	if cs, kind := findFailingContainer(pod); cs != nil {
+		summary := fmt.Sprintf("%s container %s terminated with exit code %d (%s)",
+			kind, cs.name, cs.exitCode, cs.reason)
+		if cs.message != "" {
+			summary += ": " + truncate(strings.TrimSpace(cs.message), 1024)
+		}
+		if tail := fetchPreviousLogTail(ctx, client, namespace, pod.Name, cs.name, 1024); tail != "" {
+			summary += "\nlast log lines:\n" + tail
+		}
+		return summary
+	}
+	if pod.Status.Reason != "" {
+		return pod.Status.Reason
+	}
+	return "unknown reason"
+}
+
+type failingContainer struct {
+	name     string
+	exitCode int32
+	reason   string
+	message  string
+}
+
+// findFailingContainer returns the first init or main container that
+// terminated non-zero (checking current State first, then LastTerminationState
+// for sidecars in CrashLoopBackOff). The kind string is "init" or "main".
+func findFailingContainer(pod *corev1.Pod) (*failingContainer, string) {
+	pick := func(statuses []corev1.ContainerStatus) *failingContainer {
+		for _, cs := range statuses {
+			if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+				return &failingContainer{cs.Name, t.ExitCode, t.Reason, t.Message}
+			}
+			if t := cs.LastTerminationState.Terminated; t != nil && t.ExitCode != 0 {
+				return &failingContainer{cs.Name, t.ExitCode, t.Reason, t.Message}
+			}
+		}
+		return nil
+	}
+	if c := pick(pod.Status.InitContainerStatuses); c != nil {
+		return c, "init"
+	}
+	if c := pick(pod.Status.ContainerStatuses); c != nil {
+		return c, "main"
+	}
+	return nil, ""
+}
+
+// fetchPreviousLogTail returns up to maxBytes of the named container's
+// previous-instance logs, indented for readability. Best effort: any error
+// (no previous instance, fake client, RBAC) returns "" silently — diagnostics
+// shouldn't block error reporting.
+func fetchPreviousLogTail(ctx context.Context, client kubernetes.Interface, namespace, pod, container string, maxBytes int64) string {
+	stream, err := client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
+		Container:  container,
+		Previous:   true,
+		LimitBytes: &maxBytes,
+	}).Stream(ctx)
+	if err != nil {
+		return ""
+	}
+	defer stream.Close()
+	buf, err := io.ReadAll(stream)
+	if err != nil || len(buf) == 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = "  " + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
