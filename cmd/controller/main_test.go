@@ -507,6 +507,12 @@ func TestConvertServices_BuildKitAutoDetect(t *testing.T) {
 	require.NotNil(t, svc.SecurityContext.SeccompProfile)
 	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, svc.SecurityContext.SeccompProfile.Type)
 
+	// AppArmor must also be Unconfined: on AppArmor-enforcing hosts the
+	// runtime-default profile blocks rootlesskit's mount namespace setup
+	// even with seccomp Unconfined + SETUID/SETGID. See bug 004.
+	require.NotNil(t, svc.SecurityContext.AppArmorProfile)
+	assert.Equal(t, corev1.AppArmorProfileTypeUnconfined, svc.SecurityContext.AppArmorProfile.Type)
+
 	// Should have SETUID+SETGID caps added.
 	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))
 	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETGID"))
