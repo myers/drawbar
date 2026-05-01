@@ -630,7 +630,7 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			cacheBase := cfg.CacheHandler.ExternalURL()
 			seen := map[string]bool{}
 			for _, m := range actionsToClone {
-				if m == nil || m.Dir == "" || seen[m.Dir] {
+				if m == nil || m.Dir == "" || m.Magic || seen[m.Dir] {
 					continue
 				}
 				seen[m.Dir] = true
