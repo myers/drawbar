@@ -92,6 +92,14 @@ func runEntrypoint(manifestPath, workDir string) bool {
 	hadFailure := false
 
 	for i, step := range manifest.Steps {
+		// Refresh /workspace/<path> -> /cache/<path> symlinks before every
+		// step. The previous step (most often actions/checkout) may have
+		// recreated cached directories; this re-establishes the symlinks
+		// idempotently and merges any fresh contents into the cache.
+		if len(manifest.CachePaths) > 0 {
+			mirrorCachePaths(manifest.CachePaths)
+		}
+
 		// Evaluate runtime if: condition.
 		if step.If != "" && eval != nil {
 			shouldRun, err := eval.EvalCondition(step.If)

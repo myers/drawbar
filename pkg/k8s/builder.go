@@ -199,15 +199,15 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		{Name: "actions", MountPath: "/actions", ReadOnly: true},
 	}
 
-	// Add snapshot cache bind mounts into /workspace.
-	for _, cachePath := range cfg.SnapshotPaths {
-		if cfg.SnapshotPVCName != "" {
-			runnerMounts = append(runnerMounts, corev1.VolumeMount{
-				Name:      "snapshot-cache",
-				MountPath: "/workspace/" + cachePath,
-				SubPath:   cachePath,
-			})
-		}
+	// Mount the snapshot cache PVC at /cache (sibling to /workspace). The
+	// entrypoint mirrors /workspace/<path> -> /cache/<path> as a symlink at
+	// every step boundary; mounting straight into /workspace conflicts with
+	// actions/checkout's "delete contents of /workspace" init step (EBUSY).
+	if cfg.SnapshotPVCName != "" && len(cfg.SnapshotPaths) > 0 {
+		runnerMounts = append(runnerMounts, corev1.VolumeMount{
+			Name:      "snapshot-cache",
+			MountPath: "/cache",
+		})
 	}
 
 	// Add job secret mounts to runner.
@@ -286,11 +286,16 @@ func buildManifest(cfg JobConfig) types.Manifest {
 			TimeoutMinutes:  s.TimeoutMinutes,
 		})
 	}
+	var cachePaths []string
+	if cfg.SnapshotPVCName != "" {
+		cachePaths = cfg.SnapshotPaths
+	}
 	return types.Manifest{
-		Steps:   steps,
-		BaseEnv: cfg.BaseEnv,
-		Context: cfg.EvalContext,
-		Actions: cfg.Actions,
+		Steps:      steps,
+		BaseEnv:    cfg.BaseEnv,
+		Context:    cfg.EvalContext,
+		Actions:    cfg.Actions,
+		CachePaths: cachePaths,
 	}
 }
 

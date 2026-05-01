@@ -28,6 +28,11 @@ type Manifest struct {
 	BaseEnv map[string]string `json:"baseEnv"`
 	Context *EvalContext      `json:"context,omitempty"`
 	Actions []ActionFetch     `json:"actions,omitempty"`
+	// CachePaths are workspace-relative paths the runner should mirror to
+	// /cache/<path> via symlink. Set when drawbar/cache@v1 is in use; each
+	// path is the symlink target inside /workspace. Empty when caching is
+	// off. See pkg/k8s/builder.go and cmd/entrypoint/cache_mirror.go.
+	CachePaths []string `json:"cachePaths,omitempty"`
 }
 
 // ActionFetch tells the setup subcommand to fetch an action tarball from the

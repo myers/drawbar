@@ -279,3 +279,94 @@ func TestBuildJob_ServiceSecurityOverride(t *testing.T) {
 	assert.Equal(t, "runner", runner.Name)
 	assert.Nil(t, runner.SecurityContext.SeccompProfile)
 }
+
+func TestBuildJob_SnapshotCacheMountsAtSiblingPath(t *testing.T) {
+	cfg := JobConfig{
+		TaskID:          77,
+		JobName:         "build",
+		Namespace:       "drawbar",
+		Image:           "node:24",
+		ControllerImage: "ghcr.io/myers/drawbar:latest",
+		Steps: []types.StepSpec{
+			{ID: "noop", Name: "noop", Script: ":"},
+		},
+		SnapshotPVCName: "cache-77",
+		SnapshotPaths:   []string{"target", "node_modules"},
+	}
+
+	job, err := BuildJob(cfg)
+	require.NoError(t, err)
+
+	// Volumes include snapshot-cache.
+	var volNames []string
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		volNames = append(volNames, v.Name)
+	}
+	assert.Contains(t, volNames, "snapshot-cache")
+
+	// Runner has exactly one snapshot-cache mount, at /cache, with no subPath.
+	runner := job.Spec.Template.Spec.Containers[0]
+	var cacheMounts []corev1.VolumeMount
+	for _, m := range runner.VolumeMounts {
+		if m.Name == "snapshot-cache" {
+			cacheMounts = append(cacheMounts, m)
+		}
+	}
+	require.Len(t, cacheMounts, 1, "expected exactly one /cache mount, not per-path mounts")
+	assert.Equal(t, "/cache", cacheMounts[0].MountPath)
+	assert.Empty(t, cacheMounts[0].SubPath, "must not subPath into /workspace — that EBUSYs against actions/checkout")
+
+	// No mounts under /workspace/<path> from the snapshot PVC.
+	for _, m := range runner.VolumeMounts {
+		assert.NotContains(t, m.MountPath, "/workspace/target")
+		assert.NotContains(t, m.MountPath, "/workspace/node_modules")
+	}
+}
+
+func TestBuildJob_NoSnapshotMountWithoutPVC(t *testing.T) {
+	// Even if SnapshotPaths is set, no PVC means no mount.
+	cfg := JobConfig{
+		TaskID:        78,
+		JobName:       "build",
+		Namespace:     "drawbar",
+		Image:         "node:24",
+		Steps:         []types.StepSpec{{ID: "x", Name: "x", Script: ":"}},
+		SnapshotPaths: []string{"target"},
+	}
+	job, err := BuildJob(cfg)
+	require.NoError(t, err)
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		assert.NotEqual(t, "snapshot-cache", v.Name)
+	}
+}
+
+func TestBuildJob_ManifestCarriesCachePaths(t *testing.T) {
+	cfg := JobConfig{
+		TaskID:          79,
+		JobName:         "build",
+		Namespace:       "drawbar",
+		Image:           "node:24",
+		ControllerImage: "ghcr.io/myers/drawbar:latest",
+		Steps: []types.StepSpec{
+			{ID: "noop", Name: "noop", Script: ":"},
+		},
+		SnapshotPVCName: "cache-79",
+		SnapshotPaths:   []string{"target"},
+	}
+
+	manifest := buildManifest(cfg)
+	assert.Equal(t, []string{"target"}, manifest.CachePaths)
+}
+
+func TestBuildJob_NoCachePathsWithoutPVC(t *testing.T) {
+	cfg := JobConfig{
+		TaskID:        80,
+		JobName:       "build",
+		Namespace:     "drawbar",
+		Image:         "node:24",
+		Steps:         []types.StepSpec{{ID: "x", Name: "x", Script: ":"}},
+		SnapshotPaths: []string{"target"},
+	}
+	manifest := buildManifest(cfg)
+	assert.Empty(t, manifest.CachePaths)
+}
