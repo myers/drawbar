@@ -165,6 +165,26 @@ func TestPoller_Ephemeral(t *testing.T) {
 	assert.Less(t, elapsed, 2*time.Second, "should exit promptly after task completes")
 }
 
+func TestPoller_LastPollAt(t *testing.T) {
+	mock := &mockPollerClient{interval: 10 * time.Millisecond}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	// Before Run is called, LastPollAt is the zero time (never polled).
+	assert.True(t, p.LastPollAt().IsZero(), "LastPollAt should be zero before any poll")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	before := time.Now()
+	p.Run(ctx)
+	after := time.Now()
+
+	got := p.LastPollAt()
+	assert.False(t, got.IsZero(), "LastPollAt should be set after Run")
+	assert.False(t, got.Before(before), "LastPollAt %s should be >= test start %s", got, before)
+	assert.False(t, got.After(after), "LastPollAt %s should be <= test end %s", got, after)
+}
+
 func TestDrain_Timeout(t *testing.T) {
 	handler := func(_ context.Context, _ *runnerv1.Task) {
 		time.Sleep(5 * time.Second) // very slow

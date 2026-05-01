@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux; we mount it explicitly below
 	"os"
 	"strings"
 	"os/signal"
+	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -268,12 +271,17 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	// Clean up orphaned jobs.
 	cleanupOrphanedJobs(ctx, deps.k8sClient, deps.namespace)
 
-	// Start health server.
+	// Start health server. Liveness reflects poll-loop liveness so kubelet
+	// can restart the pod if Run() wedges (see bug 007).
 	var registered atomic.Bool
 	registered.Store(true)
-	go startHealthServer(&registered, &activeJobs, int64(cfg.Runner.Capacity))
+	pollStaleness := pollStalenessThreshold(cfg.Runner.FetchInterval)
+	go startHealthServer(&registered, &activeJobs, int64(cfg.Runner.Capacity), poller.LastPollAt, pollStaleness)
 
-	slog.Info("runner is online, polling for tasks", "job_namespace", deps.namespace)
+	slog.Info("runner is online, polling for tasks",
+		"job_namespace", deps.namespace,
+		"poll_staleness_threshold", pollStaleness,
+	)
 	poller.Run(ctx)
 	slog.Info("poller stopped, draining in-flight tasks")
 	poller.Drain(30 * time.Second)
@@ -330,20 +338,75 @@ func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, names
 	}
 }
 
-func startHealthServer(registered *atomic.Bool, activeJobs *atomic.Int64, capacity int64) {
+func startHealthServer(registered *atomic.Bool, activeJobs *atomic.Int64, capacity int64, lastPoll func() time.Time, pollStaleness time.Duration) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/healthz", healthzHandler(lastPoll, pollStaleness, dumpGoroutinesToStderr))
 	mux.HandleFunc("/readyz", readyzHandler(registered))
 	mux.HandleFunc("/metrics/active-jobs", metricsHandler(activeJobs, capacity))
+	// Mount net/http/pprof on this server (port 8081) so operators can grab a
+	// live goroutine dump before the kubelet restarts the pod. Early-alpha:
+	// always on, no auth — the port isn't exposed outside the cluster.
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	slog.Info("health server listening", "port", 8081)
 	if err := http.ListenAndServe(":8081", mux); err != nil {
 		slog.Error("health server error", "error", err)
 	}
 }
 
-func healthzHandler(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+// healthzHandler returns OK while the poll loop is making progress and 503
+// once it has been silent for longer than staleness — letting kubelet restart
+// the pod when the goroutine wedges. The zero value from lastPoll is treated
+// as "starting up" (always OK) so the probe doesn't fail before the first poll.
+//
+// The first time staleness is detected, onWedge is invoked exactly once so
+// callers can capture diagnostics (a goroutine dump) before the liveness
+// probe restarts the pod and destroys the evidence.
+func healthzHandler(lastPoll func() time.Time, staleness time.Duration, onWedge func(since, threshold time.Duration)) http.HandlerFunc {
+	var dumpOnce sync.Once
+	return func(w http.ResponseWriter, _ *http.Request) {
+		t := lastPoll()
+		if !t.IsZero() {
+			if since := time.Since(t); since > staleness {
+				if onWedge != nil {
+					dumpOnce.Do(func() { onWedge(since, staleness) })
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, staleness)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}
+}
+
+// dumpGoroutinesToStderr writes a loud header plus a full goroutine stack
+// dump to stderr. Called once when /healthz first detects a wedged poll loop
+// (see bug 007). Stderr is separate from the JSON log stream so the dump is
+// readable as-is via `kubectl logs --previous`.
+func dumpGoroutinesToStderr(since, threshold time.Duration) {
+	slog.Error("POLL LOOP WEDGED — dumping goroutines to stderr",
+		"last_poll_ago", since,
+		"threshold", threshold,
+	)
+	buf := make([]byte, 1<<20) // 1 MiB; truncates if more
+	n := runtime.Stack(buf, true)
+	fmt.Fprintf(os.Stderr,
+		"\n=== POLL LOOP WEDGED (last poll %s ago, threshold %s) ===\n%s\n=== END GOROUTINE DUMP ===\n",
+		since, threshold, buf[:n],
+	)
+}
+
+// pollStalenessThreshold returns how long the poller is allowed to stay
+// silent before /healthz starts failing. At least 30s so transient stalls
+// don't trip the probe; otherwise 10× the configured fetch interval.
+func pollStalenessThreshold(fetchInterval time.Duration) time.Duration {
+	const floor = 30 * time.Second
+	t := fetchInterval * 10
+	if t < floor {
+		return floor
+	}
+	return t
 }
 
 func metricsHandler(activeJobs *atomic.Int64, capacity int64) http.HandlerFunc {

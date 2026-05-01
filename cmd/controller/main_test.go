@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"github.com/nektos/act/pkg/model"
@@ -246,12 +247,61 @@ func TestCollectSecrets(t *testing.T) {
 
 // --- healthzHandler ---
 
-func TestHealthzHandler(t *testing.T) {
+func TestHealthzHandler_FreshPoll(t *testing.T) {
+	now := time.Now()
+	handler := healthzHandler(func() time.Time { return now }, 30*time.Second, nil)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
-	healthzHandler(w, req)
+	handler(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "ok", w.Body.String())
+}
+
+func TestHealthzHandler_NoPollYet(t *testing.T) {
+	// Zero time = startup, before first poll. Treated as healthy so the
+	// probe doesn't fail in the first few seconds after launch.
+	handler := healthzHandler(func() time.Time { return time.Time{} }, 30*time.Second, nil)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestHealthzHandler_StalePoll(t *testing.T) {
+	// Last poll was an hour ago — staleness threshold of 30s exceeded.
+	stale := time.Now().Add(-time.Hour)
+	handler := healthzHandler(func() time.Time { return stale }, 30*time.Second, nil)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "poll loop stale")
+}
+
+func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	var calls atomic.Int32
+	handler := healthzHandler(
+		func() time.Time { return stale },
+		30*time.Second,
+		func(_, _ time.Duration) { calls.Add(1) },
+	)
+	for range 5 {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	}
+	assert.Equal(t, int32(1), calls.Load(), "onWedge should fire exactly once across multiple stale probes")
+}
+
+func TestPollStalenessThreshold(t *testing.T) {
+	// Floor of 30s applies for small intervals.
+	assert.Equal(t, 30*time.Second, pollStalenessThreshold(2*time.Second))
+	assert.Equal(t, 30*time.Second, pollStalenessThreshold(time.Second))
+	// 10x interval applies when above the floor.
+	assert.Equal(t, 100*time.Second, pollStalenessThreshold(10*time.Second))
+	assert.Equal(t, 5*time.Minute, pollStalenessThreshold(30*time.Second))
 }
 
 // --- readyzHandler ---

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
@@ -26,6 +27,7 @@ type Poller struct {
 	wg           sync.WaitGroup
 	backoff      time.Duration // current backoff duration (0 = no backoff)
 	stopPoll     context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
+	lastPollNs   atomic.Int64 // unix-nanos of the most recent FetchTask attempt; 0 until first poll
 }
 
 const (
@@ -87,6 +89,9 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouuid.UUID) {
+	p.lastPollNs.Store(time.Now().UnixNano())
+	p.log.Debug("polling", "tasks_version", *tasksVersion)
+
 	cleanup := p.client.SetRequestKey(*requestKey)
 	defer cleanup()
 
@@ -156,6 +161,17 @@ func (p *Poller) increaseBackoff() {
 		}
 	}
 	p.log.Warn("backing off", "duration", p.backoff)
+}
+
+// LastPollAt returns the wall-clock time of the most recent FetchTask attempt.
+// Returns the zero Time before the first poll; callers should treat that as
+// "never polled."
+func (p *Poller) LastPollAt() time.Time {
+	ns := p.lastPollNs.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // Drain waits for all in-flight tasks to complete, up to the given timeout.
