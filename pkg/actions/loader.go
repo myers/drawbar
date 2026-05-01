@@ -18,6 +18,7 @@ type ActionMeta struct {
 	Ref    *ActionRef
 	Action *model.Action
 	Dir    string // directory name in /actions volume
+	Magic  bool   // drawbar-internal action handled at job-build time (e.g. drawbar/cache)
 }
 
 // ActionCache is a filesystem cache of cloned action repos.
@@ -40,9 +41,22 @@ func (c *ActionCache) Dir() string {
 	return c.dir
 }
 
+// magicActions are drawbar-internal action references that the controller
+// handles at job-build time (e.g., reading with.key/path/restore-keys for the
+// snapshot-cache machinery in cmd/controller/main.go:extractCacheInfo). They
+// do not exist as cloneable repos; LoadAction returns a synthetic no-op meta
+// so the workflow can proceed and the with: values flow through buildActionEnv
+// into the step env, where extractCacheInfo can read them.
+var magicActions = map[string]bool{
+	"drawbar/cache": true,
+}
+
 // LoadAction loads an action's metadata. Clones the repo only on first use;
 // subsequent calls use the cached clone.
 func (c *ActionCache) LoadAction(ref *ActionRef, defaultActionsURL, token string) (*ActionMeta, error) {
+	if magicActions[ref.Org+"/"+ref.Repo] {
+		return loadMagicAction(ref), nil
+	}
 	cloneURL := ref.CloneURL(defaultActionsURL)
 	dir := ref.ActionDir()
 	cacheDir := filepath.Join(c.dir, "actions-repo-cache")
@@ -169,6 +183,18 @@ func NewExpandCtx(cache *ActionCache, actionsURL, token string) *ExpandCtx {
 func (m *ActionMeta) ToStepSpecs(stepWith map[string]string, stepEnv map[string]string, ectx *ExpandCtx) ([]types.StepSpec, error) {
 	action := m.Action
 	env := buildActionEnv(m, stepWith, stepEnv)
+
+	if m.Magic {
+		// Magic actions are no-ops at runtime. Emit a single shell step whose env
+		// carries the INPUT_* values so the controller (extractCacheInfo etc.) can
+		// read them when assembling the k8s job.
+		return []types.StepSpec{{
+			Name:   m.Ref.String(),
+			Shell:  "sh",
+			Script: ":",
+			Env:    env,
+		}}, nil
+	}
 
 	switch action.Runs.Using {
 	case model.ActionRunsUsingNode12, model.ActionRunsUsingNode16,
@@ -337,6 +363,18 @@ func buildActionEnv(meta *ActionMeta, stepWith map[string]string, stepEnv map[st
 	env["GITHUB_ACTION_PATH"] = "/actions/" + meta.actionPath()
 
 	return env
+}
+
+// loadMagicAction returns an ActionMeta for a drawbar magic action.
+// ToStepSpecs short-circuits on Magic=true and emits a no-op step whose env
+// carries the workflow's with: values for the controller to read.
+func loadMagicAction(ref *ActionRef) *ActionMeta {
+	return &ActionMeta{
+		Ref:    ref,
+		Dir:    ref.ActionDir(),
+		Action: &model.Action{Name: ref.String()},
+		Magic:  true,
+	}
 }
 
 // ReadAction is exported for testing.

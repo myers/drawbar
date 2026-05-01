@@ -257,6 +257,61 @@ func TestActionPath(t *testing.T) {
 	})
 }
 
+// --- magic actions (e.g. drawbar/cache) ---
+
+func TestLoadAction_MagicAction_NoClone(t *testing.T) {
+	// Use a cache rooted at a non-existent path; if LoadAction tried to clone
+	// it would either create the dir or error. Magic short-circuit must avoid both.
+	cache := NewActionCache("/nonexistent/should/never/be/created")
+	ref := &ActionRef{Org: "drawbar", Repo: "cache", Ref: "v1"}
+
+	meta, err := cache.LoadAction(ref, "https://github.com", "")
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	assert.True(t, meta.Magic)
+	assert.Equal(t, ref, meta.Ref)
+	assert.Equal(t, "drawbar-cache-v1", meta.Dir)
+
+	// Cache dir must not have been created.
+	_, statErr := os.Stat("/nonexistent/should/never/be/created")
+	assert.True(t, os.IsNotExist(statErr))
+}
+
+func TestLoadAction_MagicAction_AnyVersion(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+	for _, version := range []string{"v1", "v2", "main", "abc123"} {
+		t.Run(version, func(t *testing.T) {
+			ref := &ActionRef{Org: "drawbar", Repo: "cache", Ref: version}
+			meta, err := cache.LoadAction(ref, "https://github.com", "")
+			require.NoError(t, err)
+			assert.True(t, meta.Magic)
+		})
+	}
+}
+
+func TestToStepSpecs_Magic_EmitsNoopStepWithInputEnv(t *testing.T) {
+	ref := &ActionRef{Org: "drawbar", Repo: "cache", Ref: "v1"}
+	meta := loadMagicAction(ref)
+
+	stepWith := map[string]string{
+		"key":          "rust-abc123",
+		"path":         "target\n~/.cargo",
+		"restore-keys": "rust-\n",
+	}
+	specs, err := meta.ToStepSpecs(stepWith, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+
+	spec := specs[0]
+	assert.Equal(t, "drawbar/cache@v1", spec.Name)
+	assert.Equal(t, ":", spec.Script)
+	assert.Equal(t, "sh", spec.Shell)
+	// extractCacheInfo (cmd/controller/main.go) reads these env vars.
+	assert.Equal(t, "rust-abc123", spec.Env["INPUT_KEY"])
+	assert.Equal(t, "target\n~/.cargo", spec.Env["INPUT_PATH"])
+	assert.Equal(t, "rust-\n", spec.Env["INPUT_RESTORE-KEYS"])
+}
+
 // helpers
 
 func writeFile(t *testing.T, path, content string) {
