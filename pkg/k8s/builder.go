@@ -62,12 +62,22 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 	// Hardened container security context. RunAsUser/RunAsNonRoot are
 	// intentionally NOT set: drawbar pods opt into user namespaces
 	// (HostUsers: false), so the image's USER directive (typically root)
-	// maps to a high unprivileged host uid. AllowPrivilegeEscalation:false
-	// + Capabilities.Drop:ALL still apply meaningfully inside the userns.
+	// maps to a high unprivileged host uid. Drop:ALL strips host caps; we
+	// add back the standard CI set (SETUID/SETGID for package-manager
+	// privilege drop, CHOWN/FOWNER/DAC_OVERRIDE for tarball extraction
+	// and config-file rewrites). Inside the userns these are scoped to
+	// the pod and harmless on the host.
 	containerSecurity := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
+			Add: []corev1.Capability{
+				"SETUID",
+				"SETGID",
+				"CHOWN",
+				"FOWNER",
+				"DAC_OVERRIDE",
+			},
 		},
 	}
 

@@ -421,3 +421,30 @@ func TestBuildJob_PodHasHostUsersFalseWithSnapshotPVC(t *testing.T) {
 	assert.False(t, *job.Spec.Template.Spec.HostUsers,
 		"snapshot-cache jobs MUST run with userns so PVC writes land as mapped uids on the host")
 }
+
+func TestBuildJob_RunnerContainerHasUsernsCapabilities(t *testing.T) {
+	// Inside a userns'd pod, dropping ALL caps and adding back nothing
+	// breaks apt-get, dpkg, tar -xz with chown semantics, etc. We add a
+	// minimal set that covers package-manager and tarball-extraction
+	// needs while staying scoped to the namespace.
+	job, err := BuildJob(JobConfig{
+		TaskID:    1,
+		JobName:   "j",
+		Namespace: "gitea",
+		Image:     "node:24-trixie",
+	})
+	require.NoError(t, err)
+	var runner *corev1.Container
+	for i := range job.Spec.Template.Spec.Containers {
+		if job.Spec.Template.Spec.Containers[i].Name == "runner" {
+			runner = &job.Spec.Template.Spec.Containers[i]
+		}
+	}
+	require.NotNil(t, runner)
+	require.NotNil(t, runner.SecurityContext)
+	require.NotNil(t, runner.SecurityContext.Capabilities)
+	assert.ElementsMatch(t, []corev1.Capability{"ALL"}, runner.SecurityContext.Capabilities.Drop)
+	assert.ElementsMatch(t,
+		[]corev1.Capability{"SETUID", "SETGID", "CHOWN", "FOWNER", "DAC_OVERRIDE"},
+		runner.SecurityContext.Capabilities.Add)
+}
