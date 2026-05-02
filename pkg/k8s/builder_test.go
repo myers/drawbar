@@ -406,3 +406,18 @@ func TestBuildJob_RunnerContainerDoesNotPinUID(t *testing.T) {
 	assert.Nil(t, runner.SecurityContext.RunAsGroup, "runner container must not pin RunAsGroup")
 	assert.Nil(t, runner.SecurityContext.RunAsNonRoot, "runner container must not set RunAsNonRoot")
 }
+
+func TestBuildJob_PodHasHostUsersFalseWithSnapshotPVC(t *testing.T) {
+	job, err := BuildJob(JobConfig{
+		TaskID:          1,
+		JobName:         "j",
+		Namespace:       "gitea",
+		Image:           "node:24-trixie",
+		SnapshotPVCName: "cache-1",
+		SnapshotPaths:   []string{"target"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, job.Spec.Template.Spec.HostUsers)
+	assert.False(t, *job.Spec.Template.Spec.HostUsers,
+		"snapshot-cache jobs MUST run with userns so PVC writes land as mapped uids on the host")
+}
