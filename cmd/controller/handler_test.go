@@ -616,7 +616,8 @@ jobs:
 	require.NotNil(t, buildkitContainer.SecurityContext.SeccompProfile)
 	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, buildkitContainer.SecurityContext.SeccompProfile.Type)
 	// AppArmor stays at runtime-default; userns isolates rootlesskit's mounts
-	// from the host AppArmor profile. Asserting nil locks in the change.
+	// from the host AppArmor profile. The nil assertion guards against
+	// reintroducing the override.
 	assert.Nil(t, buildkitContainer.SecurityContext.AppArmorProfile, "BuildKit sidecar should not pin AppArmor (userns handles isolation)")
 	assert.True(t, *buildkitContainer.SecurityContext.AllowPrivilegeEscalation)
 	assert.Contains(t, buildkitContainer.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))

@@ -558,7 +558,8 @@ func TestConvertServices_BuildKitAutoDetect(t *testing.T) {
 	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, svc.SecurityContext.SeccompProfile.Type)
 
 	// AppArmor stays at runtime-default; userns isolates rootlesskit's mounts
-	// from the host AppArmor profile. Asserting nil locks in the change.
+	// from the host AppArmor profile. The nil assertion guards against
+	// reintroducing the override.
 	assert.Nil(t, svc.SecurityContext.AppArmorProfile, "BuildKit sidecar should not pin AppArmor (userns handles isolation)")
 
 	// Should have SETUID+SETGID caps added.
