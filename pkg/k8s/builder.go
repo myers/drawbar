@@ -59,9 +59,11 @@ type JobConfig struct {
 func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 	jobName := fmt.Sprintf("drawbar-run-%d", cfg.TaskID)
 
-	// Hardened security context for all containers — drop all capabilities
-	// and disallow privilege escalation. RunAsNonRoot is intentionally omitted
-	// because common CI images (e.g., node:22-bookworm) run as root.
+	// Hardened container security context. RunAsUser/RunAsNonRoot are
+	// intentionally NOT set: drawbar pods opt into user namespaces
+	// (HostUsers: false), so the image's USER directive (typically root)
+	// maps to a high unprivileged host uid. AllowPrivilegeEscalation:false
+	// + Capabilities.Drop:ALL still apply meaningfully inside the userns.
 	containerSecurity := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		Capabilities: &corev1.Capabilities{
@@ -254,6 +256,7 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					HostUsers:      ptr.To(false), // userns: pod uid 0 maps to high host uid
 					RestartPolicy:  corev1.RestartPolicyNever,
 					InitContainers: initContainers,
 					Containers:     []corev1.Container{runner},

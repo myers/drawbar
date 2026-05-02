@@ -370,3 +370,39 @@ func TestBuildJob_NoCachePathsWithoutPVC(t *testing.T) {
 	manifest := buildManifest(cfg)
 	assert.Empty(t, manifest.CachePaths)
 }
+
+func TestBuildJob_PodHasHostUsersFalse(t *testing.T) {
+	job, err := BuildJob(JobConfig{
+		TaskID:    1,
+		JobName:   "j",
+		Namespace: "gitea",
+		Image:     "node:24-trixie",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, job.Spec.Template.Spec.HostUsers, "PodSpec.HostUsers must be set explicitly")
+	assert.False(t, *job.Spec.Template.Spec.HostUsers, "drawbar job pods must run with userns (HostUsers: false)")
+}
+
+func TestBuildJob_RunnerContainerDoesNotPinUID(t *testing.T) {
+	// We rely on the image's USER directive (typically root) and on userns
+	// to make in-container root harmless on the host. Pinning RunAsUser or
+	// RunAsNonRoot would break apt-get etc. inside common CI images.
+	job, err := BuildJob(JobConfig{
+		TaskID:    1,
+		JobName:   "j",
+		Namespace: "gitea",
+		Image:     "node:24-trixie",
+	})
+	require.NoError(t, err)
+	var runner *corev1.Container
+	for i := range job.Spec.Template.Spec.Containers {
+		if job.Spec.Template.Spec.Containers[i].Name == "runner" {
+			runner = &job.Spec.Template.Spec.Containers[i]
+		}
+	}
+	require.NotNil(t, runner)
+	require.NotNil(t, runner.SecurityContext)
+	assert.Nil(t, runner.SecurityContext.RunAsUser, "runner container must not pin RunAsUser")
+	assert.Nil(t, runner.SecurityContext.RunAsGroup, "runner container must not pin RunAsGroup")
+	assert.Nil(t, runner.SecurityContext.RunAsNonRoot, "runner container must not set RunAsNonRoot")
+}
