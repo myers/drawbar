@@ -975,16 +975,21 @@ func buildArtifactEnv(env map[string]string, serverURL, gitCloneURL string) {
 
 // buildAptProxyEnv injects http_proxy/HTTP_PROXY and no_proxy/NO_PROXY into
 // env when aptProxyURL is non-empty. HTTPS is intentionally NOT proxied —
-// apt-cacher-ng cannot MITM TLS, so HTTPS stays direct. no_proxy excludes
-// forges, registries, and in-cluster traffic so cargo/git/image pulls bypass
-// the cache.
+// apt-cacher-ng cannot MITM TLS. no_proxy uses leading-dot suffix form so
+// subdomains match (e.g. .githubusercontent.com covers raw, codeload, and
+// objects hosts that actions/cache uses).
 func buildAptProxyEnv(env map[string]string, aptProxyURL string) {
 	if aptProxyURL == "" {
 		return
 	}
 	env["http_proxy"] = aptProxyURL
 	env["HTTP_PROXY"] = aptProxyURL
-	noProxy := "localhost,127.0.0.1,.svc,.cluster.local,github.com,fj.monoloco.net,gt.monoloco.net,ghcr.io,docker.io"
+	noProxy := "localhost,127.0.0.1,.svc,.cluster.local," +
+		".github.com,.githubusercontent.com," +
+		".monoloco.net," +
+		".docker.io,.docker.com," +
+		".ghcr.io," +
+		".crates.io"
 	env["no_proxy"] = noProxy
 	env["NO_PROXY"] = noProxy
 }

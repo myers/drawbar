@@ -164,12 +164,16 @@ func TestBuildAptProxyEnv(t *testing.T) {
 		// HTTPS deliberately NOT proxied — apt-cacher-ng can't MITM TLS.
 		assert.Empty(t, env["https_proxy"])
 		assert.Empty(t, env["HTTPS_PROXY"])
-		// Direct paths for forges, registries, and in-cluster traffic.
-		for _, host := range []string{"localhost", "127.0.0.1", ".svc", ".cluster.local",
-			"github.com", "fj.monoloco.net", "gt.monoloco.net", "ghcr.io", "docker.io"} {
-			assert.Contains(t, env["no_proxy"], host, "no_proxy missing %q", host)
-		}
-		assert.Equal(t, env["no_proxy"], env["NO_PROXY"])
+		// Pin the exact no_proxy string so accidental delimiter or ordering
+		// changes regress visibly. Leading-dot form gives suffix-match.
+		expectedNoProxy := "localhost,127.0.0.1,.svc,.cluster.local," +
+			".github.com,.githubusercontent.com," +
+			".monoloco.net," +
+			".docker.io,.docker.com," +
+			".ghcr.io," +
+			".crates.io"
+		assert.Equal(t, expectedNoProxy, env["no_proxy"])
+		assert.Equal(t, expectedNoProxy, env["NO_PROXY"])
 	})
 
 	t.Run("noop when URL empty", func(t *testing.T) {
