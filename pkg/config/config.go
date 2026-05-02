@@ -36,6 +36,7 @@ type RunnerConfig struct {
 	ActionsURL      string        `yaml:"actions_url"`
 	ControllerImage string        `yaml:"controller_image"`
 	JobSecrets      []JobSecret   `yaml:"job_secrets"`
+	AptProxyURL     string        `yaml:"apt_proxy_url"` // injected as http_proxy into job pods
 }
 
 // JobSecret describes a k8s Secret to mount into job pods.
@@ -228,6 +229,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CONTROLLER_IMAGE"); v != "" {
 		c.Runner.ControllerImage = v
+	}
+	if v := os.Getenv("RUNNER_APT_PROXY_URL"); v != "" {
+		c.Runner.AptProxyURL = v
 	}
 	if v := os.Getenv("CACHE_ENABLED"); v != "" {
 		c.Cache.Enabled = v == "true" || v == "1"

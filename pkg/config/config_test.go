@@ -197,3 +197,30 @@ func validConfig() *Config {
 	cfg.Server.URL = "http://localhost:3000"
 	return cfg
 }
+
+func TestConfig_AptProxyURL_FromEnv(t *testing.T) {
+	t.Setenv("RUNNER_APT_PROXY_URL", "http://apt-cache.gitea.svc:3142")
+	t.Setenv("SERVER_URL", "https://example")
+	cfg, err := Load("/nonexistent")
+	require.NoError(t, err)
+	assert.Equal(t, "http://apt-cache.gitea.svc:3142", cfg.Runner.AptProxyURL)
+}
+
+func TestConfig_AptProxyURL_FromYAML(t *testing.T) {
+	tmp, err := os.CreateTemp("", "drawbar-cfg-*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(tmp.Name())
+	_, err = tmp.WriteString(`
+server:
+  url: https://example
+runner:
+  apt_proxy_url: http://apt-cache.gitea.svc:3142
+  labels: ["x:docker://alpine"]
+`)
+	require.NoError(t, err)
+	tmp.Close()
+
+	cfg, err := Load(tmp.Name())
+	require.NoError(t, err)
+	assert.Equal(t, "http://apt-cache.gitea.svc:3142", cfg.Runner.AptProxyURL)
+}
