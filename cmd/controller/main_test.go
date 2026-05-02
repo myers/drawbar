@@ -153,6 +153,36 @@ func TestBuildArtifactEnv(t *testing.T) {
 	})
 }
 
+// --- buildAptProxyEnv ---
+
+func TestBuildAptProxyEnv(t *testing.T) {
+	t.Run("populates HTTP proxy and no_proxy when URL set", func(t *testing.T) {
+		env := make(map[string]string)
+		buildAptProxyEnv(env, "http://apt-cache.gitea.svc:3142")
+		assert.Equal(t, "http://apt-cache.gitea.svc:3142", env["http_proxy"])
+		assert.Equal(t, "http://apt-cache.gitea.svc:3142", env["HTTP_PROXY"])
+		// HTTPS deliberately NOT proxied — apt-cacher-ng can't MITM TLS.
+		assert.Empty(t, env["https_proxy"])
+		assert.Empty(t, env["HTTPS_PROXY"])
+		// Direct paths for forges, registries, and in-cluster traffic.
+		for _, host := range []string{"localhost", "127.0.0.1", ".svc", ".cluster.local",
+			"github.com", "fj.monoloco.net", "gt.monoloco.net", "ghcr.io", "docker.io"} {
+			assert.Contains(t, env["no_proxy"], host, "no_proxy missing %q", host)
+		}
+		assert.Equal(t, env["no_proxy"], env["NO_PROXY"])
+	})
+
+	t.Run("noop when URL empty", func(t *testing.T) {
+		env := map[string]string{"existing": "stay"}
+		buildAptProxyEnv(env, "")
+		assert.Equal(t, "stay", env["existing"])
+		assert.NotContains(t, env, "http_proxy")
+		assert.NotContains(t, env, "HTTP_PROXY")
+		assert.NotContains(t, env, "no_proxy")
+		assert.NotContains(t, env, "NO_PROXY")
+	})
+}
+
 // --- convertJobSecrets ---
 
 func TestConvertJobSecrets(t *testing.T) {

@@ -256,6 +256,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		WatchConfig:      deps.watchCfg,
 		SnapshotManager:  snapMgr,
 		ActiveJobs:       &activeJobs,
+		AptProxyURL:      cfg.Runner.AptProxyURL,
 	})
 
 	// Create poller.
@@ -452,6 +453,7 @@ type TaskHandlerConfig struct {
 	WatchConfig      k8s.WatchConfig    // optional; zero value uses defaults
 	SnapshotManager  *snapshot.Manager   // optional; nil = no ZFS snapshot cache
 	ActiveJobs       *atomic.Int64       // shared counter for metrics endpoint
+	AptProxyURL      string              // injected as http_proxy/HTTP_PROXY into job pods
 }
 
 // makeTaskHandler returns a TaskHandler that executes workflow jobs as k8s Jobs.
@@ -643,6 +645,13 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 				baseEnv["ACTIONS_RUNTIME_TOKEN"] = runtimeToken
 			}
 			slog.Info("cache URL injected", "url", cacheURL)
+		}
+
+		// Apt-cacher-ng pass-through proxy. Only HTTP — apt-cacher-ng cannot
+		// MITM TLS, so HTTPS stays direct.
+		buildAptProxyEnv(baseEnv, cfg.AptProxyURL)
+		if cfg.AptProxyURL != "" {
+			slog.Info("apt proxy injected", "url", cfg.AptProxyURL)
 		}
 
 		// Standard GITHUB_* env vars from task context. Actions like
@@ -962,6 +971,22 @@ func buildArtifactEnv(env map[string]string, serverURL, gitCloneURL string) {
 	}
 	env["ACTIONS_RUNTIME_URL"] = forgejoURL + "/api/actions_pipeline/"
 	env["ACTIONS_RESULTS_URL"] = forgejoURL + "/"
+}
+
+// buildAptProxyEnv injects http_proxy/HTTP_PROXY and no_proxy/NO_PROXY into
+// env when aptProxyURL is non-empty. HTTPS is intentionally NOT proxied —
+// apt-cacher-ng cannot MITM TLS, so HTTPS stays direct. no_proxy excludes
+// forges, registries, and in-cluster traffic so cargo/git/image pulls bypass
+// the cache.
+func buildAptProxyEnv(env map[string]string, aptProxyURL string) {
+	if aptProxyURL == "" {
+		return
+	}
+	env["http_proxy"] = aptProxyURL
+	env["HTTP_PROXY"] = aptProxyURL
+	noProxy := "localhost,127.0.0.1,.svc,.cluster.local,github.com,fj.monoloco.net,gt.monoloco.net,ghcr.io,docker.io"
+	env["no_proxy"] = noProxy
+	env["NO_PROXY"] = noProxy
 }
 
 // convertJobSecrets converts config JobSecrets to k8s builder format.
