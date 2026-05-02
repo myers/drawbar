@@ -870,10 +870,11 @@ func isBuildKitImage(image string) bool {
 // BuildKit in k8s. The rootless image (moby/buildkit:rootless) uses rootlesskit
 // which invokes newuidmap/newgidmap — these setuid helpers need SETUID+SETGID
 // caps. Seccomp must be Unconfined so rootlesskit can create user namespaces.
-// AppArmor must be Unconfined too: the runtime-default profile (the default
-// on Ubuntu/Debian k3s nodes) blocks rootlesskit's mount-namespace setup
-// even with seccomp Unconfined, so we'd see "failed to share mount point: /:
-// permission denied". --oci-worker-no-process-sandbox avoids needing SYS_ADMIN
+//
+// AppArmor is left at runtime-default: with pod-level user namespaces
+// (HostUsers: false), rootlesskit's mount syscalls happen inside a namespaced
+// kernel context and don't trip the host AppArmor profile that previously
+// blocked them. --oci-worker-no-process-sandbox avoids needing SYS_ADMIN
 // for the OCI worker.
 func applyBuildKitDefaults(svc *k8s.ServiceSpec) {
 	svc.SecurityContext = &corev1.SecurityContext{
@@ -884,9 +885,6 @@ func applyBuildKitDefaults(svc *k8s.ServiceSpec) {
 		},
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeUnconfined,
-		},
-		AppArmorProfile: &corev1.AppArmorProfile{
-			Type: corev1.AppArmorProfileTypeUnconfined,
 		},
 	}
 	// Inject flags as arguments (not command override) so the image's

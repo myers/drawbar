@@ -615,10 +615,9 @@ jobs:
 	require.NotNil(t, buildkitContainer.SecurityContext)
 	require.NotNil(t, buildkitContainer.SecurityContext.SeccompProfile)
 	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, buildkitContainer.SecurityContext.SeccompProfile.Type)
-	// AppArmor must also be Unconfined; runtime-default blocks rootlesskit's
-	// mount-namespace setup on Ubuntu/Debian k3s hosts. See bug 004.
-	require.NotNil(t, buildkitContainer.SecurityContext.AppArmorProfile)
-	assert.Equal(t, corev1.AppArmorProfileTypeUnconfined, buildkitContainer.SecurityContext.AppArmorProfile.Type)
+	// AppArmor stays at runtime-default; userns isolates rootlesskit's mounts
+	// from the host AppArmor profile. Asserting nil locks in the change.
+	assert.Nil(t, buildkitContainer.SecurityContext.AppArmorProfile, "BuildKit sidecar should not pin AppArmor (userns handles isolation)")
 	assert.True(t, *buildkitContainer.SecurityContext.AllowPrivilegeEscalation)
 	assert.Contains(t, buildkitContainer.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))
 	assert.Contains(t, buildkitContainer.SecurityContext.Capabilities.Add, corev1.Capability("SETGID"))
