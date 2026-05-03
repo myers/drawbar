@@ -307,6 +307,27 @@ func TestMirrorOne_AbsolutePathMergesExistingDir(t *testing.T) {
 	assertFile(t, filepath.Join(cacheTarget, "marker"), "fresh")
 }
 
+func TestMirrorCachePaths_FailsOnUnsetHome(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	t.Setenv("HOME", "")
+	err := mirrorCachePaths(ws, cache, []string{"~/.cargo"})
+	if err == nil {
+		t.Fatal("expected fatal error when $HOME is unset")
+	}
+	if !errors.Is(err, errHomeRequired) {
+		t.Errorf("expected errHomeRequired, got %v", err)
+	}
+}
+
+func TestMirrorCachePaths_HomeSetSucceeds(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := mirrorCachePaths(ws, cache, []string{"valid-rel"}); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
 // Helpers.
 
 func tmpWorkspaceAndCache(t *testing.T) (string, string) {
