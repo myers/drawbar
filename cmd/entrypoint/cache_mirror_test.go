@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -175,6 +176,74 @@ func TestMirrorCachePaths_ContinuesAfterFailure(t *testing.T) {
 	_ = ws
 	_ = cache
 	mirrorCachePaths([]string{"/absolute-bad", "valid-rel"})
+}
+
+func TestResolvePath_WorkspaceRelative(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	wsPath, cachePath, err := resolvePath(ws, cache, "/root", "target")
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+	if wsPath != filepath.Join(ws, "target") {
+		t.Errorf("wsPath: got %q, want %q", wsPath, filepath.Join(ws, "target"))
+	}
+	if cachePath != filepath.Join(cache, "target") {
+		t.Errorf("cachePath: got %q, want %q", cachePath, filepath.Join(cache, "target"))
+	}
+}
+
+func TestResolvePath_HomeRelative(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	wsPath, cachePath, err := resolvePath(ws, cache, "/root", "~/.cargo/registry")
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+	if wsPath != "/root/.cargo/registry" {
+		t.Errorf("wsPath: got %q, want %q", wsPath, "/root/.cargo/registry")
+	}
+	want := filepath.Join(cache, "root/.cargo/registry")
+	if cachePath != want {
+		t.Errorf("cachePath: got %q, want %q", cachePath, want)
+	}
+}
+
+func TestResolvePath_HomeRelativeBareTilde(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	wsPath, cachePath, err := resolvePath(ws, cache, "/root", "~")
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+	if wsPath != "/root" {
+		t.Errorf("wsPath: got %q, want %q", wsPath, "/root")
+	}
+	if cachePath != filepath.Join(cache, "root") {
+		t.Errorf("cachePath: got %q, want %q", cachePath, filepath.Join(cache, "root"))
+	}
+}
+
+func TestResolvePath_Absolute(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	wsPath, cachePath, err := resolvePath(ws, cache, "/root", "/var/cache/apt")
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+	if wsPath != "/var/cache/apt" {
+		t.Errorf("wsPath: got %q, want %q", wsPath, "/var/cache/apt")
+	}
+	if cachePath != filepath.Join(cache, "var/cache/apt") {
+		t.Errorf("cachePath: got %q, want %q", cachePath, filepath.Join(cache, "var/cache/apt"))
+	}
+}
+
+func TestResolvePath_HomeRelativeFailsWhenHomeUnset(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	_, _, err := resolvePath(ws, cache, "", "~/.cargo")
+	if err == nil {
+		t.Fatal("expected error for ~/ with empty $HOME")
+	}
+	if !errors.Is(err, errHomeRequired) {
+		t.Errorf("expected errHomeRequired, got %v", err)
+	}
 }
 
 // Helpers.

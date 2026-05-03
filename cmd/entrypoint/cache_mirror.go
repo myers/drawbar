@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // cacheMirrorRoot is where the snapshot-cache PVC is mounted inside the
@@ -17,6 +18,39 @@ const cacheMirrorRoot = "/cache"
 
 // workspaceRoot is the runner's working directory.
 const workspaceRoot = "/workspace"
+
+// errHomeRequired is returned when a ~/-prefixed path is encountered
+// but $HOME is empty in the runner container. mirrorCachePaths treats
+// this as a job-fatal error; everything else is best-effort.
+var errHomeRequired = errors.New("$HOME required but unset")
+
+// resolvePath classifies a declared cache path and returns where the
+// symlink lives (wsPath) and where the symlink points (cachePath).
+//
+//	"target"            -> (workspace+/target,            cache+/target)
+//	"~/.cargo/registry" -> (home+/.cargo/registry,        cache+/<home>/.cargo/registry)
+//	"/var/cache/apt"    -> (/var/cache/apt,               cache+/var/cache/apt)
+//
+// home is the runner's $HOME at call time; an empty home with a ~/-
+// prefixed path returns errHomeRequired.
+func resolvePath(workspace, cache, home, rel string) (wsPath, cachePath string, err error) {
+	switch {
+	case rel == "~" || strings.HasPrefix(rel, "~/"):
+		if home == "" {
+			return "", "", fmt.Errorf("path %q: %w", rel, errHomeRequired)
+		}
+		rest := strings.TrimPrefix(strings.TrimPrefix(rel, "~"), "/")
+		wsPath = filepath.Join(home, rest)
+		cachePath = filepath.Join(cache, strings.TrimPrefix(home, "/"), rest)
+	case filepath.IsAbs(rel):
+		wsPath = rel
+		cachePath = filepath.Join(cache, strings.TrimPrefix(rel, "/"))
+	default:
+		wsPath = filepath.Join(workspace, rel)
+		cachePath = filepath.Join(cache, rel)
+	}
+	return wsPath, cachePath, nil
+}
 
 // mirrorCachePaths makes /workspace/<path> a symlink to /cache/<path>
 // for each declared cache path. Idempotent: safe to call between every
