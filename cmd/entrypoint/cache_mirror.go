@@ -52,38 +52,33 @@ func resolvePath(workspace, cache, home, rel string) (wsPath, cachePath string, 
 	return wsPath, cachePath, nil
 }
 
-// mirrorCachePaths makes /workspace/<path> a symlink to /cache/<path>
-// for each declared cache path. Idempotent: safe to call between every
-// step. Cases handled:
-//
-//   - /workspace/<path> missing: create symlink directly.
-//   - /workspace/<path> already a symlink to the right /cache target: noop.
-//   - /workspace/<path> is a real directory: move its contents into
-//     /cache/<path> (merging on collision, /workspace wins) and replace
-//     the directory with a symlink. This is the warm-run case where
-//     actions/checkout recreated the dir, or the case where step 1 was
-//     checkout itself and produced files we want cached.
-//   - /workspace/<path> is anything else (regular file, broken symlink
-//     to elsewhere): leave it alone and skip — surfacing this as an
-//     error would be more disruptive than helpful, and it cannot happen
-//     for the cache use case we care about.
-//
-// Each call is best-effort: if mirroring one path fails, log and
-// continue — caching just doesn't kick in for that path this run.
-func mirrorCachePaths(paths []string) {
+// mirrorCachePaths makes the configured paths under /workspace, $HOME,
+// or absolute roots into symlinks pointing at /cache/<location>. Called
+// before each step. Returns a non-nil error only for fatal conditions
+// (currently: a ~/-prefixed path with $HOME unset). Per-path filesystem
+// errors are logged and skipped — caching just doesn't kick in for that
+// path this run.
+func mirrorCachePaths(paths []string) error {
+	home := os.Getenv("HOME")
 	for _, p := range paths {
-		if err := mirrorOne(workspaceRoot, cacheMirrorRoot, p); err != nil {
+		if err := mirrorOne(workspaceRoot, cacheMirrorRoot, home, p); err != nil {
+			if errors.Is(err, errHomeRequired) {
+				return err
+			}
 			fmt.Fprintf(os.Stderr, "cache mirror %q: %v\n", p, err)
 		}
 	}
+	return nil
 }
 
-func mirrorOne(workspace, cache, rel string) error {
-	if rel == "" || filepath.IsAbs(rel) {
-		return fmt.Errorf("invalid relative path %q", rel)
+func mirrorOne(workspace, cache, home, rel string) error {
+	if rel == "" {
+		return fmt.Errorf("empty cache path")
 	}
-	wsPath := filepath.Join(workspace, rel)
-	cachePath := filepath.Join(cache, rel)
+	wsPath, cachePath, err := resolvePath(workspace, cache, home, rel)
+	if err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		return fmt.Errorf("mkdir cache parent: %w", err)
@@ -111,7 +106,6 @@ func mirrorOne(workspace, cache, rel string) error {
 		if target == cachePath {
 			return nil
 		}
-		// Wrong-pointing symlink — replace it.
 		if err := os.Remove(wsPath); err != nil {
 			return fmt.Errorf("removing stale symlink: %w", err)
 		}
@@ -119,11 +113,9 @@ func mirrorOne(workspace, cache, rel string) error {
 	}
 
 	if !info.IsDir() {
-		// Regular file or other; leave alone.
 		return nil
 	}
 
-	// Real directory — merge into cache and replace with symlink.
 	if err := mergeDir(wsPath, cachePath); err != nil {
 		return fmt.Errorf("merging into cache: %w", err)
 	}

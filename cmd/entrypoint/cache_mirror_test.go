@@ -10,7 +10,7 @@ import (
 func TestMirrorOne_CreatesSymlinkWhenWorkspaceMissing(t *testing.T) {
 	ws, cache := tmpWorkspaceAndCache(t)
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestMirrorOne_LeavesCorrectSymlinkAlone(t *testing.T) {
 	mustWriteFile(t, filepath.Join(cacheTarget, "marker"), "keep")
 	mustSymlink(t, cacheTarget, wsTarget)
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -58,7 +58,7 @@ func TestMirrorOne_ReplacesWrongPointingSymlink(t *testing.T) {
 	mustMkdir(t, bogus)
 	mustSymlink(t, bogus, wsTarget)
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -86,7 +86,7 @@ func TestMirrorOne_MergesRealDirIntoCache(t *testing.T) {
 	mustWriteFile(t, filepath.Join(cacheTarget, "a.txt"), "from-cache")
 	mustWriteFile(t, filepath.Join(cacheTarget, "c.txt"), "only-in-cache")
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestMirrorOne_PreservesSymlinkDuringMerge(t *testing.T) {
 	mustMkdir(t, wsTarget)
 	mustSymlink(t, "../elsewhere", filepath.Join(wsTarget, "rel-link"))
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -126,7 +126,7 @@ func TestMirrorOne_LeavesRegularFileAlone(t *testing.T) {
 	wsTarget := filepath.Join(ws, "target")
 	mustWriteFile(t, wsTarget, "i am a file")
 
-	if err := mirrorOne(ws, cache, "target"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "target"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -143,18 +143,10 @@ func TestMirrorOne_LeavesRegularFileAlone(t *testing.T) {
 	}
 }
 
-func TestMirrorOne_RejectsAbsolutePath(t *testing.T) {
-	ws, cache := tmpWorkspaceAndCache(t)
-
-	if err := mirrorOne(ws, cache, "/etc"); err == nil {
-		t.Errorf("expected error for absolute path")
-	}
-}
-
 func TestMirrorOne_NestedRelativePath(t *testing.T) {
 	ws, cache := tmpWorkspaceAndCache(t)
 
-	if err := mirrorOne(ws, cache, "deep/nested/dir"); err != nil {
+	if err := mirrorOne(ws, cache, "/root", "deep/nested/dir"); err != nil {
 		t.Fatalf("mirrorOne: %v", err)
 	}
 
@@ -168,14 +160,12 @@ func TestMirrorOne_NestedRelativePath(t *testing.T) {
 
 func TestMirrorCachePaths_ContinuesAfterFailure(t *testing.T) {
 	ws, cache := tmpWorkspaceAndCache(t)
-	// Simulate per-path failure-then-success by passing one bad and one good.
-	defer func() {
-		// mirrorCachePaths uses package-level constants for ws/cache, not args.
-		// We're really just exercising the loop's try-each-and-continue here.
-	}()
 	_ = ws
 	_ = cache
-	mirrorCachePaths([]string{"/absolute-bad", "valid-rel"})
+	// Empty path still fails; valid relative path should still get processed.
+	if err := mirrorCachePaths([]string{"", "valid-rel"}); err != nil {
+		t.Fatalf("mirrorCachePaths should not return fatal error for empty path: %v", err)
+	}
 }
 
 func TestResolvePath_WorkspaceRelative(t *testing.T) {
