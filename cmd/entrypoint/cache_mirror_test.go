@@ -160,11 +160,20 @@ func TestMirrorOne_NestedRelativePath(t *testing.T) {
 
 func TestMirrorCachePaths_ContinuesAfterFailure(t *testing.T) {
 	ws, cache := tmpWorkspaceAndCache(t)
-	_ = ws
-	_ = cache
-	// Empty path still fails; valid relative path should still get processed.
-	if err := mirrorCachePaths([]string{"", "valid-rel"}); err != nil {
-		t.Fatalf("mirrorCachePaths should not return fatal error for empty path: %v", err)
+	// Empty path produces a non-fatal error; valid relative path should
+	// then be mirrored successfully.
+	if err := mirrorCachePaths(ws, cache, []string{"", "valid-rel"}); err != nil {
+		t.Fatalf("mirrorCachePaths should not return fatal error: %v", err)
+	}
+	// Confirm the second path was actually processed: symlink at ws/valid-rel.
+	wsPath := filepath.Join(ws, "valid-rel")
+	cachePath := filepath.Join(cache, "valid-rel")
+	got, err := os.Readlink(wsPath)
+	if err != nil {
+		t.Fatalf("expected symlink at %s: %v", wsPath, err)
+	}
+	if got != cachePath {
+		t.Errorf("symlink target: got %q, want %q", got, cachePath)
 	}
 }
 

@@ -58,10 +58,10 @@ func resolvePath(workspace, cache, home, rel string) (wsPath, cachePath string, 
 // (currently: a ~/-prefixed path with $HOME unset). Per-path filesystem
 // errors are logged and skipped — caching just doesn't kick in for that
 // path this run.
-func mirrorCachePaths(paths []string) error {
+func mirrorCachePaths(workspace, cache string, paths []string) error {
 	home := os.Getenv("HOME")
 	for _, p := range paths {
-		if err := mirrorOne(workspaceRoot, cacheMirrorRoot, home, p); err != nil {
+		if err := mirrorOne(workspace, cache, home, p); err != nil {
 			if errors.Is(err, errHomeRequired) {
 				return err
 			}

@@ -97,7 +97,7 @@ func runEntrypoint(manifestPath, workDir string) bool {
 		// recreated cached directories; this re-establishes the symlinks
 		// idempotently and merges any fresh contents into the cache.
 		if len(manifest.CachePaths) > 0 {
-			mirrorCachePaths(manifest.CachePaths)
+			mirrorCachePaths(workspaceRoot, cacheMirrorRoot, manifest.CachePaths)
 		}
 
 		// Evaluate runtime if: condition.
