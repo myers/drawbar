@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -673,7 +674,13 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		var snapshotPaths []string
 		if cfg.SnapshotManager != nil {
 			var restoreKeys []string
-			snapshotCacheKey, snapshotPaths, restoreKeys = extractCacheInfo(steps)
+			var extractErr error
+			snapshotCacheKey, snapshotPaths, restoreKeys, extractErr = extractCacheInfo(steps)
+			if extractErr != nil {
+				slog.Error("invalid cache path", "task_id", task.GetId(), "error", extractErr)
+				reportFailure(ctx, cfg.ServerClient, task, fmt.Sprintf("Invalid cache path: %v", extractErr))
+				return
+			}
 			if snapshotCacheKey != "" && len(snapshotPaths) > 0 {
 				repository := taskCtx["repository"].GetStringValue()
 				pvcName := fmt.Sprintf("cache-%d", task.GetId())
@@ -1006,9 +1013,12 @@ func convertJobSecrets(secrets []config.JobSecret) []k8s.JobSecretMount {
 	return mounts
 }
 
-// extractCacheInfo finds the cache key, paths, and restore-keys from cache steps.
-// Returns empty key if no cache step found. Paths are relative to /workspace.
-func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, restoreKeys []string) {
+// extractCacheInfo finds the cache key, paths, and restore-keys from
+// drawbar/cache@v1 steps. Path entries are accepted in three shapes:
+// workspace-relative ("target"), home-relative ("~/.cargo/registry"),
+// and absolute ("/var/cache/apt"). Returns an error if any entry
+// contains a ".." traversal segment — the caller fails the job.
+func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, restoreKeys []string, err error) {
 	seen := make(map[string]bool)
 	for _, step := range steps {
 		k, ok := step.Env["INPUT_KEY"]
@@ -1018,13 +1028,14 @@ func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, resto
 		if key == "" {
 			key = k
 		}
-		// INPUT_PATH may contain multiple paths separated by newlines.
 		if p, ok := step.Env["INPUT_PATH"]; ok && p != "" {
 			for _, entry := range strings.Split(p, "\n") {
 				entry = strings.TrimSpace(entry)
-				// Sanitize: must be relative, no traversal.
-				if entry == "" || strings.HasPrefix(entry, "/") || strings.Contains(entry, "..") {
+				if entry == "" {
 					continue
+				}
+				if hasTraversal(entry) {
+					return "", nil, nil, fmt.Errorf("cache path %q contains '..'", entry)
 				}
 				if !seen[entry] {
 					seen[entry] = true
@@ -1032,7 +1043,6 @@ func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, resto
 				}
 			}
 		}
-		// INPUT_RESTORE-KEYS: one prefix per line.
 		if rk, ok := step.Env["INPUT_RESTORE-KEYS"]; ok && rk != "" {
 			for _, entry := range strings.Split(rk, "\n") {
 				entry = strings.TrimSpace(entry)
@@ -1042,7 +1052,19 @@ func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, resto
 			}
 		}
 	}
-	return key, paths, restoreKeys
+	return key, paths, restoreKeys, nil
+}
+
+// hasTraversal reports whether any segment of the path is "..". Uses
+// filepath.ToSlash so it behaves the same regardless of host OS — paths
+// in workflow YAML always use forward slashes.
+func hasTraversal(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // parseTimeoutMinutes converts a string timeout-minutes value to float64.

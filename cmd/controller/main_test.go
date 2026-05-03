@@ -15,6 +15,7 @@ import (
 	"github.com/myers/drawbar/pkg/config"
 	"github.com/myers/drawbar/pkg/server"
 	"github.com/myers/drawbar/pkg/labels"
+	"github.com/myers/drawbar/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -630,4 +631,82 @@ func TestConvertServices_BuildKitNoDoubleInject(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, count, "should not double-inject in Args")
+}
+
+func TestExtractCacheInfo_AcceptsAllShapes(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "target\n~/.cargo/registry\n/var/cache/apt",
+		},
+	}}
+	key, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if key != "k" {
+		t.Errorf("key: got %q, want %q", key, "k")
+	}
+	want := []string{"target", "~/.cargo/registry", "/var/cache/apt"}
+	if len(paths) != len(want) {
+		t.Fatalf("paths len: got %d, want %d", len(paths), len(want))
+	}
+	for i, p := range want {
+		if paths[i] != p {
+			t.Errorf("paths[%d]: got %q, want %q", i, paths[i], p)
+		}
+	}
+}
+
+func TestExtractCacheInfo_RejectsTraversal(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "../escape",
+		},
+	}}
+	_, _, _, err := extractCacheInfo(steps)
+	if err == nil {
+		t.Fatal("expected error for ../ traversal")
+	}
+}
+
+func TestExtractCacheInfo_RejectsTraversalInMiddle(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "good/../bad",
+		},
+	}}
+	_, _, _, err := extractCacheInfo(steps)
+	if err == nil {
+		t.Fatal("expected error for embedded ../")
+	}
+}
+
+func TestExtractCacheInfo_DedupesPaths(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "target\ntarget\n~/.cargo\n~/.cargo",
+		},
+	}}
+	_, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Errorf("expected dedup to 2 paths, got %d: %v", len(paths), paths)
+	}
+}
+
+func TestExtractCacheInfo_NoCacheStep(t *testing.T) {
+	steps := []types.StepSpec{{Env: map[string]string{}}}
+	key, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if key != "" || len(paths) != 0 {
+		t.Errorf("expected empty result, got key=%q paths=%v", key, paths)
+	}
 }
