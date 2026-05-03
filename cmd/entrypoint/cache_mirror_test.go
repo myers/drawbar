@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -243,6 +244,67 @@ func TestResolvePath_HomeRelativeFailsWhenHomeUnset(t *testing.T) {
 	if !errors.Is(err, errHomeRequired) {
 		t.Errorf("expected errHomeRequired, got %v", err)
 	}
+}
+
+func TestMirrorOne_HomeRelativePath(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	home := filepath.Join(t.TempDir(), "home", "runner")
+	mustMkdir(t, home)
+
+	if err := mirrorOne(ws, cache, home, "~/.cargo/registry"); err != nil {
+		t.Fatalf("mirrorOne: %v", err)
+	}
+
+	wsTarget := filepath.Join(home, ".cargo/registry")
+	cacheTarget := filepath.Join(cache, strings.TrimPrefix(home, "/"), ".cargo/registry")
+
+	got, err := os.Readlink(wsTarget)
+	if err != nil {
+		t.Fatalf("expected symlink at %s: %v", wsTarget, err)
+	}
+	if got != cacheTarget {
+		t.Errorf("symlink target: got %q, want %q", got, cacheTarget)
+	}
+	if _, err := os.Stat(cacheTarget); err != nil {
+		t.Errorf("expected cache dir to exist: %v", err)
+	}
+}
+
+func TestMirrorOne_AbsolutePath(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	// Use a tempdir-prefixed absolute path so the test is hermetic.
+	absDir := filepath.Join(t.TempDir(), "abs", "var", "cache", "apt")
+
+	if err := mirrorOne(ws, cache, "/root", absDir); err != nil {
+		t.Fatalf("mirrorOne: %v", err)
+	}
+
+	cacheTarget := filepath.Join(cache, strings.TrimPrefix(absDir, "/"))
+	got, err := os.Readlink(absDir)
+	if err != nil {
+		t.Fatalf("expected symlink at %s: %v", absDir, err)
+	}
+	if got != cacheTarget {
+		t.Errorf("symlink target: got %q, want %q", got, cacheTarget)
+	}
+}
+
+func TestMirrorOne_AbsolutePathMergesExistingDir(t *testing.T) {
+	ws, cache := tmpWorkspaceAndCache(t)
+	absDir := filepath.Join(t.TempDir(), "abs", "var", "cache", "apt")
+	mustMkdir(t, absDir)
+	mustWriteFile(t, filepath.Join(absDir, "marker"), "fresh")
+
+	if err := mirrorOne(ws, cache, "/root", absDir); err != nil {
+		t.Fatalf("mirrorOne: %v", err)
+	}
+
+	cacheTarget := filepath.Join(cache, strings.TrimPrefix(absDir, "/"))
+	got, err := os.Readlink(absDir)
+	if err != nil || got != cacheTarget {
+		t.Fatalf("symlink: got=%q err=%v", got, err)
+	}
+	assertFile(t, filepath.Join(cacheTarget, "marker"), "fresh")
 }
 
 // Helpers.
