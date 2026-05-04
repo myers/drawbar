@@ -1035,7 +1035,7 @@ func extractCacheInfo(steps []types.StepSpec) (key string, paths []string, resto
 					continue
 				}
 				if hasTraversal(entry) {
-					return "", nil, nil, fmt.Errorf("cache path %q contains '..'", entry)
+					return "", nil, nil, fmt.Errorf("entry %q contains '..'", entry)
 				}
 				if !seen[entry] {
 					seen[entry] = true
