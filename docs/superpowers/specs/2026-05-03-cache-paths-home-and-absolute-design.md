@@ -171,8 +171,15 @@ func mirrorCachePaths(paths []string) error {
 ```
 
 Caller (`cmd/entrypoint/main.go`) treats a non-nil return as a
-job-level error: emit a `StateEvent{Event: "error", ...}` and exit 1
-before the step loop continues.
+job-level error: write `cache mirror fatal: <err>` to stderr and
+`os.Exit(1)`. The runner container's non-zero exit propagates
+through the controller's existing pod-watcher
+(`pkg/k8s/watcher.go::getContainerResult`) as `RESULT_FAILURE`.
+Stderr is captured in container logs, so the cause is visible to
+the user. (We considered emitting a `StateEvent{Event: "error"}`
+but the controller's `routeStateEvent` only handles
+`start`/`end`/`skip`; the existing exit-code path is the simpler
+integration.)
 
 ### k8s builder + types: no schema change
 
