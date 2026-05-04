@@ -17,6 +17,7 @@ import (
 	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
 	gouuid "github.com/google/uuid"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -82,8 +83,25 @@ func NewClient(endpoint string, insecure bool, uuid, token string, fetchInterval
 }
 
 func newHTTPClient(endpoint string, insecure bool, timeout time.Duration) *http.Client {
+	transport, _ := buildTransport(endpoint, insecure)
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+}
+
+// buildTransport constructs the http.Transport and, separately, the
+// http2.Transport configured on top of it. The *http2.Transport is returned
+// so callers (including tests) can inspect or further configure PING knobs
+// without having to dig through unexported fields.
+func buildTransport(endpoint string, insecure bool) (*http.Transport, *http2.Transport) {
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	if strings.HasPrefix(endpoint, "https://") && insecure {
@@ -94,10 +112,19 @@ func newHTTPClient(endpoint string, insecure bool, timeout time.Duration) *http.
 		}
 	}
 
-	return &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
+	// Enable HTTP/2 PINGs so a half-dead conn (NAT/LB drop, server crash without
+	// FIN) is detected and torn within ~25s instead of waiting for OS TCP
+	// keepalive (default 2h on Linux). See bugs/010.
+	h2t, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		slog.Error("http2 configure failed", "error", err)
+		return transport, nil
 	}
+	h2t.ReadIdleTimeout = 15 * time.Second
+	h2t.PingTimeout = 10 * time.Second
+	h2t.WriteByteTimeout = 30 * time.Second
+
+	return transport, h2t
 }
 
 // Endpoint returns the Forgejo instance URL.
