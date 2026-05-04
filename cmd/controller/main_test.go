@@ -282,9 +282,13 @@ func TestCollectSecrets(t *testing.T) {
 
 // --- healthzHandler ---
 
-func TestHealthzHandler_FreshPoll(t *testing.T) {
+func TestHealthzHandler_BothFresh(t *testing.T) {
 	now := time.Now()
-	handler := healthzHandler(func() time.Time { return now }, 30*time.Second, nil)
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return now },
+		30*time.Second, 5*time.Minute, nil,
+	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	handler(w, req)
@@ -293,9 +297,12 @@ func TestHealthzHandler_FreshPoll(t *testing.T) {
 }
 
 func TestHealthzHandler_NoPollYet(t *testing.T) {
-	// Zero time = startup, before first poll. Treated as healthy so the
-	// probe doesn't fail in the first few seconds after launch.
-	handler := healthzHandler(func() time.Time { return time.Time{} }, 30*time.Second, nil)
+	// Both heartbeats zero = startup, before first poll. Always healthy.
+	handler := healthzHandler(
+		func() time.Time { return time.Time{} },
+		func() time.Time { return time.Time{} },
+		30*time.Second, 5*time.Minute, nil,
+	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	handler(w, req)
@@ -303,9 +310,14 @@ func TestHealthzHandler_NoPollYet(t *testing.T) {
 }
 
 func TestHealthzHandler_StalePoll(t *testing.T) {
-	// Last poll was an hour ago — staleness threshold of 30s exceeded.
+	// Poll heartbeat stale = ticker dead. 503.
 	stale := time.Now().Add(-time.Hour)
-	handler := healthzHandler(func() time.Time { return stale }, 30*time.Second, nil)
+	now := time.Now()
+	handler := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		30*time.Second, 5*time.Minute, nil,
+	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	handler(w, req)
@@ -313,12 +325,47 @@ func TestHealthzHandler_StalePoll(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "poll loop stale")
 }
 
+func TestHealthzHandler_StaleSuccessfulFetch(t *testing.T) {
+	// Poll heartbeat is fresh (goroutine is alive, RPCs are returning) but
+	// no successful response in a long time = transport wedged. 503.
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		30*time.Second, 5*time.Minute, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "successful fetch stale")
+}
+
+func TestHealthzHandler_StaleSuccessfulFetch_ZeroIgnored(t *testing.T) {
+	// Successful-fetch zero = no successful fetch yet (e.g. server still down
+	// since startup). Treat as "starting up" — do NOT 503 on this alone. The
+	// poll heartbeat handles ticker-dead; readyz handles registration.
+	now := time.Now()
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return time.Time{} },
+		30*time.Second, 5*time.Minute, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
 func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
 	var calls atomic.Int32
 	handler := healthzHandler(
 		func() time.Time { return stale },
-		30*time.Second,
+		func() time.Time { return now },
+		30*time.Second, 5*time.Minute,
 		func(_, _ time.Duration) { calls.Add(1) },
 	)
 	for range 5 {
@@ -330,13 +377,38 @@ func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load(), "onWedge should fire exactly once across multiple stale probes")
 }
 
+func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	var calls atomic.Int32
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		30*time.Second, 5*time.Minute,
+		func(_, _ time.Duration) { calls.Add(1) },
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
 func TestPollStalenessThreshold(t *testing.T) {
-	// Floor of 30s applies for small intervals.
 	assert.Equal(t, 30*time.Second, pollStalenessThreshold(2*time.Second))
 	assert.Equal(t, 30*time.Second, pollStalenessThreshold(time.Second))
-	// 10x interval applies when above the floor.
 	assert.Equal(t, 100*time.Second, pollStalenessThreshold(10*time.Second))
 	assert.Equal(t, 5*time.Minute, pollStalenessThreshold(30*time.Second))
+}
+
+func TestSuccessFetchStalenessThreshold(t *testing.T) {
+	// Floor of 2 minutes — successful-fetch staleness is the slower detector;
+	// it should tolerate a brief outage before tripping the probe.
+	assert.Equal(t, 2*time.Minute, successFetchStalenessThreshold(2*time.Second))
+	assert.Equal(t, 2*time.Minute, successFetchStalenessThreshold(10*time.Second))
+	// 10x interval applies above the floor.
+	assert.Equal(t, 5*time.Minute, successFetchStalenessThreshold(30*time.Second))
+	assert.Equal(t, 10*time.Minute, successFetchStalenessThreshold(time.Minute))
 }
 
 // --- readyzHandler ---

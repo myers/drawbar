@@ -278,11 +278,17 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	var registered atomic.Bool
 	registered.Store(true)
 	pollStaleness := pollStalenessThreshold(cfg.Runner.FetchInterval)
-	go startHealthServer(&registered, &activeJobs, int64(cfg.Runner.Capacity), poller.LastPollAt, pollStaleness)
+	successFetchStaleness := successFetchStalenessThreshold(cfg.Runner.FetchInterval)
+	go startHealthServer(
+		&registered, &activeJobs, int64(cfg.Runner.Capacity),
+		poller.LastPollAt, poller.LastSuccessfulFetchAt,
+		pollStaleness, successFetchStaleness,
+	)
 
 	slog.Info("runner is online, polling for tasks",
 		"job_namespace", deps.namespace,
 		"poll_staleness_threshold", pollStaleness,
+		"success_fetch_staleness_threshold", successFetchStaleness,
 	)
 	poller.Run(ctx)
 	slog.Info("poller stopped, draining in-flight tasks")
@@ -340,14 +346,23 @@ func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, names
 	}
 }
 
-func startHealthServer(registered *atomic.Bool, activeJobs *atomic.Int64, capacity int64, lastPoll func() time.Time, pollStaleness time.Duration) {
+func startHealthServer(
+	registered *atomic.Bool,
+	activeJobs *atomic.Int64,
+	capacity int64,
+	lastPoll func() time.Time,
+	lastSuccessfulFetch func() time.Time,
+	pollStaleness time.Duration,
+	successFetchStaleness time.Duration,
+) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler(lastPoll, pollStaleness, dumpGoroutinesToStderr))
+	mux.HandleFunc("/healthz", healthzHandler(
+		lastPoll, lastSuccessfulFetch,
+		pollStaleness, successFetchStaleness,
+		dumpGoroutinesToStderr,
+	))
 	mux.HandleFunc("/readyz", readyzHandler(registered))
 	mux.HandleFunc("/metrics/active-jobs", metricsHandler(activeJobs, capacity))
-	// Mount net/http/pprof on this server (port 8081) so operators can grab a
-	// live goroutine dump before the kubelet restarts the pod. Early-alpha:
-	// always on, no auth — the port isn't exposed outside the cluster.
 	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	slog.Info("health server listening", "port", 8081)
 	if err := http.ListenAndServe(":8081", mux); err != nil {
@@ -356,24 +371,45 @@ func startHealthServer(registered *atomic.Bool, activeJobs *atomic.Int64, capaci
 }
 
 // healthzHandler returns OK while the poll loop is making progress and 503
-// once it has been silent for longer than staleness — letting kubelet restart
-// the pod when the goroutine wedges. The zero value from lastPoll is treated
-// as "starting up" (always OK) so the probe doesn't fail before the first poll.
+// once either heartbeat is too stale:
 //
-// The first time staleness is detected, onWedge is invoked exactly once so
-// callers can capture diagnostics (a goroutine dump) before the liveness
-// probe restarts the pod and destroys the evidence.
-func healthzHandler(lastPoll func() time.Time, staleness time.Duration, onWedge func(since, threshold time.Duration)) http.HandlerFunc {
+//   - lastPoll catches "ticker dead" (the poll goroutine is not running). The
+//     zero value is treated as "starting up" and is always OK.
+//   - lastSuccessfulFetch catches "transport dead but goroutine alive" — RPCs
+//     are returning errors but no real server response in a long time
+//     (h2 conn half-dead, server-side throttling, ...). The zero value is
+//     ignored on purpose: if the server has been down since the runner
+//     started, /readyz handles that — /healthz should not page.
+//
+// onWedge fires exactly once across the lifetime of the handler the first
+// time either condition trips, so callers can capture diagnostics (a goroutine
+// dump) before the kubelet restarts the pod and destroys the evidence.
+func healthzHandler(
+	lastPoll func() time.Time,
+	lastSuccessfulFetch func() time.Time,
+	pollStaleness time.Duration,
+	successFetchStaleness time.Duration,
+	onWedge func(since, threshold time.Duration),
+) http.HandlerFunc {
 	var dumpOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
-		t := lastPoll()
-		if !t.IsZero() {
-			if since := time.Since(t); since > staleness {
+		if t := lastPoll(); !t.IsZero() {
+			if since := time.Since(t); since > pollStaleness {
 				if onWedge != nil {
-					dumpOnce.Do(func() { onWedge(since, staleness) })
+					dumpOnce.Do(func() { onWedge(since, pollStaleness) })
 				}
 				w.WriteHeader(http.StatusServiceUnavailable)
-				fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, staleness)
+				fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, pollStaleness)
+				return
+			}
+		}
+		if t := lastSuccessfulFetch(); !t.IsZero() {
+			if since := time.Since(t); since > successFetchStaleness {
+				if onWedge != nil {
+					dumpOnce.Do(func() { onWedge(since, successFetchStaleness) })
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintf(w, "successful fetch stale: last successful fetch %s ago (threshold %s)", since, successFetchStaleness)
 				return
 			}
 		}
@@ -404,6 +440,20 @@ func dumpGoroutinesToStderr(since, threshold time.Duration) {
 // don't trip the probe; otherwise 10× the configured fetch interval.
 func pollStalenessThreshold(fetchInterval time.Duration) time.Duration {
 	const floor = 30 * time.Second
+	t := fetchInterval * 10
+	if t < floor {
+		return floor
+	}
+	return t
+}
+
+// successFetchStalenessThreshold returns how long the poller is allowed to
+// go without a real server response before /healthz starts failing. Slower
+// than pollStalenessThreshold because brief server outages are normal — we
+// only want to restart the pod when the transport itself is wedged. At
+// least 2 minutes; otherwise 10× the configured fetch interval.
+func successFetchStalenessThreshold(fetchInterval time.Duration) time.Duration {
+	const floor = 2 * time.Minute
 	t := fetchInterval * 10
 	if t < floor {
 		return floor
