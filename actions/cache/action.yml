@@ -5,7 +5,12 @@ inputs:
     description: 'Cache key. Exact match triggers a cache hit.'
     required: true
   path:
-    description: 'Paths to cache, relative to workspace. One per line.'
+    description: |
+      Paths to cache, one per line. Three shapes accepted:
+        - workspace-relative: "target"
+        - home-relative:      "~/.cargo/registry"  (expanded against $HOME in the runner)
+        - absolute:           "/var/cache/apt"
+      Mirrors the actions/cache@v4 path: shape.
     required: true
   restore-keys:
     description: 'Ordered list of prefix keys to fall back to if exact key misses. One per line.'
