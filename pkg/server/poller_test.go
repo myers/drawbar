@@ -235,6 +235,10 @@ func TestPoller_LastSuccessfulFetchAt_TransportErrorOnlyUpdatesPoll(t *testing.T
 	// lastSuccessfulFetchNs must NOT advance — that's what catches the wedge
 	// if h2 PINGs ever fail to detect a dead conn.
 	transportErr := connect.NewError(connect.CodeUnavailable, errors.New("transport error"))
+	// Only the first error fires within the test window: the non-deadline
+	// error triggers backoff (backoffMin = 2s), so subsequent ticks don't
+	// reach the mock. The slice is oversized on purpose so the test doesn't
+	// depend on backoff arithmetic.
 	errs := make([]error, 100)
 	for i := range errs {
 		errs[i] = transportErr
