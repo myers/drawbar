@@ -366,7 +366,7 @@ func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 		func() time.Time { return stale },
 		func() time.Time { return now },
 		30*time.Second, 5*time.Minute,
-		func(_, _ time.Duration) { calls.Add(1) },
+		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
 	for range 5 {
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -385,13 +385,49 @@ func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
 		func() time.Time { return now },
 		func() time.Time { return stale },
 		30*time.Second, 5*time.Minute,
-		func(_, _ time.Duration) { calls.Add(1) },
+		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 	handler(w, req)
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
+	// Poll-loop path: kind should be "poll loop".
+	t.Run("poll", func(t *testing.T) {
+		stale := time.Now().Add(-time.Hour)
+		now := time.Now()
+		var gotKind string
+		handler := healthzHandler(
+			func() time.Time { return stale },
+			func() time.Time { return now },
+			30*time.Second, 5*time.Minute,
+			func(kind string, _, _ time.Duration) { gotKind = kind },
+		)
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, "poll loop", gotKind)
+	})
+
+	// Successful-fetch path: kind should be "successful fetch".
+	t.Run("successful fetch", func(t *testing.T) {
+		now := time.Now()
+		stale := time.Now().Add(-time.Hour)
+		var gotKind string
+		handler := healthzHandler(
+			func() time.Time { return now },
+			func() time.Time { return stale },
+			30*time.Second, 5*time.Minute,
+			func(kind string, _, _ time.Duration) { gotKind = kind },
+		)
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, "successful fetch", gotKind)
+	})
 }
 
 func TestPollStalenessThreshold(t *testing.T) {

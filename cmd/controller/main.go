@@ -384,19 +384,21 @@ func startHealthServer(
 // onWedge fires exactly once across the lifetime of the handler the first
 // time either condition trips, so callers can capture diagnostics (a goroutine
 // dump) before the kubelet restarts the pod and destroys the evidence.
+// The kind parameter identifies which check tripped ("poll loop" or
+// "successful fetch").
 func healthzHandler(
 	lastPoll func() time.Time,
 	lastSuccessfulFetch func() time.Time,
 	pollStaleness time.Duration,
 	successFetchStaleness time.Duration,
-	onWedge func(since, threshold time.Duration),
+	onWedge func(kind string, since, threshold time.Duration),
 ) http.HandlerFunc {
 	var dumpOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
 		if t := lastPoll(); !t.IsZero() {
 			if since := time.Since(t); since > pollStaleness {
 				if onWedge != nil {
-					dumpOnce.Do(func() { onWedge(since, pollStaleness) })
+					dumpOnce.Do(func() { onWedge("poll loop", since, pollStaleness) })
 				}
 				w.WriteHeader(http.StatusServiceUnavailable)
 				fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, pollStaleness)
@@ -406,7 +408,7 @@ func healthzHandler(
 		if t := lastSuccessfulFetch(); !t.IsZero() {
 			if since := time.Since(t); since > successFetchStaleness {
 				if onWedge != nil {
-					dumpOnce.Do(func() { onWedge(since, successFetchStaleness) })
+					dumpOnce.Do(func() { onWedge("successful fetch", since, successFetchStaleness) })
 				}
 				w.WriteHeader(http.StatusServiceUnavailable)
 				fmt.Fprintf(w, "successful fetch stale: last successful fetch %s ago (threshold %s)", since, successFetchStaleness)
@@ -420,18 +422,21 @@ func healthzHandler(
 
 // dumpGoroutinesToStderr writes a loud header plus a full goroutine stack
 // dump to stderr. Called once when /healthz first detects a wedged poll loop
-// (see bug 007). Stderr is separate from the JSON log stream so the dump is
-// readable as-is via `kubectl logs --previous`.
-func dumpGoroutinesToStderr(since, threshold time.Duration) {
-	slog.Error("POLL LOOP WEDGED — dumping goroutines to stderr",
-		"last_poll_ago", since,
+// or transport (see bug 007 / 010). Stderr is separate from the JSON log
+// stream so the dump is readable as-is via `kubectl logs --previous`.
+//
+// kind describes which staleness check tripped — "poll loop" or "successful fetch".
+func dumpGoroutinesToStderr(kind string, since, threshold time.Duration) {
+	slog.Error(strings.ToUpper(kind)+" WEDGED — dumping goroutines to stderr",
+		"kind", kind,
+		"since", since,
 		"threshold", threshold,
 	)
 	buf := make([]byte, 1<<20) // 1 MiB; truncates if more
 	n := runtime.Stack(buf, true)
 	fmt.Fprintf(os.Stderr,
-		"\n=== POLL LOOP WEDGED (last poll %s ago, threshold %s) ===\n%s\n=== END GOROUTINE DUMP ===\n",
-		since, threshold, buf[:n],
+		"\n=== %s WEDGED (last contact %s ago, threshold %s) ===\n%s\n=== END GOROUTINE DUMP ===\n",
+		strings.ToUpper(kind), since, threshold, buf[:n],
 	)
 }
 
