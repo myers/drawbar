@@ -74,7 +74,14 @@ func Default() *Config {
 			Labels:        []string{"ubuntu-latest:docker://node:22-bookworm"},
 			Capacity:      1,
 			FetchInterval: 2 * time.Second,
-			FetchTimeout:  5 * time.Second,
+			// Forgejo's long-poll holds the connection ~50s when no tasks are
+			// available, so a short FetchTimeout means every healthy poll
+			// returns CodeDeadlineExceeded (client-side cancel). That signal
+			// counts as a successful round trip in the heartbeat logic, which
+			// is correct — but a timeout shorter than the h2 ReadIdleTimeout
+			// (~15s) would also short-circuit the transport-wedge detection.
+			// Match the Helm default of 30s.
+			FetchTimeout: 30 * time.Second,
 			Timeout:       3 * time.Hour,
 		},
 		Cache: CacheConfig{

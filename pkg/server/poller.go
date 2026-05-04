@@ -17,18 +17,18 @@ type TaskHandler func(ctx context.Context, task *runnerv1.Task)
 
 // Poller continuously fetches tasks from the server.
 type Poller struct {
-	client       PollerClient
-	handler      TaskHandler
-	fetchTimeout time.Duration
-	capacity     int64
-	ephemeral    bool // if true, stop polling after first task completes
-	log          *slog.Logger
-	sem          chan struct{} // concurrency semaphore
-	wg           sync.WaitGroup
-	backoff      time.Duration      // current backoff duration (0 = no backoff)
-	stopPoll     context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
-	lastPollNs            atomic.Int64 // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
-	lastSuccessfulFetchNs atomic.Int64 // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
+	client                PollerClient
+	handler               TaskHandler
+	fetchTimeout          time.Duration
+	capacity              int64
+	ephemeral             bool // if true, stop polling after first task completes
+	log                   *slog.Logger
+	sem                   chan struct{} // concurrency semaphore
+	wg                    sync.WaitGroup
+	backoff               time.Duration      // current backoff duration (0 = no backoff)
+	stopPoll              context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
+	lastPollNs            atomic.Int64       // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
+	lastSuccessfulFetchNs atomic.Int64       // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
 }
 
 const (
