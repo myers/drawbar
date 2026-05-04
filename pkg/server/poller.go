@@ -25,9 +25,10 @@ type Poller struct {
 	log          *slog.Logger
 	sem          chan struct{} // concurrency semaphore
 	wg           sync.WaitGroup
-	backoff      time.Duration // current backoff duration (0 = no backoff)
+	backoff      time.Duration      // current backoff duration (0 = no backoff)
 	stopPoll     context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
-	lastPollNs   atomic.Int64 // unix-nanos of the most recent FetchTask attempt; 0 until first poll
+	lastPollNs            atomic.Int64 // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
+	lastSuccessfulFetchNs atomic.Int64 // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
 }
 
 const (
@@ -89,7 +90,6 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouuid.UUID) {
-	p.lastPollNs.Store(time.Now().UnixNano())
 	p.log.Debug("polling", "tasks_version", *tasksVersion)
 
 	cleanup := p.client.SetRequestKey(*requestKey)
@@ -101,28 +101,39 @@ func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouu
 	resp, err := p.client.FetchTask(fetchCtx, connect.NewRequest(&runnerv1.FetchTaskRequest{
 		TasksVersion: *tasksVersion,
 	}))
+
+	// Heartbeat: lastPollNs records that the RPC RETURNED (success or error,
+	// but not a context cancellation due to shutdown). If the RPC wedges on
+	// a half-dead h2 conn, this heartbeat goes stale and /healthz reports it.
+	if ctx.Err() == nil {
+		now := time.Now().UnixNano()
+		p.lastPollNs.Store(now)
+		// lastSuccessfulFetchNs is stricter: only advances when the server
+		// actually responded. CodeDeadlineExceeded is the long-poll "no work"
+		// signal and counts as a successful round trip.
+		if err == nil || connect.CodeOf(err) == connect.CodeDeadlineExceeded {
+			p.lastSuccessfulFetchNs.Store(now)
+		}
+	}
+
 	if err != nil {
 		if ctx.Err() != nil {
 			return // Context cancelled, shutting down.
 		}
-		// deadline_exceeded is normal when no tasks are available (server holds connection).
 		if connect.CodeOf(err) == connect.CodeDeadlineExceeded {
 			p.log.Debug("no tasks available", "error", err)
-			p.backoff = 0 // server is reachable, clear backoff
+			p.backoff = 0
 		} else {
 			p.log.Error("fetch task failed", "error", err)
 			p.increaseBackoff()
 		}
-		// Keep the same request key for retry (idempotency).
 		return
 	}
 
-	// Successful response — clear backoff, rotate request key, update version.
 	p.backoff = 0
 	*requestKey = gouuid.New()
 	*tasksVersion = resp.Msg.GetTasksVersion()
 
-	// Handle task.
 	if task := resp.Msg.GetTask(); task != nil && task.GetId() != 0 {
 		p.log.Info("received task", "id", task.GetId())
 		p.dispatchTask(ctx, task)
@@ -163,11 +174,25 @@ func (p *Poller) increaseBackoff() {
 	p.log.Warn("backing off", "duration", p.backoff)
 }
 
-// LastPollAt returns the wall-clock time of the most recent FetchTask attempt.
-// Returns the zero Time before the first poll; callers should treat that as
-// "never polled."
+// LastPollAt returns the wall-clock time of the most recent FetchTask call
+// to RETURN (success or error). Returns the zero Time before the first
+// completed RPC; callers should treat that as "never polled."
 func (p *Poller) LastPollAt() time.Time {
 	ns := p.lastPollNs.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// LastSuccessfulFetchAt returns the wall-clock time of the most recent
+// FetchTask that produced a real server response — either nil error or
+// connect.CodeDeadlineExceeded (long-poll's "no work" signal). Returns the
+// zero Time before the first such response. Used by /healthz to detect a
+// transport that is alive at the syscall level but not actually talking
+// to the server (h2 conn half-dead, server-side throttling, etc.).
+func (p *Poller) LastSuccessfulFetchAt() time.Time {
+	ns := p.lastSuccessfulFetchNs.Load()
 	if ns == 0 {
 		return time.Time{}
 	}

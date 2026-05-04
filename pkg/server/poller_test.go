@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -205,4 +206,73 @@ func TestDrain_Timeout(t *testing.T) {
 	elapsed := time.Since(start)
 
 	assert.Less(t, elapsed, 500*time.Millisecond, "Drain should timeout quickly")
+}
+
+func TestPoller_LastSuccessfulFetchAt_SuccessUpdatesBoth(t *testing.T) {
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{}, {}, {}},
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	// Both heartbeats are zero before any poll.
+	assert.True(t, p.LastPollAt().IsZero())
+	assert.True(t, p.LastSuccessfulFetchAt().IsZero())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	// After at least one successful fetch both timestamps should be set.
+	assert.False(t, p.LastPollAt().IsZero(), "LastPollAt should be set after a successful poll")
+	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "LastSuccessfulFetchAt should be set after a successful poll")
+}
+
+func TestPoller_LastSuccessfulFetchAt_TransportErrorOnlyUpdatesPoll(t *testing.T) {
+	// All FetchTask calls return a non-deadline error. lastPollNs should
+	// advance (the goroutine is alive and attempting RPCs); however
+	// lastSuccessfulFetchNs must NOT advance — that's what catches the wedge
+	// if h2 PINGs ever fail to detect a dead conn.
+	transportErr := connect.NewError(connect.CodeUnavailable, errors.New("transport error"))
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = transportErr
+	}
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		errs:     errs,
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	assert.False(t, p.LastPollAt().IsZero(), "poll heartbeat should advance even on errors")
+	assert.True(t, p.LastSuccessfulFetchAt().IsZero(), "successful-fetch heartbeat must not advance on transport errors")
+}
+
+func TestPoller_LastSuccessfulFetchAt_DeadlineExceededCounts(t *testing.T) {
+	// Long-poll's "no work" response is CodeDeadlineExceeded — that's still
+	// a healthy round trip and must update lastSuccessfulFetchNs.
+	deadlineErr := connect.NewError(connect.CodeDeadlineExceeded, errors.New("no tasks"))
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = deadlineErr
+	}
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		errs:     errs,
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	assert.False(t, p.LastPollAt().IsZero())
+	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "DeadlineExceeded is a successful round trip; should update")
 }
