@@ -235,10 +235,11 @@ func TestPoller_LastSuccessfulFetchAt_TransportErrorOnlyUpdatesPoll(t *testing.T
 	// lastSuccessfulFetchNs must NOT advance — that's what catches the wedge
 	// if h2 PINGs ever fail to detect a dead conn.
 	transportErr := connect.NewError(connect.CodeUnavailable, errors.New("transport error"))
-	// Only the first error fires within the test window: the non-deadline
-	// error triggers backoff (backoffMin = 2s), so subsequent ticks don't
-	// reach the mock. The slice is oversized on purpose so the test doesn't
-	// depend on backoff arithmetic.
+	// All errors share the same wedge mode, so it doesn't matter how many
+	// fire within the test window. The slice is oversized on purpose so
+	// the test doesn't depend on backoff arithmetic — only that the
+	// non-deadline error path runs at least once and lastSuccessfulFetchNs
+	// stays at its zero value.
 	errs := make([]error, 100)
 	for i := range errs {
 		errs[i] = transportErr
@@ -446,9 +447,9 @@ func TestPoller_AcquireBeforeFetch(t *testing.T) {
 
 	<-started
 
-	// Hold the handler busy for ~5 ticker intervals. After 50ms there
-	// should still be exactly 1 FetchTask call: the one that delivered
-	// the task.
+	// Hold the handler busy for ~5 FetchInterval durations. The loop is
+	// blocked at the semaphore acquire, so no further FetchTask calls
+	// should fire while the slot is held — total stays at 1.
 	time.Sleep(50 * time.Millisecond)
 	if calls := c.Calls(); calls != 1 {
 		t.Fatalf("at capacity: want exactly 1 FetchTask call, got %d", calls)

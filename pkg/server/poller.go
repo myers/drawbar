@@ -162,6 +162,10 @@ func (p *Poller) fetchTask(ctx context.Context, s *workerState) (*runnerv1.Task,
 		return nil, false
 	}
 
+	// Reset error counter on any successful RPC. consecutiveEmpty is
+	// intentionally NOT reset here — back-to-back empty responses still
+	// drive the empty-side backoff to slow polling when the server has
+	// no work.
 	s.consecutiveErrors = 0
 	s.requestKey = gouuid.New()
 
