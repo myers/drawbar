@@ -8,6 +8,11 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 spec:
   replicas: 1
+  # The controller mounts an RWO cache PVC. RollingUpdate would surge a
+  # new pod that can't attach until the old one terminates, deadlocking
+  # for the full grace period on every image bump. Recreate avoids that.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: drawbar
