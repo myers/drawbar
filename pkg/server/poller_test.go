@@ -388,6 +388,76 @@ func TestPoller_Shutdown_HardTimeout(t *testing.T) {
 	<-runDone
 }
 
+// fetchCountingClient records every FetchTask call so a test can assert
+// the loop does NOT call FetchTask while at capacity.
+type fetchCountingClient struct {
+	mu        sync.Mutex
+	calls     int
+	responses []*runnerv1.FetchTaskResponse
+	idx       int
+	interval  time.Duration
+}
+
+func (c *fetchCountingClient) FetchTask(_ context.Context, _ *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.idx < len(c.responses) {
+		r := c.responses[c.idx]
+		c.idx++
+		return connect.NewResponse(r), nil
+	}
+	return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
+}
+func (c *fetchCountingClient) Endpoint() string             { return "" }
+func (c *fetchCountingClient) FetchInterval() time.Duration { return c.interval }
+func (c *fetchCountingClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+func (c *fetchCountingClient) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestPoller_AcquireBeforeFetch pins down the structural invariant: while
+// at capacity, the loop must NOT call FetchTask. Today's code violates
+// this — the test is expected to fail against pre-reshape code and pass
+// after Task 6.
+func TestPoller_AcquireBeforeFetch(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-release
+	}
+
+	c := &fetchCountingClient{
+		interval: 10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{
+			{Task: &runnerv1.Task{Id: 1}},
+		},
+	}
+	p := NewPoller(c, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	<-started
+
+	// Hold the handler busy for ~5 ticker intervals. After 50ms there
+	// should still be exactly 1 FetchTask call: the one that delivered
+	// the task.
+	time.Sleep(50 * time.Millisecond)
+	if calls := c.Calls(); calls != 1 {
+		t.Fatalf("at capacity: want exactly 1 FetchTask call, got %d", calls)
+	}
+
+	close(release)
+	cancel()
+}
+
 // giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
 // when the request's tasksVersion differs from the server's latestVersion.
 // Without this gating, the poller_test mock can't catch bug 012.

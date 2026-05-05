@@ -21,11 +21,10 @@ type Poller struct {
 	handler               TaskHandler
 	fetchTimeout          time.Duration
 	capacity              int64
-	ephemeral             bool // if true, stop polling after first task completes
+	ephemeral             bool // if true, stop polling after first task dispatched
 	log                   *slog.Logger
 	sem                   chan struct{} // concurrency semaphore
 	wg                    sync.WaitGroup
-	backoff               time.Duration      // current backoff duration (0 = no backoff)
 	stopPoll              context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
 	stopJobs              context.CancelFunc // set by Run(), called by Shutdown when its ctx expires
 	lastPollNs            atomic.Int64       // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
@@ -33,13 +32,25 @@ type Poller struct {
 	inFlight              atomic.Int64       // number of handler goroutines currently running
 }
 
-const (
-	backoffMin = 2 * time.Second
-	backoffMax = 60 * time.Second
-)
+// workerState is per-Run scratch state: the cursor we send to the server,
+// the idempotency key for the next request, and consecutive empty/error
+// counters that drive backoff. Local to Run so a fresh Run starts clean.
+type workerState struct {
+	tasksVersion      int64
+	requestKey        gouuid.UUID
+	consecutiveEmpty  int
+	consecutiveErrors int
+}
+
+func (s *workerState) resetBackoff() {
+	s.consecutiveEmpty = 0
+	s.consecutiveErrors = 0
+}
+
+const backoffMax = 60 * time.Second
 
 // NewPoller creates a poller that calls handler for each received task.
-// If ephemeral is true, the poller stops after the first task completes.
+// If ephemeral is true, the poller stops after the first task is dispatched.
 func NewPoller(client PollerClient, handler TaskHandler, capacity int64, fetchTimeout time.Duration, ephemeral bool, log *slog.Logger) *Poller {
 	return &Poller{
 		client:       client,
@@ -52,70 +63,86 @@ func NewPoller(client PollerClient, handler TaskHandler, capacity int64, fetchTi
 	}
 }
 
-// Run starts the poll loop. Blocks until ctx is cancelled (or until the first
-// task completes in ephemeral mode).
+// Run starts the poll loop. Blocks until ctx is cancelled (or until the
+// first task is dispatched in ephemeral mode). Acquires a capacity slot
+// BEFORE calling FetchTask so the loop blocks on capacity rather than
+// in a separate dispatch step (matches upstream act_runner; see bug 013).
 func (p *Poller) Run(ctx context.Context) {
-	pollCtx, stopPoll := context.WithCancel(ctx)
+	pollingCtx, stopPoll := context.WithCancel(ctx)
 	defer stopPoll()
 	p.stopPoll = stopPoll
 
 	jobsCtx, stopJobs := context.WithCancel(ctx)
 	p.stopJobs = stopJobs
 
-	var tasksVersion int64
-	requestKey := gouuid.New()
-
-	interval := p.client.FetchInterval()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	s := &workerState{requestKey: gouuid.New()}
 
 	p.log.Info("poller started",
-		"interval", interval,
+		"interval", p.client.FetchInterval(),
 		"capacity", p.capacity,
 		"ephemeral", p.ephemeral,
 		"endpoint", p.client.Endpoint(),
 	)
 
 	for {
+		// 1. Acquire capacity, or stop.
 		select {
-		case <-pollCtx.Done():
+		case p.sem <- struct{}{}:
+		case <-pollingCtx.Done():
 			p.log.Info("poller stopping")
 			return
-		case <-ticker.C:
-			p.poll(ctx, jobsCtx, &tasksVersion, &requestKey)
+		}
 
-			// Adjust ticker: use backoff duration if set, otherwise normal interval.
-			if p.backoff > 0 {
-				ticker.Reset(p.backoff)
-			} else {
-				ticker.Reset(interval)
+		// 2. Fetch (we hold a slot to handle a task if one comes back).
+		task, ok := p.fetchTask(pollingCtx, s)
+		if !ok {
+			<-p.sem
+			if !p.waitBackoff(pollingCtx, s) {
+				p.log.Info("poller stopping")
+				return
 			}
+			continue
+		}
+		s.resetBackoff()
+
+		// 3. Spawn handler. Goroutine releases the slot when done.
+		p.wg.Add(1)
+		p.inFlight.Add(1)
+		go func(t *runnerv1.Task) {
+			defer p.wg.Done()
+			defer p.inFlight.Add(-1)
+			defer func() { <-p.sem }()
+			p.handler(jobsCtx, t)
+		}(task)
+
+		if p.ephemeral {
+			p.log.Info("ephemeral mode: task dispatched, stopping poller")
+			stopPoll()
 		}
 	}
 }
 
-func (p *Poller) poll(ctx context.Context, jobsCtx context.Context, tasksVersion *int64, requestKey *gouuid.UUID) {
-	p.log.Debug("polling", "tasks_version", *tasksVersion)
-
-	cleanup := p.client.SetRequestKey(*requestKey)
+// fetchTask runs one FetchTask round trip and updates heartbeats and
+// workerState. Returns (task, true) if a task was received; (nil, false)
+// otherwise (empty response, error, or context cancellation). The cursor
+// is forward-only and reset to 0 after a task receipt (bug 012).
+func (p *Poller) fetchTask(ctx context.Context, s *workerState) (*runnerv1.Task, bool) {
+	cleanup := p.client.SetRequestKey(s.requestKey)
 	defer cleanup()
 
 	fetchCtx, cancel := context.WithTimeout(ctx, p.fetchTimeout)
 	defer cancel()
 
 	resp, err := p.client.FetchTask(fetchCtx, connect.NewRequest(&runnerv1.FetchTaskRequest{
-		TasksVersion: *tasksVersion,
+		TasksVersion: s.tasksVersion,
 	}))
 
-	// Heartbeat: lastPollNs records that the RPC RETURNED (success or error,
-	// but not a context cancellation due to shutdown). If the RPC wedges on
-	// a half-dead h2 conn, this heartbeat goes stale and /healthz reports it.
+	// Heartbeat: lastPollNs records that the RPC RETURNED. lastSuccessfulFetchNs
+	// is stricter — only advances on a real server response. CodeDeadlineExceeded
+	// is the long-poll's "no work" signal and counts as a successful round trip.
 	if ctx.Err() == nil {
 		now := time.Now().UnixNano()
 		p.lastPollNs.Store(now)
-		// lastSuccessfulFetchNs is stricter: only advances when the server
-		// actually responded. CodeDeadlineExceeded is the long-poll "no work"
-		// signal and counts as a successful round trip.
 		if err == nil || connect.CodeOf(err) == connect.CodeDeadlineExceeded {
 			p.lastSuccessfulFetchNs.Store(now)
 		}
@@ -123,75 +150,65 @@ func (p *Poller) poll(ctx context.Context, jobsCtx context.Context, tasksVersion
 
 	if err != nil {
 		if ctx.Err() != nil {
-			return // Context cancelled, shutting down.
+			return nil, false
 		}
 		if connect.CodeOf(err) == connect.CodeDeadlineExceeded {
 			p.log.Debug("no tasks available", "error", err)
-			p.backoff = 0
-		} else {
-			p.log.Error("fetch task failed", "error", err)
-			p.increaseBackoff()
+			s.consecutiveEmpty++
+			return nil, false
 		}
-		return
+		p.log.Error("fetch task failed", "error", err)
+		s.consecutiveErrors++
+		return nil, false
 	}
 
-	p.backoff = 0
-	*requestKey = gouuid.New()
+	s.consecutiveErrors = 0
+	s.requestKey = gouuid.New()
 
-	// Advance the cursor on every successful response so that idle polls reach
-	// gitea's "version unchanged" fast path. Only ever move it forward — a
-	// stale response carrying an older version must not roll us back.
-	if v := resp.Msg.GetTasksVersion(); v > *tasksVersion {
-		*tasksVersion = v
+	// Cursor: forward-only advance + reset to 0 on task receipt (bug 012).
+	if v := resp.Msg.GetTasksVersion(); v > s.tasksVersion {
+		s.tasksVersion = v
 	}
 
-	if task := resp.Msg.GetTask(); task != nil && task.GetId() != 0 {
-		p.log.Info("received task", "id", task.GetId())
-		// Reset the cursor so the next poll forces gitea to run PickTask.
-		// Otherwise we wedge: gitea bumps latestVersion on run-insert /
-		// job-reset, not on PickTask or UpdateTask, so a second task queued
-		// at the same version (e.g. two runs from one push, capacity=1)
-		// would sit indefinitely while gitea returned empty responses with
-		// the same version. Matches gitea's act_runner behaviour. See bugs/012.
-		*tasksVersion = 0
-		p.dispatchTask(jobsCtx, task)
+	task := resp.Msg.GetTask()
+	if task == nil || task.GetId() == 0 {
+		s.consecutiveEmpty++
+		return nil, false
 	}
+	s.tasksVersion = 0
+	p.log.Info("received task", "id", task.GetId())
+	return task, true
 }
 
-// dispatchTask runs the handler in a goroutine after acquiring a semaphore slot.
-// Blocks until a slot is available or the context is cancelled.
-func (p *Poller) dispatchTask(jobsCtx context.Context, task *runnerv1.Task) {
+// waitBackoff sleeps for the configured FetchInterval, scaled by
+// consecutive empty/error counts. Returns false if the polling context
+// is cancelled while waiting.
+func (p *Poller) waitBackoff(ctx context.Context, s *workerState) bool {
+	base := p.client.FetchInterval()
+	n := s.consecutiveErrors
+	if s.consecutiveEmpty > n {
+		n = s.consecutiveEmpty
+	}
+	d := base
+	if n > 1 {
+		shift := n - 1
+		if shift > 5 {
+			shift = 5
+		}
+		d = base * time.Duration(int64(1)<<shift)
+		if d > backoffMax {
+			d = backoffMax
+		}
+		p.log.Warn("backing off", "duration", d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
-	case p.sem <- struct{}{}:
-	case <-jobsCtx.Done():
-		p.log.Warn("context cancelled while waiting for capacity", "task_id", task.GetId())
-		return
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	p.wg.Add(1)
-	p.inFlight.Add(1)
-	go func() {
-		defer p.wg.Done()
-		defer p.inFlight.Add(-1)
-		defer func() { <-p.sem }()
-		p.handler(jobsCtx, task)
-	}()
-
-	if p.ephemeral && p.stopPoll != nil {
-		p.log.Info("ephemeral mode: task dispatched, stopping poller")
-		p.stopPoll()
-	}
-}
-
-func (p *Poller) increaseBackoff() {
-	if p.backoff == 0 {
-		p.backoff = backoffMin
-	} else {
-		p.backoff *= 2
-		if p.backoff > backoffMax {
-			p.backoff = backoffMax
-		}
-	}
-	p.log.Warn("backing off", "duration", p.backoff)
 }
 
 // LastPollAt returns the wall-clock time of the most recent FetchTask call
