@@ -25,6 +25,7 @@ import (
 	gouuid "github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -187,15 +188,14 @@ func TestFetchTask_WithIdempotency(t *testing.T) {
 			for _, a := range assignments {
 				if a.key == key {
 					// Return the same task with a regenerated token.
-					recovered := *a.task
-					ctx := &structpb.Struct{
+					recovered := proto.Clone(a.task).(*runnerv1.Task)
+					recovered.Context = &structpb.Struct{
 						Fields: map[string]*structpb.Value{
 							"gitea_runtime_token": structpb.NewStringValue("regenerated-token"),
 						},
 					}
-					recovered.Context = ctx
 					return connect.NewResponse(&runnerv1.FetchTaskResponse{
-						Task:         &recovered,
+						Task:         recovered,
 						TasksVersion: 1,
 					}), nil
 				}
