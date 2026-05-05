@@ -282,6 +282,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	go startHealthServer(
 		&registered, &activeJobs, int64(cfg.Runner.Capacity),
 		poller.LastPollAt, poller.LastSuccessfulFetchAt,
+		poller.InFlight,
 		pollStaleness, successFetchStaleness,
 	)
 
@@ -352,12 +353,14 @@ func startHealthServer(
 	capacity int64,
 	lastPoll func() time.Time,
 	lastSuccessfulFetch func() time.Time,
+	inFlight func() int64,
 	pollStaleness time.Duration,
 	successFetchStaleness time.Duration,
 ) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(
 		lastPoll, lastSuccessfulFetch,
+		inFlight,
 		pollStaleness, successFetchStaleness,
 		dumpGoroutinesToStderr,
 	))
@@ -374,12 +377,16 @@ func startHealthServer(
 // once either heartbeat is too stale:
 //
 //   - lastPoll catches "ticker dead" (the poll goroutine is not running). The
-//     zero value is treated as "starting up" and is always OK.
+//     zero value is treated as "starting up" and is always OK. The check is
+//     suppressed while inFlight() > 0 because the loop legitimately blocks on
+//     capacity acquisition while a handler runs (bug 013).
 //   - lastSuccessfulFetch catches "transport dead but goroutine alive" — RPCs
 //     are returning errors but no real server response in a long time
 //     (h2 conn half-dead, server-side throttling, ...). The zero value is
 //     ignored on purpose: if the server has been down since the runner
-//     started, /readyz handles that — /healthz should not page.
+//     started, /readyz handles that — /healthz should not page. This check
+//     is NOT suppressed during in-flight handlers: a transport wedge while
+//     a long handler runs is still a real problem (bug 010).
 //
 // onWedge fires exactly once across the lifetime of the handler the first
 // time either condition trips, so callers can capture diagnostics (a goroutine
@@ -389,20 +396,26 @@ func startHealthServer(
 func healthzHandler(
 	lastPoll func() time.Time,
 	lastSuccessfulFetch func() time.Time,
+	inFlight func() int64,
 	pollStaleness time.Duration,
 	successFetchStaleness time.Duration,
 	onWedge func(kind string, since, threshold time.Duration),
 ) http.HandlerFunc {
 	var dumpOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
-		if t := lastPoll(); !t.IsZero() {
-			if since := time.Since(t); since > pollStaleness {
-				if onWedge != nil {
-					dumpOnce.Do(func() { onWedge("poll loop", since, pollStaleness) })
+		// While any handler is in flight, the poll loop is legitimately blocked
+		// on capacity and lastPoll won't advance. Suppress the staleness 503 in
+		// that case — see bug 013.
+		if inFlight() == 0 {
+			if t := lastPoll(); !t.IsZero() {
+				if since := time.Since(t); since > pollStaleness {
+					if onWedge != nil {
+						dumpOnce.Do(func() { onWedge("poll loop", since, pollStaleness) })
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+					fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, pollStaleness)
+					return
 				}
-				w.WriteHeader(http.StatusServiceUnavailable)
-				fmt.Fprintf(w, "poll loop stale: last poll %s ago (threshold %s)", since, pollStaleness)
-				return
 			}
 		}
 		if t := lastSuccessfulFetch(); !t.IsZero() {

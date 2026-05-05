@@ -287,6 +287,7 @@ func TestHealthzHandler_BothFresh(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return now },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -301,6 +302,7 @@ func TestHealthzHandler_NoPollYet(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return time.Time{} },
 		func() time.Time { return time.Time{} },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -316,6 +318,7 @@ func TestHealthzHandler_StalePoll(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return stale },
 		func() time.Time { return now },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -333,6 +336,7 @@ func TestHealthzHandler_StaleSuccessfulFetch(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return stale },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -350,6 +354,7 @@ func TestHealthzHandler_StaleSuccessfulFetch_ZeroIgnored(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return time.Time{} },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -365,6 +370,7 @@ func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return stale },
 		func() time.Time { return now },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute,
 		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
@@ -384,6 +390,7 @@ func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return stale },
+		func() int64 { return 0 },
 		30*time.Second, 5*time.Minute,
 		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
@@ -403,6 +410,7 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 		handler := healthzHandler(
 			func() time.Time { return stale },
 			func() time.Time { return now },
+			func() int64 { return 0 },
 			30*time.Second, 5*time.Minute,
 			func(kind string, _, _ time.Duration) { gotKind = kind },
 		)
@@ -420,6 +428,7 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 		handler := healthzHandler(
 			func() time.Time { return now },
 			func() time.Time { return stale },
+			func() int64 { return 0 },
 			30*time.Second, 5*time.Minute,
 			func(kind string, _, _ time.Duration) { gotKind = kind },
 		)
