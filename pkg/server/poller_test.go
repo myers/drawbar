@@ -39,7 +39,7 @@ func (m *mockPollerClient) FetchTask(_ context.Context, _ *connect.Request[runne
 	return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
 }
 
-func (m *mockPollerClient) Endpoint() string           { return m.endpoint }
+func (m *mockPollerClient) Endpoint() string             { return m.endpoint }
 func (m *mockPollerClient) FetchInterval() time.Duration { return m.interval }
 func (m *mockPollerClient) SetRequestKey(_ gouuid.UUID) func() {
 	return func() {}
@@ -279,4 +279,71 @@ func TestPoller_LastSuccessfulFetchAt_DeadlineExceededCounts(t *testing.T) {
 
 	assert.False(t, p.LastPollAt().IsZero())
 	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "DeadlineExceeded is a successful round trip; should update")
+}
+
+// giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
+// when the request's tasksVersion differs from the server's latestVersion.
+// Without this gating, the poller_test mock can't catch bug 012.
+type giteaLikePollerClient struct {
+	mu            sync.Mutex
+	queue         []*runnerv1.Task // FIFO of waiting tasks
+	latestVersion int64            // bumped on enqueue
+	requests      []int64          // tasksVersion seen on each FetchTask
+	interval      time.Duration
+}
+
+func (g *giteaLikePollerClient) enqueue(task *runnerv1.Task) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.queue = append(g.queue, task)
+	g.latestVersion++
+}
+
+func (g *giteaLikePollerClient) FetchTask(_ context.Context, req *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.requests = append(g.requests, req.Msg.GetTasksVersion())
+	resp := &runnerv1.FetchTaskResponse{TasksVersion: g.latestVersion}
+	if req.Msg.GetTasksVersion() != g.latestVersion && len(g.queue) > 0 {
+		resp.Task = g.queue[0]
+		g.queue = g.queue[1:]
+	}
+	return connect.NewResponse(resp), nil
+}
+
+func (g *giteaLikePollerClient) Endpoint() string             { return "" }
+func (g *giteaLikePollerClient) FetchInterval() time.Duration { return g.interval }
+func (g *giteaLikePollerClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+
+// TestPoller_DoesNotLatchCursorOnEmptyResponse is the bug-012 regression test.
+// Two tasks are enqueued back-to-back (one push, two workflow files). The
+// poller picks up task 1, then keeps polling. The pre-fix code would latch
+// its cursor to gitea's latestVersion after every empty response — including
+// the empty response from gitea's "version unchanged" path — so task 2 would
+// never be delivered until something else bumped latestVersion. The fix:
+// only advance the cursor when a task is actually returned.
+func TestPoller_DoesNotLatchCursorOnEmptyResponse(t *testing.T) {
+	var handled []int64
+	var hmu sync.Mutex
+	handler := func(_ context.Context, task *runnerv1.Task) {
+		hmu.Lock()
+		defer hmu.Unlock()
+		handled = append(handled, task.GetId())
+	}
+
+	mock := &giteaLikePollerClient{interval: 10 * time.Millisecond}
+	mock.enqueue(&runnerv1.Task{Id: 71})
+	mock.enqueue(&runnerv1.Task{Id: 72})
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+	p.Drain(time.Second)
+
+	hmu.Lock()
+	defer hmu.Unlock()
+	assert.Equal(t, []int64{71, 72}, handled, "both queued tasks must be delivered without an external version bump")
 }

@@ -132,10 +132,23 @@ func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouu
 
 	p.backoff = 0
 	*requestKey = gouuid.New()
-	*tasksVersion = resp.Msg.GetTasksVersion()
+
+	// Advance the cursor on every successful response so that idle polls reach
+	// gitea's "version unchanged" fast path. Only ever move it forward — a
+	// stale response carrying an older version must not roll us back.
+	if v := resp.Msg.GetTasksVersion(); v > *tasksVersion {
+		*tasksVersion = v
+	}
 
 	if task := resp.Msg.GetTask(); task != nil && task.GetId() != 0 {
 		p.log.Info("received task", "id", task.GetId())
+		// Reset the cursor so the next poll forces gitea to run PickTask.
+		// Otherwise we wedge: gitea bumps latestVersion on run-insert /
+		// job-reset, not on PickTask or UpdateTask, so a second task queued
+		// at the same version (e.g. two runs from one push, capacity=1)
+		// would sit indefinitely while gitea returned empty responses with
+		// the same version. Matches gitea's act_runner behaviour. See bugs/012.
+		*tasksVersion = 0
 		p.dispatchTask(ctx, task)
 	}
 }
