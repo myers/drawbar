@@ -281,6 +281,35 @@ func TestPoller_LastSuccessfulFetchAt_DeadlineExceededCounts(t *testing.T) {
 	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "DeadlineExceeded is a successful round trip; should update")
 }
 
+func TestPoller_InFlight_TracksRunningHandlers(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-release
+	}
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go p.Run(ctx)
+
+	<-started
+	assert.Equal(t, int64(1), p.InFlight(), "handler running -> InFlight==1")
+	close(release)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && p.InFlight() != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	assert.Equal(t, int64(0), p.InFlight(), "handler returned -> InFlight==0")
+	cancel()
+}
+
 // giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
 // when the request's tasksVersion differs from the server's latestVersion.
 // Without this gating, the poller_test mock can't catch bug 012.

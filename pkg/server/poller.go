@@ -29,6 +29,7 @@ type Poller struct {
 	stopPoll              context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
 	lastPollNs            atomic.Int64       // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
 	lastSuccessfulFetchNs atomic.Int64       // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
+	inFlight              atomic.Int64       // number of handler goroutines currently running
 }
 
 const (
@@ -163,8 +164,10 @@ func (p *Poller) dispatchTask(ctx context.Context, task *runnerv1.Task) {
 		return
 	}
 	p.wg.Add(1)
+	p.inFlight.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer p.inFlight.Add(-1)
 		defer func() { <-p.sem }()
 		p.handler(ctx, task)
 	}()
@@ -210,6 +213,13 @@ func (p *Poller) LastSuccessfulFetchAt() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, ns)
+}
+
+// InFlight returns the number of handler goroutines currently running.
+// /healthz uses this to suppress the poll-staleness 503 while the runner
+// is legitimately busy with a long-running task (bug 013).
+func (p *Poller) InFlight() int64 {
+	return p.inFlight.Load()
 }
 
 // Drain waits for all in-flight tasks to complete, up to the given timeout.
