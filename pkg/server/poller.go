@@ -27,6 +27,7 @@ type Poller struct {
 	wg                    sync.WaitGroup
 	backoff               time.Duration      // current backoff duration (0 = no backoff)
 	stopPoll              context.CancelFunc // set by Run(), called in ephemeral mode after dispatch
+	stopJobs              context.CancelFunc // set by Run(), called by Shutdown when its ctx expires
 	lastPollNs            atomic.Int64       // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
 	lastSuccessfulFetchNs atomic.Int64       // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
 	inFlight              atomic.Int64       // number of handler goroutines currently running
@@ -58,6 +59,10 @@ func (p *Poller) Run(ctx context.Context) {
 	defer stopPoll()
 	p.stopPoll = stopPoll
 
+	jobsCtx, stopJobs := context.WithCancel(ctx)
+	defer stopJobs()
+	p.stopJobs = stopJobs
+
 	var tasksVersion int64
 	requestKey := gouuid.New()
 
@@ -78,7 +83,7 @@ func (p *Poller) Run(ctx context.Context) {
 			p.log.Info("poller stopping")
 			return
 		case <-ticker.C:
-			p.poll(ctx, &tasksVersion, &requestKey)
+			p.poll(ctx, jobsCtx, &tasksVersion, &requestKey)
 
 			// Adjust ticker: use backoff duration if set, otherwise normal interval.
 			if p.backoff > 0 {
@@ -90,7 +95,7 @@ func (p *Poller) Run(ctx context.Context) {
 	}
 }
 
-func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouuid.UUID) {
+func (p *Poller) poll(ctx context.Context, jobsCtx context.Context, tasksVersion *int64, requestKey *gouuid.UUID) {
 	p.log.Debug("polling", "tasks_version", *tasksVersion)
 
 	cleanup := p.client.SetRequestKey(*requestKey)
@@ -150,16 +155,16 @@ func (p *Poller) poll(ctx context.Context, tasksVersion *int64, requestKey *gouu
 		// would sit indefinitely while gitea returned empty responses with
 		// the same version. Matches gitea's act_runner behaviour. See bugs/012.
 		*tasksVersion = 0
-		p.dispatchTask(ctx, task)
+		p.dispatchTask(jobsCtx, task)
 	}
 }
 
 // dispatchTask runs the handler in a goroutine after acquiring a semaphore slot.
 // Blocks until a slot is available or the context is cancelled.
-func (p *Poller) dispatchTask(ctx context.Context, task *runnerv1.Task) {
+func (p *Poller) dispatchTask(jobsCtx context.Context, task *runnerv1.Task) {
 	select {
 	case p.sem <- struct{}{}:
-	case <-ctx.Done():
+	case <-jobsCtx.Done():
 		p.log.Warn("context cancelled while waiting for capacity", "task_id", task.GetId())
 		return
 	}
@@ -169,7 +174,7 @@ func (p *Poller) dispatchTask(ctx context.Context, task *runnerv1.Task) {
 		defer p.wg.Done()
 		defer p.inFlight.Add(-1)
 		defer func() { <-p.sem }()
-		p.handler(ctx, task)
+		p.handler(jobsCtx, task)
 	}()
 
 	if p.ephemeral && p.stopPoll != nil {
@@ -234,5 +239,45 @@ func (p *Poller) Drain(timeout time.Duration) {
 		p.log.Info("all tasks drained")
 	case <-time.After(timeout):
 		p.log.Warn("drain timed out, some tasks may still be running", "timeout", timeout)
+	}
+}
+
+// Shutdown stops accepting new work and waits for in-flight handlers to
+// complete. If ctx expires before that happens, in-flight handlers are
+// cancelled (their handler ctx fires) and Shutdown waits for them to
+// return; ctx.Err() is returned in that case. Otherwise nil.
+//
+// Replaces Drain — the difference is that Shutdown cancels the handler
+// context on timeout, rather than returning while leaving handlers
+// running. Callers should pass a context with the deadline they're
+// willing to wait for graceful drain.
+func (p *Poller) Shutdown(ctx context.Context) error {
+	if p.stopPoll != nil {
+		p.stopPoll()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		p.log.Info("all tasks drained")
+		return nil
+	case <-ctx.Done():
+		// Race: graceful drain may have completed at the same instant.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		p.log.Warn("drain timed out — cancelling in-flight tasks")
+		if p.stopJobs != nil {
+			p.stopJobs()
+		}
+		<-done
+		return ctx.Err()
 	}
 }
