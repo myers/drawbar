@@ -827,3 +827,43 @@ func TestExtractCacheInfo_NoCacheStep(t *testing.T) {
 		t.Errorf("expected empty result, got key=%q paths=%v", key, paths)
 	}
 }
+
+func TestHealthzHandler_BusySuppressesStaleness(t *testing.T) {
+	pollStale := 50 * time.Millisecond
+	succStale := time.Hour
+	now := time.Now().Add(-time.Hour) // last poll: ages ago
+	var inFlight atomic.Int64
+
+	var wedgeKind string
+	onWedge := func(kind string, _, _ time.Duration) { wedgeKind = kind }
+
+	h := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return time.Now() }, // succ fetch: fresh
+		inFlight.Load,
+		pollStale, succStale,
+		onWedge,
+	)
+
+	// While in-flight, poll-staleness must be suppressed.
+	inFlight.Store(1)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("busy poll-stale: want 200, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "" {
+		t.Fatalf("busy: onWedge must not fire, got %q", wedgeKind)
+	}
+
+	// When idle, the same staleness must trip the 503.
+	inFlight.Store(0)
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("idle poll-stale: want 503, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "poll loop" {
+		t.Fatalf("idle: want wedgeKind=poll loop, got %q", wedgeKind)
+	}
+}
