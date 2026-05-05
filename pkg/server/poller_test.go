@@ -15,6 +15,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// shutdownPoller waits for in-flight handlers via Shutdown with a graceful
+// timeout. Equivalent to the old Drain(timeout) for tests where we just
+// want the handlers to finish normally.
+func shutdownPoller(t *testing.T, p *Poller, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = p.Shutdown(ctx)
+}
+
 // mockPollerClient implements PollerClient for testing.
 type mockPollerClient struct {
 	mu        sync.Mutex
@@ -60,7 +70,7 @@ func TestPoller_DispatchesTask(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
-	p.Drain(time.Second)
+	shutdownPoller(t, p, time.Second)
 
 	assert.Equal(t, int64(42), handled.Load())
 }
@@ -119,7 +129,7 @@ func TestPoller_ContextCancellation(t *testing.T) {
 	}
 }
 
-func TestDrain_WaitsForTasks(t *testing.T) {
+func TestShutdown_WaitsForTasks(t *testing.T) {
 	var finished atomic.Bool
 	handler := func(_ context.Context, _ *runnerv1.Task) {
 		time.Sleep(50 * time.Millisecond)
@@ -135,7 +145,11 @@ func TestDrain_WaitsForTasks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
-	p.Drain(time.Second)
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutCancel()
+	if err := p.Shutdown(shutCtx); err != nil {
+		t.Fatalf("Shutdown: want nil, got %v", err)
+	}
 
 	assert.True(t, finished.Load())
 }
@@ -159,7 +173,7 @@ func TestPoller_Ephemeral(t *testing.T) {
 
 	start := time.Now()
 	p.Run(context.Background()) // should return after first task
-	p.Drain(time.Second)
+	shutdownPoller(t, p, time.Second)
 	elapsed := time.Since(start)
 
 	assert.Equal(t, int32(1), taskCount.Load(), "ephemeral mode should handle exactly one task")
@@ -186,9 +200,15 @@ func TestPoller_LastPollAt(t *testing.T) {
 	assert.False(t, got.After(after), "LastPollAt %s should be <= test end %s", got, after)
 }
 
-func TestDrain_Timeout(t *testing.T) {
-	handler := func(_ context.Context, _ *runnerv1.Task) {
-		time.Sleep(5 * time.Second) // very slow
+func TestShutdown_Timeout(t *testing.T) {
+	started := make(chan struct{})
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		// Respect ctx so Shutdown's hard cancel can return.
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
 	}
 
 	mock := &mockPollerClient{
@@ -197,15 +217,29 @@ func TestDrain_Timeout(t *testing.T) {
 	}
 
 	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	p.Run(ctx)
 
+	// Run the poll loop with context.Background() so jobsCtx is not tied to
+	// any external cancellation — only Shutdown's hard cancel should fire it.
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	// Wait until the handler is running before calling Shutdown.
+	<-started
+
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer shutCancel()
 	start := time.Now()
-	p.Drain(100 * time.Millisecond)
+	err := p.Shutdown(shutCtx)
 	elapsed := time.Since(start)
 
-	assert.Less(t, elapsed, 500*time.Millisecond, "Drain should timeout quickly")
+	if err == nil {
+		t.Fatal("Shutdown: want non-nil err on timeout, got nil")
+	}
+	assert.Less(t, elapsed, 500*time.Millisecond, "Shutdown should return promptly after cancelling handler")
+	<-runDone
 }
 
 func TestPoller_LastSuccessfulFetchAt_SuccessUpdatesBoth(t *testing.T) {
@@ -519,7 +553,7 @@ func TestPoller_DoesNotLatchCursorOnEmptyResponse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
-	p.Drain(time.Second)
+	shutdownPoller(t, p, time.Second)
 
 	hmu.Lock()
 	defer hmu.Unlock()

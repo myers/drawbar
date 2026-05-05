@@ -247,21 +247,6 @@ func (p *Poller) InFlight() int64 {
 	return p.inFlight.Load()
 }
 
-// Drain waits for all in-flight tasks to complete, up to the given timeout.
-func (p *Poller) Drain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		p.log.Info("all tasks drained")
-	case <-time.After(timeout):
-		p.log.Warn("drain timed out, some tasks may still be running", "timeout", timeout)
-	}
-}
-
 // Shutdown stops accepting new work and waits for in-flight handlers to
 // complete. If ctx expires before that happens, in-flight handlers are
 // cancelled (their handler ctx fires) and Shutdown waits for them to

@@ -293,7 +293,11 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	)
 	poller.Run(ctx)
 	slog.Info("poller stopped, draining in-flight tasks")
-	poller.Drain(30 * time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := poller.Shutdown(shutCtx); err != nil {
+		slog.Warn("shutdown drain ended early", "error", err)
+	}
 	slog.Info("runner shut down")
 	return nil
 }
