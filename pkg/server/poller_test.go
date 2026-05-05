@@ -310,6 +310,84 @@ func TestPoller_InFlight_TracksRunningHandlers(t *testing.T) {
 	cancel()
 }
 
+func TestPoller_Shutdown_GracefulDrain(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sawJobsCancel atomic.Bool
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		select {
+		case <-release:
+			// Graceful path: ctx should still be alive.
+			if ctx.Err() != nil {
+				sawJobsCancel.Store(true)
+			}
+		case <-ctx.Done():
+			sawJobsCancel.Store(true)
+		}
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	<-started
+	close(release)
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Shutdown(shutCtx); err != nil {
+		t.Fatalf("Shutdown: want nil, got %v", err)
+	}
+	if sawJobsCancel.Load() {
+		t.Fatal("graceful path: handler must not see jobsCtx cancellation")
+	}
+	<-runDone
+}
+
+func TestPoller_Shutdown_HardTimeout(t *testing.T) {
+	started := make(chan struct{})
+	var sawJobsCancel atomic.Bool
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-ctx.Done()
+		sawJobsCancel.Store(true)
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	<-started
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := p.Shutdown(shutCtx)
+	if err == nil {
+		t.Fatal("Shutdown: want non-nil err on timeout, got nil")
+	}
+	if !sawJobsCancel.Load() {
+		t.Fatal("hard path: handler must see jobsCtx cancellation")
+	}
+	<-runDone
+}
+
 // giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
 // when the request's tasksVersion differs from the server's latestVersion.
 // Without this gating, the poller_test mock can't catch bug 012.

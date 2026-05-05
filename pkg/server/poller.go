@@ -60,7 +60,6 @@ func (p *Poller) Run(ctx context.Context) {
 	p.stopPoll = stopPoll
 
 	jobsCtx, stopJobs := context.WithCancel(ctx)
-	defer stopJobs()
 	p.stopJobs = stopJobs
 
 	var tasksVersion int64
