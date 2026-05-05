@@ -32,6 +32,7 @@ type RunnerConfig struct {
 	FetchInterval   time.Duration `yaml:"fetch_interval"`
 	FetchTimeout    time.Duration `yaml:"fetch_timeout"`
 	Timeout         time.Duration `yaml:"timeout"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 	GitCloneURL     string        `yaml:"git_clone_url"`
 	ActionsURL      string        `yaml:"actions_url"`
 	ControllerImage string        `yaml:"controller_image"`
@@ -81,8 +82,9 @@ func Default() *Config {
 			// is correct — but a timeout shorter than the h2 ReadIdleTimeout
 			// (~15s) would also short-circuit the transport-wedge detection.
 			// Match the Helm default of 30s.
-			FetchTimeout: 30 * time.Second,
-			Timeout:       3 * time.Hour,
+			FetchTimeout:    30 * time.Second,
+			Timeout:         3 * time.Hour,
+			ShutdownTimeout: computeShutdownTimeoutDefault(3*time.Hour, 30*time.Second),
 		},
 		Cache: CacheConfig{
 			Enabled: true,
@@ -97,6 +99,28 @@ func Default() *Config {
 			Level: "info",
 		},
 	}
+}
+
+// computeShutdownTimeoutDefault returns the default Runner.ShutdownTimeout:
+// min(Runner.Timeout, 10*Runner.FetchTimeout), clamped to [30s, 5m]. Long
+// enough to flush the final UpdateTask + Job delete; short enough that pod
+// eviction during a node drain doesn't take hours.
+func computeShutdownTimeoutDefault(timeout, fetchTimeout time.Duration) time.Duration {
+	const (
+		floor   = 30 * time.Second
+		ceiling = 5 * time.Minute
+	)
+	d := timeout
+	if t := 10 * fetchTimeout; t < d {
+		d = t
+	}
+	if d < floor {
+		return floor
+	}
+	if d > ceiling {
+		return ceiling
+	}
+	return d
 }
 
 // Load reads a YAML config file and applies defaults and env overrides.
@@ -134,6 +158,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Runner.Timeout == 0 {
 		cfg.Runner.Timeout = defaults.Runner.Timeout
 	}
+	if cfg.Runner.ShutdownTimeout == 0 {
+		cfg.Runner.ShutdownTimeout = computeShutdownTimeoutDefault(cfg.Runner.Timeout, cfg.Runner.FetchTimeout)
+	}
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = defaults.Log.Level
 	}
@@ -170,6 +197,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Runner.Timeout < 1*time.Minute {
 		return fmt.Errorf("runner.timeout must be >= 1m (got %s)", c.Runner.Timeout)
+	}
+	if c.Runner.ShutdownTimeout < 1*time.Second {
+		return fmt.Errorf("runner.shutdown_timeout must be >= 1s (got %s)", c.Runner.ShutdownTimeout)
+	}
+	if c.Runner.ShutdownTimeout > c.Runner.Timeout {
+		return fmt.Errorf("runner.shutdown_timeout (%s) must be <= runner.timeout (%s)", c.Runner.ShutdownTimeout, c.Runner.Timeout)
 	}
 
 	// Cache.
@@ -239,6 +272,11 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("RUNNER_APT_PROXY_URL"); v != "" {
 		c.Runner.AptProxyURL = v
+	}
+	if v := os.Getenv("RUNNER_SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Runner.ShutdownTimeout = d
+		}
 	}
 	if v := os.Getenv("CACHE_ENABLED"); v != "" {
 		c.Cache.Enabled = v == "true" || v == "1"

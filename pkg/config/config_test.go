@@ -224,3 +224,87 @@ runner:
 	require.NoError(t, err)
 	assert.Equal(t, "http://apt-cache.gitea.svc:3142", cfg.Runner.AptProxyURL)
 }
+
+func TestDefault_ShutdownTimeout(t *testing.T) {
+	cfg := Default()
+	// With default Runner.Timeout=3h and FetchTimeout=30s,
+	// min(3h, 10*30s)=5m, clamped to [30s, 5m] = 5m.
+	assert.Equal(t, 5*time.Minute, cfg.Runner.ShutdownTimeout)
+}
+
+func TestLoad_ShutdownTimeout_FromYAML(t *testing.T) {
+	t.Setenv("RUNNER_NAME", "")
+	content := `
+server:
+  url: http://localhost:3000
+runner:
+  labels: ["x:docker://alpine"]
+  shutdown_timeout: 90s
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 90*time.Second, cfg.Runner.ShutdownTimeout)
+}
+
+func TestLoad_ShutdownTimeout_DefaultAppliedForZero(t *testing.T) {
+	// YAML omits shutdown_timeout entirely — Load should fall back to Default.
+	t.Setenv("RUNNER_NAME", "")
+	content := `
+server:
+  url: http://localhost:3000
+runner:
+  labels: ["x:docker://alpine"]
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Minute, cfg.Runner.ShutdownTimeout)
+}
+
+func TestLoad_ShutdownTimeout_FromEnv(t *testing.T) {
+	t.Setenv("SERVER_URL", "http://server:3000")
+	t.Setenv("RUNNER_SHUTDOWN_TIMEOUT", "2m")
+	cfg, err := Load("/nonexistent/config.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Minute, cfg.Runner.ShutdownTimeout)
+}
+
+func TestValidate_ShutdownTimeout_TooSmall(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.ShutdownTimeout = 500 * time.Millisecond
+	assert.ErrorContains(t, cfg.Validate(), "shutdown_timeout")
+}
+
+func TestValidate_ShutdownTimeout_LargerThanTimeout(t *testing.T) {
+	cfg := validConfig()
+	cfg.Runner.Timeout = 2 * time.Minute
+	cfg.Runner.ShutdownTimeout = 5 * time.Minute
+	assert.ErrorContains(t, cfg.Validate(), "shutdown_timeout")
+}
+
+func TestDefault_ShutdownTimeout_ClampLow(t *testing.T) {
+	// Construct a config where 10*FetchTimeout would be below 30s and verify
+	// the clamp floor kicks in. Since Default() uses the global defaults, we
+	// exercise the helper directly rather than via Default().
+	got := computeShutdownTimeoutDefault(1*time.Hour, 1*time.Second)
+	assert.Equal(t, 30*time.Second, got)
+}
+
+func TestDefault_ShutdownTimeout_ClampHigh(t *testing.T) {
+	got := computeShutdownTimeoutDefault(3*time.Hour, 10*time.Minute)
+	assert.Equal(t, 5*time.Minute, got)
+}
+
+func TestDefault_ShutdownTimeout_PicksMin(t *testing.T) {
+	// Runner.Timeout is the lower bound — short jobs get short drain.
+	got := computeShutdownTimeoutDefault(45*time.Second, 30*time.Second)
+	// min(45s, 10*30s) = 45s, clamped to [30s, 5m] = 45s.
+	assert.Equal(t, 45*time.Second, got)
+}
