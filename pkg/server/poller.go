@@ -260,6 +260,12 @@ func (p *Poller) Shutdown(ctx context.Context) error {
 	if p.stopPoll != nil {
 		p.stopPoll()
 	}
+	if p.stopJobs != nil {
+		// Always release jobsCtx on return. CancelFunc is idempotent.
+		// This plugs the context-child leak that would otherwise happen
+		// in the graceful path (where the timeout branch is not taken).
+		defer p.stopJobs()
+	}
 
 	done := make(chan struct{})
 	go func() {
