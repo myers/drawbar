@@ -21,6 +21,7 @@ spec:
       labels:
         app: drawbar
     spec:
+      terminationGracePeriodSeconds: {{ include "drawbar.shutdownGraceSeconds" . }}
       serviceAccountName: {{ include "drawbar.serviceAccountName" . }}
       securityContext:
         runAsNonRoot: true

@@ -16,6 +16,7 @@ runner:
   fetchInterval: 2s
   fetchTimeout: 30s
   timeout: 30m
+  shutdownTimeout: 60s   # drain budget on SIGTERM; chart sets terminationGracePeriodSeconds = shutdownTimeout + 5s
   gitCloneUrl: ""  # defaults to server.url
   jobNamespace: ""  # defaults to release namespace
 

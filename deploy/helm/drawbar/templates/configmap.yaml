@@ -16,6 +16,7 @@ data:
       fetch_interval: {{ .Values.runner.fetchInterval | quote }}
       fetch_timeout: {{ .Values.runner.fetchTimeout | quote }}
       timeout: {{ .Values.runner.timeout | quote }}
+      shutdown_timeout: {{ .Values.runner.shutdownTimeout | quote }}
       {{- if .Values.runner.gitCloneUrl }}
       git_clone_url: {{ .Values.runner.gitCloneUrl | quote }}
       {{- end }}
