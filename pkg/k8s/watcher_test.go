@@ -334,59 +334,6 @@ func TestWaitForContainerRunning_AlreadyTerminated(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// --- parseStateEvents ---
-
-func TestParseStateEvents_Empty(t *testing.T) {
-	events, offset := parseStateEvents("", 0)
-	assert.Empty(t, events)
-	assert.Equal(t, 0, offset)
-}
-
-func TestParseStateEvents_SingleEvent(t *testing.T) {
-	output := `{"event":"start","step":0,"name":"Build","exit_code":0,"time":"2024-01-01T00:00:00Z"}`
-	events, offset := parseStateEvents(output, 0)
-	require.Len(t, events, 1)
-	assert.Equal(t, "start", events[0].Event)
-	assert.Equal(t, 0, events[0].Step)
-	assert.Equal(t, "Build", events[0].Name)
-	assert.Equal(t, 1, offset)
-}
-
-func TestParseStateEvents_MultipleWithOffset(t *testing.T) {
-	output := `{"event":"start","step":0,"name":"A","exit_code":0,"time":"t1"}
-{"event":"end","step":0,"name":"A","exit_code":0,"time":"t2"}
-{"event":"start","step":1,"name":"B","exit_code":0,"time":"t3"}`
-
-	// First call — read all 3.
-	events, offset := parseStateEvents(output, 0)
-	require.Len(t, events, 3)
-	assert.Equal(t, 3, offset)
-
-	// Second call with same output — no new events.
-	events2, offset2 := parseStateEvents(output, offset)
-	assert.Empty(t, events2)
-	assert.Equal(t, 3, offset2)
-}
-
-func TestParseStateEvents_MalformedSkipped(t *testing.T) {
-	output := `{"event":"start","step":0,"name":"A","exit_code":0,"time":"t1"}
-not valid json
-{"event":"end","step":0,"name":"A","exit_code":1,"time":"t2"}`
-
-	events, _ := parseStateEvents(output, 0)
-	require.Len(t, events, 2)
-	assert.Equal(t, "start", events[0].Event)
-	assert.Equal(t, "end", events[1].Event)
-}
-
-func TestParseStateEvents_BlankLines(t *testing.T) {
-	output := `{"event":"start","step":0,"name":"A","exit_code":0,"time":"t1"}
-
-{"event":"end","step":0,"name":"A","exit_code":0,"time":"t2"}`
-
-	events, _ := parseStateEvents(output, 0)
-	require.Len(t, events, 2)
-}
 
 func TestRouteStateEvent_Start(t *testing.T) {
 	rep := newTestReporter(1, 2)
@@ -406,37 +353,6 @@ func TestRouteStateEvent_End_Failure(t *testing.T) {
 	routeStateEvent(types.StateEvent{Event: "end", Step: 0, Name: "Build", ExitCode: 1}, rep)
 }
 
-// --- pollStateFileWith ---
-
-func TestPollStateFileWith(t *testing.T) {
-	executor := &mockPodExecutor{
-		outputs: []string{
-			`{"event":"start","step":0,"name":"Build","exit_code":0,"time":"t1"}`,
-			`{"event":"start","step":0,"name":"Build","exit_code":0,"time":"t1"}
-{"event":"end","step":0,"name":"Build","exit_code":0,"time":"t2"}`,
-		},
-		errs: []error{nil, nil, fmt.Errorf("terminated")},
-	}
-
-	rep := newTestReporter(1, 2)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	err := pollStateFileWith(ctx, executor, "ns", "pod", rep, 10*time.Millisecond)
-	assert.NoError(t, err)
-}
-
-func TestPollStateFileWith_ContainerExit(t *testing.T) {
-	executor := &mockPodExecutor{
-		errs: []error{fmt.Errorf("container terminated")},
-	}
-
-	rep := newTestReporter(1, 1)
-	ctx := context.Background()
-
-	err := pollStateFileWith(ctx, executor, "ns", "pod", rep, 10*time.Millisecond)
-	assert.NoError(t, err) // terminated is a clean exit
-}
 
 // --- streamLogs ---
 

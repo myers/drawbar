@@ -101,22 +101,34 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	}
 	slog.Info("runner container started", "pod", podName)
 
-	// Stream logs and poll state in parallel.
+	// Stream logs from the runner container.
 	logDone := make(chan error, 1)
 	go func() {
 		logDone <- streamLogs(ctx, streamer, namespace, podName, "runner", rep, cfg.CommandProc)
 	}()
 
-	stateDone := make(chan error, 1)
+	// Stream step-state events via the entrypoint tail subcommand.
+	type streamResult struct {
+		offset int
+		err    error
+	}
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	stateDone := make(chan streamResult, 1)
 	go func() {
-		stateDone <- pollStateFileWith(ctx, executor, namespace, podName, rep, cfg.PollInterval)
+		off, sErr := streamStateFileWith(streamCtx, executor, namespace, podName, rep)
+		stateDone <- streamResult{offset: off, err: sErr}
 	}()
 
 	// Wait for log streaming to finish (container exits).
 	<-logDone
 
-	// Give state polling a moment to catch up.
-	time.Sleep(cfg.PollInterval * 2)
+	// Stop the live state streamer and pick up its final offset.
+	cancelStream()
+	res := <-stateDone
+
+	// Authoritatively drain anything written after the last streamed line.
+	drainStateFile(ctx, executor, namespace, podName, rep, res.offset)
 
 	// Determine result from container exit code.
 	result, err := getContainerResult(ctx, client, namespace, podName)
@@ -127,39 +139,6 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	return result, nil
 }
 
-// pollStateFileWith reads the entrypoint's state.jsonl file to track step lifecycle.
-// Interim implementation against the new streaming PodExecutor; will be replaced
-// by streamStateFileWith in a follow-up task.
-func pollStateFileWith(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter, poll time.Duration) error {
-	var lastOffset int
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(poll):
-		}
-
-		stream, err := executor.ExecStream(ctx, namespace, podName, "runner",
-			[]string{"cat", "/shim/state.jsonl"})
-		if err != nil {
-			if strings.Contains(err.Error(), "terminated") || strings.Contains(err.Error(), "not found") {
-				return nil
-			}
-			continue
-		}
-		body, rErr := io.ReadAll(stream)
-		stream.Close()
-		if rErr != nil {
-			continue
-		}
-		events, newOffset := parseStateEvents(string(body), lastOffset)
-		for _, event := range events {
-			routeStateEvent(event, rep)
-		}
-		lastOffset = newOffset
-	}
-}
 
 // streamStateFileWith maintains a long-lived `entrypoint tail` exec session
 // against /shim/state.jsonl and routes each newline-terminated state event
@@ -326,29 +305,6 @@ func streamLogs(ctx context.Context, streamer LogStreamer, namespace, podName, c
 	}
 }
 
-// parseStateEvents parses JSONL state events from raw output, starting at lastOffset.
-// Returns parsed events and the new offset for the next call.
-func parseStateEvents(output string, lastOffset int) ([]types.StateEvent, int) {
-	trimmed := strings.TrimSpace(output)
-	if trimmed == "" {
-		return nil, lastOffset
-	}
-	lines := strings.Split(trimmed, "\n")
-	var events []types.StateEvent
-	for i := lastOffset; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		var event types.StateEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			slog.Debug("skipping malformed state event", "line", line, "error", err)
-			continue
-		}
-		events = append(events, event)
-	}
-	return events, len(lines)
-}
 
 // routeStateEvent dispatches a state event to the reporter.
 func routeStateEvent(event types.StateEvent, rep *reporter.Reporter) {
