@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -156,6 +158,139 @@ func pollStateFileWith(ctx context.Context, executor PodExecutor, namespace, pod
 			routeStateEvent(event, rep)
 		}
 		lastOffset = newOffset
+	}
+}
+
+// streamStateFileWith maintains a long-lived `entrypoint tail` exec session
+// against /shim/state.jsonl and routes each newline-terminated state event
+// into rep. On transient stream failure it reconnects with --skip <lastOffset>
+// so events are never replayed. After maxStreamAttempts failures in a row it
+// returns. The returned offset is the number of newline-terminated lines
+// successfully processed (whether routed or skipped as malformed).
+func streamStateFileWith(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter) (int, error) {
+	const (
+		initialBackoff = 50 * time.Millisecond
+		maxBackoff     = 2 * time.Second
+		maxAttempts    = 5
+	)
+
+	lastOffset := 0
+	backoff := initialBackoff
+	attempt := 0
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return lastOffset, err
+		}
+
+		cmd := []string{"/shim/entrypoint", "tail",
+			"--skip", strconv.Itoa(lastOffset),
+			"/shim/state.jsonl"}
+		stream, err := executor.ExecStream(ctx, namespace, podName, "runner", cmd)
+		if err != nil {
+			attempt++
+			if attempt >= maxAttempts {
+				slog.Error("state stream gave up after retries",
+					"lastOffset", lastOffset, "err", err)
+				return lastOffset, err
+			}
+			select {
+			case <-ctx.Done():
+				return lastOffset, ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+		// Successful connect: reset attempt counter and backoff.
+		attempt = 0
+		backoff = initialBackoff
+
+		reader := bufio.NewReader(stream)
+		for {
+			line, rErr := reader.ReadString('\n')
+			if rErr == nil && len(line) > 0 {
+				trimmed := strings.TrimRight(line, "\n\r")
+				if trimmed == "" {
+					lastOffset++
+					continue
+				}
+				var ev types.StateEvent
+				if jErr := json.Unmarshal([]byte(trimmed), &ev); jErr != nil {
+					slog.Debug("skipping malformed state event",
+						"line", trimmed, "err", jErr)
+					lastOffset++
+					continue
+				}
+				routeStateEvent(ev, rep)
+				lastOffset++
+				continue
+			}
+			// rErr != nil: close the stream and decide whether to reconnect.
+			stream.Close()
+			if errors.Is(rErr, context.Canceled) ||
+				errors.Is(rErr, context.DeadlineExceeded) {
+				return lastOffset, rErr
+			}
+			// Any other error (including io.EOF) → break inner loop and
+			// reconnect via the outer loop.
+			break
+		}
+	}
+}
+
+// drainStateFile performs a single best-effort one-shot read of any state
+// events written to /shim/state.jsonl after the streaming tail's last
+// observed line. Errors are logged at warn and not returned: by the time we
+// drain, the runner container may already be terminated.
+func drainStateFile(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter, lastOffset int) {
+	if err := ctx.Err(); err != nil {
+		slog.Warn("post-exit state drain skipped: ctx already canceled",
+			"err", err, "lastOffset", lastOffset)
+		return
+	}
+
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := []string{"/shim/entrypoint", "tail", "--once",
+		"--skip", strconv.Itoa(lastOffset),
+		"/shim/state.jsonl"}
+	stream, err := executor.ExecStream(drainCtx, namespace, podName, "runner", cmd)
+	if err != nil {
+		slog.Warn("post-exit state drain exec failed",
+			"err", err, "lastOffset", lastOffset, "pod", podName)
+		return
+	}
+	defer stream.Close()
+
+	reader := bufio.NewReader(stream)
+	for {
+		line, rErr := reader.ReadString('\n')
+		if rErr == nil && len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\n\r")
+			if trimmed == "" {
+				continue
+			}
+			var ev types.StateEvent
+			if jErr := json.Unmarshal([]byte(trimmed), &ev); jErr != nil {
+				slog.Debug("skipping malformed state event",
+					"line", trimmed, "err", jErr)
+				continue
+			}
+			routeStateEvent(ev, rep)
+			continue
+		}
+		if rErr != io.EOF {
+			slog.Warn("post-exit state drain stream error",
+				"err", rErr, "lastOffset", lastOffset)
+		}
+		return
 	}
 }
 

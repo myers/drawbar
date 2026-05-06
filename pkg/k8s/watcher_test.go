@@ -634,3 +634,187 @@ func TestWaitForContainerRunning_ErrImagePull(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "ErrImagePull")
 }
+
+// --- streamStateFileWith and drainStateFile ---
+
+// findFlagValue scans cmd for `flag` and returns the next argument's value.
+// Returns "" if not found.
+func findFlagValue(cmd []string, flag string) string {
+	for i := 0; i < len(cmd)-1; i++ {
+		if cmd[i] == flag {
+			return cmd[i+1]
+		}
+	}
+	return ""
+}
+
+// recordingExecutor records every ExecStream invocation and serves outputs
+// from a programmable script.
+type recordingExecutor struct {
+	mu      sync.Mutex
+	calls   [][]string
+	outputs []string
+	errs    []error
+	idx     int
+}
+
+func (r *recordingExecutor) ExecStream(_ context.Context, _, _, _ string, cmd []string) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, append([]string(nil), cmd...))
+	i := r.idx
+	r.idx++
+	if i < len(r.errs) && r.errs[i] != nil {
+		return nil, r.errs[i]
+	}
+	if i < len(r.outputs) {
+		return io.NopCloser(strings.NewReader(r.outputs[i])), nil
+	}
+	return nil, fmt.Errorf("terminated")
+}
+
+func (r *recordingExecutor) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *recordingExecutor) callAt(i int) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[i]
+}
+
+func TestStreamStateFile_RoutesAllEvents(t *testing.T) {
+	rep := newTestReporter(1, 3)
+	jsonl := `{"event":"start","step":0,"name":"checkout","time":"2026-05-06T14:35:54Z"}
+{"event":"end","step":0,"name":"checkout","exit_code":0,"time":"2026-05-06T14:35:58Z"}
+{"event":"start","step":1,"name":"build","time":"2026-05-06T14:35:58Z"}
+`
+	exec := &recordingExecutor{outputs: []string{jsonl}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Once exec returns the stream EOF, the function will try to reconnect.
+		// Cancel ctx after a short pause to break it out of the retry loop.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if off != 3 {
+		t.Errorf("offset = %d, want 3", off)
+	}
+	// The first call should NOT carry --skip > 0 (skip starts at 0).
+	if got := findFlagValue(exec.callAt(0), "--skip"); got != "0" && got != "" {
+		t.Errorf("first call --skip = %q, want \"0\" or absent", got)
+	}
+}
+
+func TestStreamStateFile_ReconnectAfterError(t *testing.T) {
+	rep := newTestReporter(1, 5)
+	first := `{"event":"start","step":0,"name":"a","time":"t"}
+{"event":"end","step":0,"name":"a","exit_code":0,"time":"t"}
+{"event":"start","step":1,"name":"b","time":"t"}
+`
+	// After 3 routed events, EOF triggers reconnect. Second call returns more.
+	second := `{"event":"end","step":1,"name":"b","exit_code":0,"time":"t"}
+`
+	exec := &recordingExecutor{outputs: []string{first, second}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if off != 4 {
+		t.Errorf("offset = %d, want 4", off)
+	}
+	if exec.callCount() < 2 {
+		t.Fatalf("expected >= 2 calls, got %d", exec.callCount())
+	}
+	if got := findFlagValue(exec.callAt(1), "--skip"); got != "3" {
+		t.Errorf("second call --skip = %q, want \"3\"", got)
+	}
+}
+
+func TestStreamStateFile_MalformedLineSkipped(t *testing.T) {
+	rep := newTestReporter(1, 2)
+	jsonl := `{not json}
+{"event":"start","step":0,"name":"a","time":"t"}
+`
+	exec := &recordingExecutor{outputs: []string{jsonl}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if off != 2 {
+		t.Errorf("offset = %d, want 2 (both lines counted)", off)
+	}
+}
+
+func TestStreamStateFile_MaxRetries(t *testing.T) {
+	rep := newTestReporter(1, 0)
+	exec := &recordingExecutor{
+		errs: []error{
+			fmt.Errorf("boom1"),
+			fmt.Errorf("boom2"),
+			fmt.Errorf("boom3"),
+			fmt.Errorf("boom4"),
+			fmt.Errorf("boom5"),
+		},
+	}
+
+	ctx := context.Background()
+	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if err == nil {
+		t.Errorf("expected error after max retries")
+	}
+	if off != 0 {
+		t.Errorf("offset = %d, want 0", off)
+	}
+	if exec.callCount() != 5 {
+		t.Errorf("call count = %d, want 5", exec.callCount())
+	}
+}
+
+func TestDrainStateFile_RoutesEvents(t *testing.T) {
+	rep := newTestReporter(1, 2)
+	jsonl := `{"event":"end","step":0,"name":"a","exit_code":0,"time":"t"}
+{"event":"end","step":1,"name":"b","exit_code":1,"time":"t"}
+`
+	exec := &recordingExecutor{outputs: []string{jsonl}}
+
+	drainStateFile(context.Background(), exec, "ns", "pod", rep, 3)
+
+	if exec.callCount() != 1 {
+		t.Errorf("call count = %d, want 1", exec.callCount())
+	}
+	cmd := exec.callAt(0)
+	if findFlagValue(cmd, "--skip") != "3" {
+		t.Errorf("--skip = %q, want \"3\"", findFlagValue(cmd, "--skip"))
+	}
+	hasOnce := false
+	for _, a := range cmd {
+		if a == "--once" {
+			hasOnce = true
+		}
+	}
+	if !hasOnce {
+		t.Errorf("drain command missing --once flag: %v", cmd)
+	}
+}
+
+func TestDrainStateFile_TerminatedContainer(t *testing.T) {
+	rep := newTestReporter(1, 1)
+	exec := &recordingExecutor{errs: []error{fmt.Errorf("container terminated")}}
+
+	// Should not panic, should not block; just log a warning and return.
+	drainStateFile(context.Background(), exec, "ns", "pod", rep, 0)
+}
