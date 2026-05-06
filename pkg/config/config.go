@@ -69,7 +69,7 @@ type LogConfig struct {
 // Default returns a Config with sensible defaults.
 func Default() *Config {
 	hostname, _ := os.Hostname()
-	return &Config{
+	cfg := &Config{
 		Runner: RunnerConfig{
 			Name:          hostname,
 			Labels:        []string{"ubuntu-latest:docker://node:22-bookworm"},
@@ -82,9 +82,8 @@ func Default() *Config {
 			// is correct — but a timeout shorter than the h2 ReadIdleTimeout
 			// (~15s) would also short-circuit the transport-wedge detection.
 			// Match the Helm default of 30s.
-			FetchTimeout:    30 * time.Second,
-			Timeout:         3 * time.Hour,
-			ShutdownTimeout: computeShutdownTimeoutDefault(3*time.Hour, 30*time.Second),
+			FetchTimeout: 30 * time.Second,
+			Timeout:      3 * time.Hour,
 		},
 		Cache: CacheConfig{
 			Enabled: true,
@@ -99,6 +98,8 @@ func Default() *Config {
 			Level: "info",
 		},
 	}
+	cfg.Runner.ShutdownTimeout = computeShutdownTimeoutDefault(cfg.Runner.Timeout, cfg.Runner.FetchTimeout)
+	return cfg
 }
 
 // computeShutdownTimeoutDefault returns the default Runner.ShutdownTimeout:
@@ -110,17 +111,8 @@ func computeShutdownTimeoutDefault(timeout, fetchTimeout time.Duration) time.Dur
 		floor   = 30 * time.Second
 		ceiling = 5 * time.Minute
 	)
-	d := timeout
-	if t := 10 * fetchTimeout; t < d {
-		d = t
-	}
-	if d < floor {
-		return floor
-	}
-	if d > ceiling {
-		return ceiling
-	}
-	return d
+	d := min(timeout, 10*fetchTimeout)
+	return max(floor, min(d, ceiling))
 }
 
 // Load reads a YAML config file and applies defaults and env overrides.
