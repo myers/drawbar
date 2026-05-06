@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -72,5 +71,4 @@ func TestParseTailArgs_UnknownFlag(t *testing.T) {
 // is stable.
 var _ = func() {
 	_ = runTail(context.Background(), tailArgs{}, &bytes.Buffer{})
-	_ = strings.TrimSpace("")
 }

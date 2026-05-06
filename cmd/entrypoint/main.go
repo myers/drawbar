@@ -45,7 +45,7 @@ func main() {
 		args, err := parseTailArgs(os.Args[2:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
-			usage()
+			os.Exit(1)
 		}
 		if err := runTail(context.Background(), args, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
