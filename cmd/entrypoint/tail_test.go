@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -71,4 +73,82 @@ func TestParseTailArgs_UnknownFlag(t *testing.T) {
 // is stable.
 var _ = func() {
 	_ = runTail(context.Background(), tailArgs{}, &bytes.Buffer{})
+}
+
+func writeFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func TestRunTailOnce_AllLines(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "line1\nline2\nline3\n")
+
+	var buf bytes.Buffer
+	err := runTail(context.Background(), tailArgs{path: p, once: true}, &buf)
+	if err != nil {
+		t.Fatalf("runTail: %v", err)
+	}
+	got := buf.String()
+	want := "line1\nline2\nline3\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRunTailOnce_Skip(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "a\nb\nc\nd\n")
+
+	var buf bytes.Buffer
+	err := runTail(context.Background(), tailArgs{path: p, once: true, skip: 2}, &buf)
+	if err != nil {
+		t.Fatalf("runTail: %v", err)
+	}
+	if buf.String() != "c\nd\n" {
+		t.Errorf("got %q, want \"c\\nd\\n\"", buf.String())
+	}
+}
+
+func TestRunTailOnce_SkipBeyondFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "a\nb\n")
+
+	var buf bytes.Buffer
+	err := runTail(context.Background(), tailArgs{path: p, once: true, skip: 10}, &buf)
+	if err != nil {
+		t.Fatalf("runTail: %v", err)
+	}
+	if buf.String() != "" {
+		t.Errorf("got %q, want empty", buf.String())
+	}
+}
+
+func TestRunTailOnce_PartialTrailingLine(t *testing.T) {
+	// A trailing partial line (no \n) is not emitted in --once mode.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "complete\npartial-no-newline")
+
+	var buf bytes.Buffer
+	err := runTail(context.Background(), tailArgs{path: p, once: true}, &buf)
+	if err != nil {
+		t.Fatalf("runTail: %v", err)
+	}
+	if buf.String() != "complete\n" {
+		t.Errorf("got %q, want \"complete\\n\"", buf.String())
+	}
+}
+
+func TestRunTailOnce_NonexistentFile(t *testing.T) {
+	var buf bytes.Buffer
+	err := runTail(context.Background(), tailArgs{path: "/no/such/path", once: true}, &buf)
+	if err == nil {
+		t.Errorf("expected error for nonexistent file")
+	}
 }

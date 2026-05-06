@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 )
 
@@ -56,7 +58,42 @@ func parseTailArgs(argv []string) (tailArgs, error) {
 	return args, nil
 }
 
-// runTail is the stub for the tail behavior. Implemented in later tasks.
-func runTail(_ context.Context, _ tailArgs, _ io.Writer) error {
-	return errors.New("not implemented")
+// runTail follows or one-shot reads the JSONL file at args.path, dropping the
+// first args.skip newline-terminated lines and writing the remainder verbatim
+// to out. Partial trailing lines (no \n) are never emitted.
+func runTail(ctx context.Context, args tailArgs, out io.Writer) error {
+	f, err := os.Open(args.path)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", args.path, err)
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	skipped := 0
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		line, rErr := reader.ReadString('\n')
+		hasFullLine := rErr == nil && line != ""
+		if hasFullLine {
+			if skipped < args.skip {
+				skipped++
+				continue
+			}
+			if _, wErr := io.WriteString(out, line); wErr != nil {
+				return fmt.Errorf("writing line: %w", wErr)
+			}
+			continue
+		}
+		if errors.Is(rErr, io.EOF) {
+			if args.once {
+				return nil
+			}
+			// Follow mode arrives in Task 3. For now, treat as EOF return.
+			return nil
+		}
+		return fmt.Errorf("reading: %w", rErr)
+	}
 }
