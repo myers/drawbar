@@ -172,3 +172,24 @@ important debugging signal.
 - Drawbar pod (during this run):
   `drawbar-766f56c567-vh6qx`, ran clean for 8m13s job duration with
   0 restarts (validating bugs 014/015 fixes in the same run).
+
+## Resolution
+
+Fixed in commits `97cfb9f..345fe58` on `main`. Replaced the
+500 ms `cat /shim/state.jsonl` poll loop with a long-lived
+`entrypoint tail` exec stream plus a one-shot post-exit drain so
+trailing per-step state events are no longer lost when the runner
+container exits.
+
+- Spec: [`docs/superpowers/specs/2026-05-06-step-state-streaming-design.md`](../docs/superpowers/specs/2026-05-06-step-state-streaming-design.md)
+- Plan: [`docs/superpowers/plans/2026-05-06-step-state-streaming.md`](../docs/superpowers/plans/2026-05-06-step-state-streaming.md)
+
+Live verification against the bug 016 repro shape (multi-step job
+with a late-step failure) is pending — handed off to the
+test-cluster agent. Fill in run/job IDs and observed per-step
+records here once verified.
+
+The 1-vs-0 step-indexing discrepancy noted in this doc (log lines
+say "Step 5", API says step 4) was deliberately *not* touched in
+this fix — it's a separate human-facing stderr formatting issue.
+File a follow-up if it remains a concern.
