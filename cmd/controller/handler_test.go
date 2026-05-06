@@ -646,6 +646,137 @@ jobs:
 	assert.Nil(t, runner.SecurityContext.SeccompProfile)
 }
 
+// --- Shutdown recovery test ---
+
+// blockingExecutor blocks Exec calls until ctx.Done fires, then returns
+// ctx.Err. Used to simulate a long-running pod that's still mid-execution
+// when the controller decides to shut down.
+type blockingExecutor struct{}
+
+func (blockingExecutor) Exec(ctx context.Context, _, _, _ string, _ []string) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// blockingStreamer returns a reader that blocks on Read until ctx is cancelled.
+type blockingStreamer struct{}
+
+func (blockingStreamer) StreamLogs(ctx context.Context, _, _, _ string) (io.ReadCloser, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		<-ctx.Done()
+		pw.CloseWithError(ctx.Err())
+	}()
+	return pr, nil
+}
+
+func TestMakeTaskHandler_ShutdownRecovery_ReportsFailureAndDeletesJob(t *testing.T) {
+	taskID := int64(200)
+	jobName := fmt.Sprintf("server-run-%d", taskID)
+
+	// 1. Fake Forgejo server.
+	fjs := &fakeForgejoServer{}
+	server := httptest.NewServer(fjs.serveMux("/api/actions"))
+	t.Cleanup(server.Close)
+	forgejoClient := forgeserver.NewClient(server.URL, false, "uuid", "token", time.Second, 5*time.Second)
+
+	// 2. Fake k8s client; create a pod for the job once it appears so
+	//    waitForContainerRunning unblocks and we get into the streaming phase
+	//    where the blocking executor/streamer can be cancelled.
+	k8sClient := fake.NewSimpleClientset()
+	go func() {
+		for i := 0; i < 100; i++ {
+			time.Sleep(10 * time.Millisecond)
+			jobs, _ := k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+			if len(jobs.Items) > 0 {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      jobName + "-pod",
+						Namespace: "test-ns",
+						Labels:    map[string]string{"job-name": jobs.Items[0].Name},
+					},
+					Status: corev1.PodStatus{
+						ContainerStatuses: []corev1.ContainerStatus{
+							{
+								Name:  "runner",
+								State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+							},
+						},
+					},
+				}
+				k8sClient.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
+				return
+			}
+		}
+	}()
+
+	// 3. Build task with a single step.
+	task := &runnerv1.Task{
+		Id: taskID,
+		WorkflowPayload: []byte(`name: Test
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 60
+`),
+		Context: &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				"server_url": structpb.NewStringValue("https://server.example.com"),
+				"token":      structpb.NewStringValue("test-token"),
+			},
+		},
+		Secrets: map[string]string{},
+	}
+
+	// 4. Run handler with a ctx that gets cancelled mid-execution to
+	//    simulate poller.Shutdown's jobsCtx cancellation.
+	handler := makeTaskHandler(TaskHandlerConfig{
+		K8sClient:    k8sClient,
+		ServerClient: forgejoClient,
+		Labels:       labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")},
+		Namespace:    "test-ns",
+		Timeout:      5 * time.Minute,
+		WatchConfig: k8s.WatchConfig{
+			PollInterval: 20 * time.Millisecond,
+			Executor:     blockingExecutor{},
+			Streamer:     blockingStreamer{},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel after a brief delay to let the handler get into WatchJob.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		handler(ctx, task)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler did not return after ctx cancel")
+	}
+
+	// 5. Verify: forge received a final UpdateTask with RESULT_FAILURE.
+	fjs.mu.Lock()
+	assert.Greater(t, fjs.taskCalls, 0, "should have sent task updates")
+	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, fjs.lastResult,
+		"recovery branch should report RESULT_FAILURE")
+	fjs.mu.Unlock()
+
+	// 6. Verify: k8s Job was deleted.
+	jobs, err := k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, jobs.Items, "recovery branch should delete the k8s Job")
+}
+
 // --- Git helpers ---
 
 func setupActionRepo(t *testing.T, org, repo string, files map[string]string) (string, string, string) {

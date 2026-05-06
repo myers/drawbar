@@ -842,6 +842,17 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 			result = runnerv1.Result_RESULT_FAILURE
 		}
 
+		// If the handler ctx was cancelled, this is the controller's shutdown
+		// drain timing out. The handler ctx (and every derivative) is dead, so
+		// the final UpdateTask and Job delete need a fresh Background-rooted
+		// context. The 5s budget matches the chart's terminationGracePeriodSeconds
+		// buffer (shutdown_timeout + 5s).
+		if ctx.Err() != nil {
+			runShutdownRecovery(cfg, task.GetId(), created.Name, rep)
+			slog.Info("task completed", "task_id", task.GetId(), "result", "shutdown")
+			return
+		}
+
 		// Report final result.
 		if err := rep.Close(ctx, result); err != nil {
 			slog.Error("failed to report final result", "error", err)
@@ -875,6 +886,38 @@ func reportFailure(ctx context.Context, client *server.Client, task *runnerv1.Ta
 	rep.AddLog(message)
 	if err := rep.Close(ctx, runnerv1.Result_RESULT_FAILURE); err != nil {
 		slog.Error("failed to report failure", "task_id", task.GetId(), "error", err)
+	}
+}
+
+// runShutdownRecovery is invoked from the task handler when the handler
+// context has been cancelled by poller.Shutdown's drain timeout. It pushes
+// a final RESULT_FAILURE to the forge and deletes the surviving k8s Job
+// using a fresh Background-rooted context (the handler ctx is dead, so
+// any derivative would be cancelled too). The defer recover() prevents a
+// panic here from crashing sibling handlers' drain.
+func runShutdownRecovery(cfg TaskHandlerConfig, taskID int64, jobName string, rep *reporter.Reporter) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in shutdown recovery", "task_id", taskID, "panic", r)
+		}
+	}()
+
+	shutdownReportCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rep.AddLog("controller restart, results may be incomplete")
+	if err := rep.Close(shutdownReportCtx, runnerv1.Result_RESULT_FAILURE); err != nil {
+		slog.Warn("shutdown recovery: final report failed",
+			"task_id", taskID, "job", jobName, "error", err)
+	}
+
+	propagation := metav1.DeletePropagationForeground
+	if err := cfg.K8sClient.BatchV1().Jobs(cfg.Namespace).Delete(
+		shutdownReportCtx, jobName,
+		metav1.DeleteOptions{PropagationPolicy: &propagation},
+	); err != nil {
+		slog.Warn("shutdown recovery: job delete failed",
+			"task_id", taskID, "job", jobName, "namespace", cfg.Namespace, "error", err)
 	}
 }
 
