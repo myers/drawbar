@@ -26,7 +26,7 @@ are accepted by the controller's time.ParseDuration but not by this helper —
 use seconds (e.g. "5400s" for 1.5h) for compound durations.
 */ -}}
 {{- define "drawbar.shutdownGraceSeconds" -}}
-{{- $d := .Values.runner.shutdownTimeout | default "60s" -}}
+{{- $d := .Values.runner.shutdownTimeout | default "60s" | toString -}}
 {{- $unit := $d | trimAll "0123456789" -}}
 {{- $n := $d | trimSuffix $unit | int -}}
 {{- $secs := 0 -}}
