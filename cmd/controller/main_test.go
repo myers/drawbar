@@ -281,6 +281,16 @@ func TestCollectSecrets(t *testing.T) {
 }
 
 // --- healthzHandler ---
+//
+// Signature reminder for these tests:
+//
+//   healthzHandler(lastPoll, lastSuccessfulFetch, inFlight, inBackoff,
+//                  pollStaleness, successFetchStaleness, capacity, onWedge)
+//
+// The "always idle" defaults below: inFlight=0, inBackoff=false, capacity=1.
+// Tests that exercise the new guards override these explicitly.
+
+func neverInBackoff() bool { return false }
 
 func TestHealthzHandler_BothFresh(t *testing.T) {
 	now := time.Now()
@@ -288,7 +298,8 @@ func TestHealthzHandler_BothFresh(t *testing.T) {
 		func() time.Time { return now },
 		func() time.Time { return now },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute, nil,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -298,12 +309,12 @@ func TestHealthzHandler_BothFresh(t *testing.T) {
 }
 
 func TestHealthzHandler_NoPollYet(t *testing.T) {
-	// Both heartbeats zero = startup, before first poll. Always healthy.
 	handler := healthzHandler(
 		func() time.Time { return time.Time{} },
 		func() time.Time { return time.Time{} },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute, nil,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -312,14 +323,14 @@ func TestHealthzHandler_NoPollYet(t *testing.T) {
 }
 
 func TestHealthzHandler_StalePoll(t *testing.T) {
-	// Poll heartbeat stale = ticker dead. 503.
 	stale := time.Now().Add(-time.Hour)
 	now := time.Now()
 	handler := healthzHandler(
 		func() time.Time { return stale },
 		func() time.Time { return now },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute, nil,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -329,15 +340,14 @@ func TestHealthzHandler_StalePoll(t *testing.T) {
 }
 
 func TestHealthzHandler_StaleSuccessfulFetch(t *testing.T) {
-	// Poll heartbeat is fresh (goroutine is alive, RPCs are returning) but
-	// no successful response in a long time = transport wedged. 503.
 	now := time.Now()
 	stale := time.Now().Add(-time.Hour)
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return stale },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute, nil,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -347,15 +357,13 @@ func TestHealthzHandler_StaleSuccessfulFetch(t *testing.T) {
 }
 
 func TestHealthzHandler_StaleSuccessfulFetch_ZeroIgnored(t *testing.T) {
-	// Successful-fetch zero = no successful fetch yet (e.g. server still down
-	// since startup). Treat as "starting up" — do NOT 503 on this alone. The
-	// poll heartbeat handles ticker-dead; readyz handles registration.
 	now := time.Now()
 	handler := healthzHandler(
 		func() time.Time { return now },
 		func() time.Time { return time.Time{} },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute, nil,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -371,7 +379,8 @@ func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 		func() time.Time { return stale },
 		func() time.Time { return now },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
 		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
 	for range 5 {
@@ -380,7 +389,7 @@ func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
 		handler(w, req)
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	}
-	assert.Equal(t, int32(1), calls.Load(), "onWedge should fire exactly once across multiple stale probes")
+	assert.Equal(t, int32(1), calls.Load())
 }
 
 func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
@@ -391,7 +400,8 @@ func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
 		func() time.Time { return now },
 		func() time.Time { return stale },
 		func() int64 { return 0 },
-		30*time.Second, 5*time.Minute,
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
 		func(_ string, _, _ time.Duration) { calls.Add(1) },
 	)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -402,7 +412,6 @@ func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
 }
 
 func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
-	// Poll-loop path: kind should be "poll loop".
 	t.Run("poll", func(t *testing.T) {
 		stale := time.Now().Add(-time.Hour)
 		now := time.Now()
@@ -411,7 +420,8 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 			func() time.Time { return stale },
 			func() time.Time { return now },
 			func() int64 { return 0 },
-			30*time.Second, 5*time.Minute,
+			neverInBackoff,
+			30*time.Second, 5*time.Minute, 1,
 			func(kind string, _, _ time.Duration) { gotKind = kind },
 		)
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -420,7 +430,6 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 		assert.Equal(t, "poll loop", gotKind)
 	})
 
-	// Successful-fetch path: kind should be "successful fetch".
 	t.Run("successful fetch", func(t *testing.T) {
 		now := time.Now()
 		stale := time.Now().Add(-time.Hour)
@@ -429,7 +438,8 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 			func() time.Time { return now },
 			func() time.Time { return stale },
 			func() int64 { return 0 },
-			30*time.Second, 5*time.Minute,
+			neverInBackoff,
+			30*time.Second, 5*time.Minute, 1,
 			func(kind string, _, _ time.Duration) { gotKind = kind },
 		)
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -437,6 +447,169 @@ func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
 		handler(w, req)
 		assert.Equal(t, "successful fetch", gotKind)
 	})
+}
+
+// TestHealthzHandler_BusySuppressesStaleness covers bug 013's existing
+// behavior: while a handler is in flight, the poll-staleness 503 is
+// suppressed. With the bug 014 fix layered on, the same in-flight state
+// also satisfies the inFlight==capacity successful-fetch suppression at
+// capacity 1, so this test runs against capacity=1 and confirms BOTH
+// branches stay 200 while busy and the poll-stale branch trips when idle.
+func TestHealthzHandler_BusySuppressesStaleness(t *testing.T) {
+	pollStale := 50 * time.Millisecond
+	succStale := time.Hour
+	pollT := time.Now().Add(-time.Hour)
+	var inFlight atomic.Int64
+
+	var wedgeKind string
+	onWedge := func(kind string, _, _ time.Duration) { wedgeKind = kind }
+
+	h := healthzHandler(
+		func() time.Time { return pollT },
+		func() time.Time { return time.Now() },
+		inFlight.Load,
+		neverInBackoff,
+		pollStale, succStale, 1,
+		onWedge,
+	)
+
+	inFlight.Store(1)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("busy poll-stale: want 200, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "" {
+		t.Fatalf("busy: onWedge must not fire, got %q", wedgeKind)
+	}
+
+	inFlight.Store(0)
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("idle poll-stale: want 503, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "poll loop" {
+		t.Fatalf("idle: want wedgeKind=poll loop, got %q", wedgeKind)
+	}
+}
+
+// --- New tests for bugs 014 and 015 ---
+
+func TestHealthzHandler_BackoffSuppressesPollStaleness(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	var inBackoff atomic.Bool
+	inBackoff.Store(true)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "in-backoff must suppress poll-stale 503")
+	assert.Equal(t, "", wedgeKind, "onWedge must not fire while in backoff")
+}
+
+func TestHealthzHandler_BackoffEndsExposesStaleness(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	var inBackoff atomic.Bool
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+
+	inBackoff.Store(true)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	inBackoff.Store(false)
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "poll loop", wedgeKind)
+}
+
+func TestHealthzHandler_AtCapacitySuppressesSuccessfulFetch(t *testing.T) {
+	cases := []struct {
+		name     string
+		capacity int64
+	}{
+		{"cap1", 1},
+		{"cap2", 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			stale := time.Now().Add(-time.Hour)
+
+			var wedgeKind string
+			h := healthzHandler(
+				func() time.Time { return now },
+				func() time.Time { return stale },
+				func() int64 { return tc.capacity }, // inFlight == capacity
+				neverInBackoff,
+				30*time.Second, 5*time.Minute, tc.capacity,
+				func(kind string, _, _ time.Duration) { wedgeKind = kind },
+			)
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			assert.Equal(t, http.StatusOK, rec.Code, "at-capacity must suppress successful-fetch 503")
+			assert.Equal(t, "", wedgeKind)
+		})
+	}
+}
+
+func TestHealthzHandler_BelowCapacityExposesSuccessfulFetch(t *testing.T) {
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 1 }, // inFlight < capacity (capacity 2)
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 2,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "successful fetch", wedgeKind)
+}
+
+func TestHealthzHandler_BothBranchesStale_PollLoopWins(t *testing.T) {
+	// inFlight=0, inBackoff=false, both heartbeats stale. Poll-loop branch
+	// is evaluated first and wins (matches existing dumpOnce semantics).
+	stale := time.Now().Add(-time.Hour)
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "poll loop", wedgeKind)
 }
 
 func TestPollStalenessThreshold(t *testing.T) {
@@ -828,42 +1001,3 @@ func TestExtractCacheInfo_NoCacheStep(t *testing.T) {
 	}
 }
 
-func TestHealthzHandler_BusySuppressesStaleness(t *testing.T) {
-	pollStale := 50 * time.Millisecond
-	succStale := time.Hour
-	now := time.Now().Add(-time.Hour) // last poll: ages ago
-	var inFlight atomic.Int64
-
-	var wedgeKind string
-	onWedge := func(kind string, _, _ time.Duration) { wedgeKind = kind }
-
-	h := healthzHandler(
-		func() time.Time { return now },
-		func() time.Time { return time.Now() }, // succ fetch: fresh
-		inFlight.Load,
-		pollStale, succStale,
-		onWedge,
-	)
-
-	// While in-flight, poll-staleness must be suppressed.
-	inFlight.Store(1)
-	rec := httptest.NewRecorder()
-	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("busy poll-stale: want 200, got %d (%q)", rec.Code, rec.Body.String())
-	}
-	if wedgeKind != "" {
-		t.Fatalf("busy: onWedge must not fire, got %q", wedgeKind)
-	}
-
-	// When idle, the same staleness must trip the 503.
-	inFlight.Store(0)
-	rec = httptest.NewRecorder()
-	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("idle poll-stale: want 503, got %d (%q)", rec.Code, rec.Body.String())
-	}
-	if wedgeKind != "poll loop" {
-		t.Fatalf("idle: want wedgeKind=poll loop, got %q", wedgeKind)
-	}
-}

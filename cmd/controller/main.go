@@ -282,7 +282,7 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 	go startHealthServer(
 		&registered, &activeJobs, int64(cfg.Runner.Capacity),
 		poller.LastPollAt, poller.LastSuccessfulFetchAt,
-		poller.InFlight,
+		poller.InFlight, poller.InBackoff,
 		pollStaleness, successFetchStaleness,
 	)
 
@@ -359,14 +359,15 @@ func startHealthServer(
 	lastPoll func() time.Time,
 	lastSuccessfulFetch func() time.Time,
 	inFlight func() int64,
+	inBackoff func() bool,
 	pollStaleness time.Duration,
 	successFetchStaleness time.Duration,
 ) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(
 		lastPoll, lastSuccessfulFetch,
-		inFlight,
-		pollStaleness, successFetchStaleness,
+		inFlight, inBackoff,
+		pollStaleness, successFetchStaleness, capacity,
 		dumpGoroutinesToStderr,
 	))
 	mux.HandleFunc("/readyz", readyzHandler(registered))
@@ -383,15 +384,19 @@ func startHealthServer(
 //
 //   - lastPoll catches "ticker dead" (the poll goroutine is not running). The
 //     zero value is treated as "starting up" and is always OK. The check is
-//     suppressed while inFlight() > 0 because the loop legitimately blocks on
-//     capacity acquisition while a handler runs (bug 013).
+//     suppressed while inFlight() > 0 (the loop is legitimately blocked on
+//     capacity acquisition while a handler runs — bug 013) or while
+//     inBackoff() is true (the loop is sleeping inside waitBackoff and will
+//     resume when the timer fires — bug 015).
 //   - lastSuccessfulFetch catches "transport dead but goroutine alive" — RPCs
 //     are returning errors but no real server response in a long time
 //     (h2 conn half-dead, server-side throttling, ...). The zero value is
 //     ignored on purpose: if the server has been down since the runner
-//     started, /readyz handles that — /healthz should not page. This check
-//     is NOT suppressed during in-flight handlers: a transport wedge while
-//     a long handler runs is still a real problem (bug 010).
+//     started, /readyz handles that — /healthz should not page. The check is
+//     suppressed when inFlight() == capacity: every slot is held, so the
+//     poller is structurally unable to issue a new FetchTask and
+//     lastSuccessfulFetch cannot advance through no fault of the transport
+//     (bug 014). Below capacity (one slot free) the check is live again.
 //
 // onWedge fires exactly once across the lifetime of the handler the first
 // time either condition trips, so callers can capture diagnostics (a goroutine
@@ -402,16 +407,17 @@ func healthzHandler(
 	lastPoll func() time.Time,
 	lastSuccessfulFetch func() time.Time,
 	inFlight func() int64,
+	inBackoff func() bool,
 	pollStaleness time.Duration,
 	successFetchStaleness time.Duration,
+	capacity int64,
 	onWedge func(kind string, since, threshold time.Duration),
 ) http.HandlerFunc {
 	var dumpOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
-		// While any handler is in flight, the poll loop is legitimately blocked
-		// on capacity and lastPoll won't advance. Suppress the staleness 503 in
-		// that case — see bug 013.
-		if inFlight() == 0 {
+		// Poll-staleness: only meaningful when the loop is neither holding a
+		// slot for an in-flight handler nor sleeping inside waitBackoff.
+		if inFlight() == 0 && !inBackoff() {
 			if t := lastPoll(); !t.IsZero() {
 				if since := time.Since(t); since > pollStaleness {
 					if onWedge != nil {
@@ -423,14 +429,20 @@ func healthzHandler(
 				}
 			}
 		}
-		if t := lastSuccessfulFetch(); !t.IsZero() {
-			if since := time.Since(t); since > successFetchStaleness {
-				if onWedge != nil {
-					dumpOnce.Do(func() { onWedge("successful fetch", since, successFetchStaleness) })
+		// Successful-fetch: only meaningful when at least one slot is free for
+		// the poller to actually attempt a new FetchTask. At inFlight ==
+		// capacity, the loop is blocked on the semaphore and the heartbeat
+		// cannot advance through any path that "transport health" would help.
+		if inFlight() < capacity {
+			if t := lastSuccessfulFetch(); !t.IsZero() {
+				if since := time.Since(t); since > successFetchStaleness {
+					if onWedge != nil {
+						dumpOnce.Do(func() { onWedge("successful fetch", since, successFetchStaleness) })
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+					fmt.Fprintf(w, "successful fetch stale: last successful fetch %s ago (threshold %s)", since, successFetchStaleness)
+					return
 				}
-				w.WriteHeader(http.StatusServiceUnavailable)
-				fmt.Fprintf(w, "successful fetch stale: last successful fetch %s ago (threshold %s)", since, successFetchStaleness)
-				return
 			}
 		}
 		w.WriteHeader(http.StatusOK)
