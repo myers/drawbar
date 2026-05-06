@@ -41,6 +41,16 @@ func main() {
 		if !runEntrypoint(os.Args[2], shimDir) {
 			os.Exit(1)
 		}
+	case "tail":
+		args, err := parseTailArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
+			usage()
+		}
+		if err := runTail(context.Background(), args, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 	}
@@ -48,8 +58,9 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
-	fmt.Fprintf(os.Stderr, "  entrypoint setup <manifest.json>   # init: fetch action sources into /actions/\n")
-	fmt.Fprintf(os.Stderr, "  entrypoint run <manifest.json>     # runner: execute steps\n")
+	fmt.Fprintf(os.Stderr, "  entrypoint setup <manifest.json>             # init: fetch action sources into /actions/\n")
+	fmt.Fprintf(os.Stderr, "  entrypoint run <manifest.json>               # runner: execute steps\n")
+	fmt.Fprintf(os.Stderr, "  entrypoint tail [--once] [--skip N] <path>   # stream JSONL lines from a file to stdout\n")
 	os.Exit(1)
 }
 
