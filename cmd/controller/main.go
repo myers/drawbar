@@ -848,8 +848,8 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		// context. The 5s budget matches the chart's terminationGracePeriodSeconds
 		// buffer (shutdown_timeout + 5s).
 		if ctx.Err() != nil {
-			runShutdownRecovery(cfg, task.GetId(), created.Name, rep)
-			slog.Info("task completed", "task_id", task.GetId(), "result", "shutdown")
+			runShutdownRecovery(cfg, task.GetId(), created.Name, rep, snapshotPVCName)
+			slog.Info("task completed", "task_id", task.GetId(), "result", runnerv1.Result_RESULT_FAILURE, "reason", "shutdown")
 			return
 		}
 
@@ -895,7 +895,7 @@ func reportFailure(ctx context.Context, client *server.Client, task *runnerv1.Ta
 // using a fresh Background-rooted context (the handler ctx is dead, so
 // any derivative would be cancelled too). The defer recover() prevents a
 // panic here from crashing sibling handlers' drain.
-func runShutdownRecovery(cfg TaskHandlerConfig, taskID int64, jobName string, rep *reporter.Reporter) {
+func runShutdownRecovery(cfg TaskHandlerConfig, taskID int64, jobName string, rep *reporter.Reporter, snapshotPVCName string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic in shutdown recovery", "task_id", taskID, "panic", r)
@@ -918,6 +918,13 @@ func runShutdownRecovery(cfg TaskHandlerConfig, taskID int64, jobName string, re
 	); err != nil {
 		slog.Warn("shutdown recovery: job delete failed",
 			"task_id", taskID, "job", jobName, "namespace", cfg.Namespace, "error", err)
+	}
+
+	if snapshotPVCName != "" && cfg.SnapshotManager != nil {
+		if err := cfg.SnapshotManager.DeletePVC(shutdownReportCtx, snapshotPVCName); err != nil {
+			slog.Warn("shutdown recovery: snapshot PVC delete failed",
+				"task_id", taskID, "pvc", snapshotPVCName, "error", err)
+		}
 	}
 }
 
