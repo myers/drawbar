@@ -1,0 +1,21 @@
+# Vendored upstream act_runner (already in .gitignore but defensive).
+reference/
+
+# Build artifacts and binaries.
+bin/
+vendor/
+*.exe
+*.so
+*.dylib
+
+# Documentation, plans, specs — prose, not code under review.
+docs/
+bugs/
+*.md
+
+# Helm chart values/templates aren't bug-shaped review material.
+deploy/helm/
+
+# Generated / fixtures, if any get added later.
+*.pb.go
+testdata/
