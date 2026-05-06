@@ -734,3 +734,57 @@ func TestDrainStateFile_TerminatedContainer(t *testing.T) {
 	// Should not panic, should not block; just log a warning and return.
 	drainStateFile(context.Background(), exec, "ns", "pod", rep, 0)
 }
+
+func TestStreamStateFile_ImmediateEOFAppliesBackoff(t *testing.T) {
+	// When ExecStream succeeds but the returned stream EOFs immediately
+	// (e.g. entrypoint tail finds /shim/state.jsonl missing during the
+	// startup race and exits 1), the loop must NOT busy-reconnect.
+	// Empty outputs (zero lines) trigger this case 5 times in a row;
+	// after 5 fruitless attempts the function should return.
+	rep := newTestReporter(1, 0)
+	exec := &recordingExecutor{
+		outputs: []string{"", "", "", "", ""},
+	}
+
+	ctx := context.Background()
+	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if err == nil {
+		t.Errorf("expected error after 5 unproductive streams")
+	}
+	if off != 0 {
+		t.Errorf("offset = %d, want 0", off)
+	}
+	if exec.callCount() != 5 {
+		t.Errorf("call count = %d, want 5", exec.callCount())
+	}
+}
+
+func TestStreamStateFile_ProductiveStreamResetsAttempts(t *testing.T) {
+	// A stream that delivers at least one line should reset the attempt
+	// counter, so subsequent unproductive cycles get their own retry budget.
+	// Sequence: 4 unproductive, 1 productive (1 line), 5 unproductive.
+	// Without the gate-on-routed fix, the 4 unproductive at the start would
+	// run away. With the fix, attempt accumulates to 4, productive resets it
+	// to 0, then the next 5 unproductive trip the cap.
+	rep := newTestReporter(1, 1)
+	productive := `{"event":"start","step":0,"name":"a","time":"t"}` + "\n"
+	exec := &recordingExecutor{
+		outputs: []string{
+			"", "", "", "",
+			productive,
+			"", "", "", "", "",
+		},
+	}
+
+	ctx := context.Background()
+	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	if err == nil {
+		t.Errorf("expected error after final unproductive run")
+	}
+	if off != 1 {
+		t.Errorf("offset = %d, want 1 (one productive line)", off)
+	}
+	if exec.callCount() != 10 {
+		t.Errorf("call count = %d, want 10", exec.callCount())
+	}
+}

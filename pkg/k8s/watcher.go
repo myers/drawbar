@@ -167,33 +167,29 @@ func streamStateFileWith(ctx context.Context, executor PodExecutor, namespace, p
 			"/shim/state.jsonl"}
 		stream, err := executor.ExecStream(ctx, namespace, podName, "runner", cmd)
 		if err != nil {
-			attempt++
-			if attempt >= maxAttempts {
+			if next, stop := backoffStep(ctx, &attempt, &backoff, maxAttempts, maxBackoff); stop {
 				slog.Error("state stream gave up after retries",
 					"lastOffset", lastOffset, "err", err)
 				return lastOffset, err
-			}
-			select {
-			case <-ctx.Done():
-				return lastOffset, ctx.Err()
-			case <-time.After(backoff):
-			}
-			if backoff < maxBackoff {
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
+			} else if next != nil {
+				return lastOffset, next
 			}
 			continue
 		}
-		// Successful connect: reset attempt counter and backoff.
-		attempt = 0
-		backoff = initialBackoff
 
+		// Connect succeeded. The attempt counter is reset only after we
+		// observe at least one full line — otherwise an immediate-EOF cycle
+		// would bypass the maxAttempts cap and busy-reconnect forever.
+		linesRead := 0
 		reader := bufio.NewReader(stream)
 		for {
 			line, rErr := reader.ReadString('\n')
 			if rErr == nil && len(line) > 0 {
+				if linesRead == 0 {
+					attempt = 0
+					backoff = initialBackoff
+				}
+				linesRead++
 				trimmed := strings.TrimRight(line, "\n\r")
 				if trimmed == "" {
 					lastOffset++
@@ -210,17 +206,50 @@ func streamStateFileWith(ctx context.Context, executor PodExecutor, namespace, p
 				lastOffset++
 				continue
 			}
-			// rErr != nil: close the stream and decide whether to reconnect.
 			stream.Close()
 			if errors.Is(rErr, context.Canceled) ||
 				errors.Is(rErr, context.DeadlineExceeded) {
 				return lastOffset, rErr
 			}
-			// Any other error (including io.EOF) → break inner loop and
-			// reconnect via the outer loop.
 			break
 		}
+
+		// If the stream produced no lines, treat it like a failed connect:
+		// rate-limit reconnects so we don't hammer the API during the
+		// startup race where state.jsonl doesn't yet exist.
+		if linesRead == 0 {
+			if next, stop := backoffStep(ctx, &attempt, &backoff, maxAttempts, maxBackoff); stop {
+				slog.Error("state stream produced no lines after retries",
+					"lastOffset", lastOffset)
+				return lastOffset, fmt.Errorf("state stream produced no lines after %d attempts", maxAttempts)
+			} else if next != nil {
+				return lastOffset, next
+			}
+		}
 	}
+}
+
+// backoffStep applies one step of bounded exponential backoff against attempt
+// and *backoff. Returns (nil, true) when maxAttempts is reached, (ctxErr,
+// false) on ctx-cancel during the sleep, (nil, false) otherwise. Mutates
+// *attempt and *backoff in place.
+func backoffStep(ctx context.Context, attempt *int, backoff *time.Duration, maxAttempts int, maxBackoff time.Duration) (error, bool) {
+	*attempt++
+	if *attempt >= maxAttempts {
+		return nil, true
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err(), false
+	case <-time.After(*backoff):
+	}
+	if *backoff < maxBackoff {
+		*backoff *= 2
+		if *backoff > maxBackoff {
+			*backoff = maxBackoff
+		}
+	}
+	return nil, false
 }
 
 // drainStateFile performs a single best-effort one-shot read of any state
