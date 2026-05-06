@@ -30,6 +30,7 @@ type Poller struct {
 	lastPollNs            atomic.Int64       // unix-nanos of the most recent FetchTask attempt to RETURN; 0 until first poll completes
 	lastSuccessfulFetchNs atomic.Int64       // unix-nanos of the most recent FetchTask that produced a real response (success or DeadlineExceeded); 0 until first such response
 	inFlight              atomic.Int64       // number of handler goroutines currently running
+	inBackoff             atomic.Bool        // true while the poll loop is sleeping inside waitBackoff
 }
 
 // workerState is per-Run scratch state: the cursor we send to the server,
@@ -188,6 +189,9 @@ func (p *Poller) fetchTask(ctx context.Context, s *workerState) (*runnerv1.Task,
 // consecutive empty/error counts. Returns false if the polling context
 // is cancelled while waiting.
 func (p *Poller) waitBackoff(ctx context.Context, s *workerState) bool {
+	p.inBackoff.Store(true)
+	defer p.inBackoff.Store(false)
+
 	base := p.client.FetchInterval()
 	n := s.consecutiveErrors
 	if s.consecutiveEmpty > n {
@@ -245,6 +249,14 @@ func (p *Poller) LastSuccessfulFetchAt() time.Time {
 // is legitimately busy with a long-running task (bug 013).
 func (p *Poller) InFlight() int64 {
 	return p.inFlight.Load()
+}
+
+// InBackoff reports whether the poll loop is currently sleeping inside
+// waitBackoff. /healthz uses this to suppress the poll-staleness 503
+// during a normal backoff cycle (bug 015): the goroutine is alive and
+// will resume on its own when the timer fires.
+func (p *Poller) InBackoff() bool {
+	return p.inBackoff.Load()
 }
 
 // Shutdown stops accepting new work and waits for in-flight handlers to

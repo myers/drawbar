@@ -493,6 +493,83 @@ func TestPoller_AcquireBeforeFetch(t *testing.T) {
 	cancel()
 }
 
+func TestPoller_InBackoff_FalseOnStartup(t *testing.T) {
+	mock := &mockPollerClient{interval: 10 * time.Millisecond}
+	p := NewPoller(mock, func(context.Context, *runnerv1.Task) {}, 1, time.Second, false, slog.Default())
+
+	assert.False(t, p.InBackoff(), "InBackoff must be false before Run starts")
+}
+
+func TestPoller_InBackoff_FlagDuringWait(t *testing.T) {
+	// First call returns an error so the poller enters waitBackoff;
+	// subsequent calls block on a channel we control so the goroutine
+	// stays inside the backoff sleep when we observe InBackoff().
+	gate := make(chan struct{})
+	mock := &errGatedClient{
+		interval: 50 * time.Millisecond,
+		errOnce:  errors.New("transport boom"),
+		gate:     gate,
+	}
+
+	p := NewPoller(mock, func(context.Context, *runnerv1.Task) {}, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	// The first FetchTask returns an error; waitBackoff is entered with
+	// d == base interval (50ms). Wait for the flag to go true.
+	deadline := time.Now().Add(2 * time.Second)
+	for !p.InBackoff() {
+		if time.Now().After(deadline) {
+			t.Fatal("InBackoff never went true")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel()
+	close(gate) // unblock any pending FetchTask call
+	<-done
+
+	assert.False(t, p.InBackoff(), "InBackoff must be false after Run returns")
+}
+
+// errGatedClient is a PollerClient that returns errOnce on its first call,
+// then blocks all subsequent calls on gate until the test closes it.
+type errGatedClient struct {
+	mu       sync.Mutex
+	interval time.Duration
+	errOnce  error
+	gate     chan struct{}
+	calls    int
+}
+
+func (c *errGatedClient) FetchTask(ctx context.Context, _ *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	if n == 1 {
+		return nil, c.errOnce
+	}
+	select {
+	case <-c.gate:
+		return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *errGatedClient) Endpoint() string             { return "" }
+func (c *errGatedClient) FetchInterval() time.Duration { return c.interval }
+func (c *errGatedClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+
 // giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
 // when the request's tasksVersion differs from the server's latestVersion.
 // Without this gating, the poller_test mock can't catch bug 012.
