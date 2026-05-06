@@ -530,6 +530,7 @@ func TestPoller_InBackoff_FlagDuringWait(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+	assert.True(t, p.InBackoff(), "InBackoff must be true while waitBackoff is sleeping")
 
 	cancel()
 	close(gate) // unblock any pending FetchTask call
