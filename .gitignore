@@ -33,3 +33,4 @@ Thumbs.db
 # MITM proxy cert (copied for Docker build)
 mitmproxy-ca-cert.crt
 /.claude
+/reference
