@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"time"
 )
 
 // tailArgs holds parsed flags for the `entrypoint tail` subcommand.
@@ -61,6 +62,10 @@ func parseTailArgs(argv []string) (tailArgs, error) {
 // runTail follows or one-shot reads the JSONL file at args.path, dropping the
 // first args.skip newline-terminated lines and writing the remainder verbatim
 // to out. Partial trailing lines (no \n) are never emitted.
+//
+// In follow mode (args.once == false) the function sleeps 50 ms on EOF and
+// retries, so new lines appended to the file flow out as they arrive. It exits
+// when ctx is cancelled, returning ctx.Err().
 func runTail(ctx context.Context, args tailArgs, out io.Writer) error {
 	f, err := os.Open(args.path)
 	if err != nil {
@@ -70,30 +75,56 @@ func runTail(ctx context.Context, args tailArgs, out io.Writer) error {
 
 	reader := bufio.NewReader(f)
 	skipped := 0
+	const followSleep = 50 * time.Millisecond
+
+	// pending accumulates partial-line bytes across EOF-sleep cycles until a
+	// '\n' arrives. bufio.Reader.ReadString consumes bytes into `line` when it
+	// returns (partial, io.EOF) — those bytes no longer exist in the reader's
+	// buffer, so we must carry them forward manually.
+	var pending []byte
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		line, rErr := reader.ReadString('\n')
-		hasFullLine := rErr == nil && line != ""
-		if hasFullLine {
+
+		// Full line (rErr == nil, line ends in '\n').
+		if rErr == nil && len(line) > 0 {
+			full := line
+			if len(pending) > 0 {
+				full = string(pending) + line
+				pending = nil
+			}
 			if skipped < args.skip {
 				skipped++
 				continue
 			}
-			if _, wErr := io.WriteString(out, line); wErr != nil {
+			if _, wErr := io.WriteString(out, full); wErr != nil {
 				return fmt.Errorf("writing line: %w", wErr)
 			}
 			continue
 		}
+
+		// EOF — may include a partial line in `line`.
 		if errors.Is(rErr, io.EOF) {
+			if line != "" {
+				// Partial bytes; carry them forward to be prepended once the
+				// line is completed by a future write.
+				pending = append(pending, line...)
+			}
 			if args.once {
+				// --once mode: discard any pending partial line and return.
 				return nil
 			}
-			// Follow mode arrives in Task 3. For now, treat as EOF return.
-			return nil
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(followSleep):
+			}
+			continue
 		}
+
 		return fmt.Errorf("reading: %w", rErr)
 	}
 }

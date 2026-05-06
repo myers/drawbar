@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseTailArgs_Defaults(t *testing.T) {
@@ -151,4 +154,127 @@ func TestRunTailOnce_NonexistentFile(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected error for nonexistent file")
 	}
+}
+
+func TestRunTailFollow_AppendsArriveLive(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "first\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var buf safeBuffer
+	done := make(chan error, 1)
+	go func() { done <- runTail(ctx, tailArgs{path: p}, &buf) }()
+
+	// Wait until we see "first\n".
+	waitFor(t, 1*time.Second, func() bool { return buf.String() == "first\n" })
+
+	// Append more lines while the tailer is running.
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString("second\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	waitFor(t, 1*time.Second, func() bool { return buf.String() == "first\nsecond\n" })
+
+	cancel()
+	<-done
+}
+
+func TestRunTailFollow_PartialLineCompletes(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var buf safeBuffer
+	done := make(chan error, 1)
+	go func() { done <- runTail(ctx, tailArgs{path: p}, &buf) }()
+
+	// Write a partial line (no \n).
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString("partial"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Confirm nothing emitted yet.
+	time.Sleep(150 * time.Millisecond)
+	if got := buf.String(); got != "" {
+		t.Errorf("buf = %q before newline; want empty", got)
+	}
+
+	// Complete the line.
+	if _, err := f.WriteString("-rest\n"); err != nil {
+		t.Fatalf("write rest: %v", err)
+	}
+	f.Close()
+
+	waitFor(t, 1*time.Second, func() bool { return buf.String() == "partial-rest\n" })
+
+	cancel()
+	<-done
+}
+
+func TestRunTailFollow_ContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "state.jsonl")
+	writeFile(t, p, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- runTail(ctx, tailArgs{path: p}, &bytes.Buffer{}) }()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("got err = %v, want context.Canceled", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("runTail did not exit after cancel")
+	}
+}
+
+// safeBuffer is bytes.Buffer guarded by a mutex; tests need to read while
+// runTail writes from another goroutine.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func waitFor(t *testing.T, timeout time.Duration, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("waitFor: predicate did not become true within %s", timeout)
 }
