@@ -279,15 +279,15 @@ type runTestExecutor struct {
 	idx     int
 }
 
-func (m *runTestExecutor) Exec(_ context.Context, _, _, _ string, _ []string) (string, error) {
+func (m *runTestExecutor) ExecStream(_ context.Context, _, _, _ string, _ []string) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	i := m.idx
 	m.idx++
 	if i < len(m.outputs) {
-		return m.outputs[i], nil
+		return io.NopCloser(strings.NewReader(m.outputs[i])), nil
 	}
-	return "", fmt.Errorf("container terminated")
+	return nil, fmt.Errorf("container terminated")
 }
 
 type runTestStreamer struct {

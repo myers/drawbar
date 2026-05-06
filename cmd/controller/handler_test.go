@@ -76,15 +76,15 @@ type mockExecutor struct {
 	idx     int
 }
 
-func (m *mockExecutor) Exec(_ context.Context, _, _, _ string, _ []string) (string, error) {
+func (m *mockExecutor) ExecStream(_ context.Context, _, _, _ string, _ []string) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	i := m.idx
 	m.idx++
 	if i < len(m.outputs) {
-		return m.outputs[i], nil
+		return io.NopCloser(strings.NewReader(m.outputs[i])), nil
 	}
-	return "", fmt.Errorf("container terminated")
+	return nil, fmt.Errorf("container terminated")
 }
 
 type mockStreamer struct {
@@ -648,14 +648,14 @@ jobs:
 
 // --- Shutdown recovery test ---
 
-// blockingExecutor blocks Exec calls until ctx.Done fires, then returns
+// blockingExecutor blocks ExecStream calls until ctx.Done fires, then returns
 // ctx.Err. Used to simulate a long-running pod that's still mid-execution
 // when the controller decides to shut down.
 type blockingExecutor struct{}
 
-func (blockingExecutor) Exec(ctx context.Context, _, _, _ string, _ []string) (string, error) {
+func (blockingExecutor) ExecStream(ctx context.Context, _, _, _ string, _ []string) (io.ReadCloser, error) {
 	<-ctx.Done()
-	return "", ctx.Err()
+	return nil, ctx.Err()
 }
 
 // blockingStreamer returns a reader that blocks on Read until ctx is cancelled.

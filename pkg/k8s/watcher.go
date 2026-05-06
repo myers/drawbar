@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,9 +21,10 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-// PodExecutor runs commands inside a pod container.
+// PodExecutor opens a streaming exec session against a pod container. The
+// returned reader streams stdout from the command. The caller MUST Close it.
 type PodExecutor interface {
-	Exec(ctx context.Context, namespace, pod, container string, cmd []string) (string, error)
+	ExecStream(ctx context.Context, namespace, pod, container string, cmd []string) (io.ReadCloser, error)
 }
 
 // LogStreamer opens a log stream for a container.
@@ -51,8 +51,8 @@ type SPDYExecutor struct {
 	RestCfg *rest.Config
 }
 
-func (s *SPDYExecutor) Exec(ctx context.Context, namespace, pod, container string, cmd []string) (string, error) {
-	return execInPod(ctx, s.Client, s.RestCfg, namespace, pod, container, cmd)
+func (s *SPDYExecutor) ExecStream(ctx context.Context, namespace, pod, container string, cmd []string) (io.ReadCloser, error) {
+	return execStream(ctx, s.Client, s.RestCfg, namespace, pod, container, cmd)
 }
 
 // K8sLogStreamer implements LogStreamer using the k8s log API.
@@ -126,6 +126,8 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 }
 
 // pollStateFileWith reads the entrypoint's state.jsonl file to track step lifecycle.
+// Interim implementation against the new streaming PodExecutor; will be replaced
+// by streamStateFileWith in a follow-up task.
 func pollStateFileWith(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter, poll time.Duration) error {
 	var lastOffset int
 
@@ -136,19 +138,20 @@ func pollStateFileWith(ctx context.Context, executor PodExecutor, namespace, pod
 		case <-time.After(poll):
 		}
 
-		// Read state file via exec.
-		output, err := executor.Exec(ctx, namespace, podName, "runner",
+		stream, err := executor.ExecStream(ctx, namespace, podName, "runner",
 			[]string{"cat", "/shim/state.jsonl"})
 		if err != nil {
-			// Container may have exited — that's OK.
 			if strings.Contains(err.Error(), "terminated") || strings.Contains(err.Error(), "not found") {
 				return nil
 			}
 			continue
 		}
-
-		// Parse new events since last read.
-		events, newOffset := parseStateEvents(output, lastOffset)
+		body, rErr := io.ReadAll(stream)
+		stream.Close()
+		if rErr != nil {
+			continue
+		}
+		events, newOffset := parseStateEvents(string(body), lastOffset)
 		for _, event := range events {
 			routeStateEvent(event, rep)
 		}
@@ -231,8 +234,10 @@ func routeStateEvent(event types.StateEvent, rep *reporter.Reporter) {
 	}
 }
 
-// execInPod runs a command in a running container and returns stdout.
-func execInPod(ctx context.Context, client kubernetes.Interface, restCfg *rest.Config, namespace, podName, container string, cmd []string) (string, error) {
+// execStream runs a command in a running container and returns a reader that
+// streams stdout. The command keeps running until it exits or the caller
+// closes the reader. Stderr is discarded.
+func execStream(ctx context.Context, client kubernetes.Interface, restCfg *rest.Config, namespace, podName, container string, cmd []string) (io.ReadCloser, error) {
 	req := client.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(podName).
@@ -247,17 +252,18 @@ func execInPod(ctx context.Context, client kubernetes.Interface, restCfg *rest.C
 
 	exec, err := remotecommand.NewSPDYExecutor(restCfg, "POST", req.URL())
 	if err != nil {
-		return "", fmt.Errorf("creating SPDY executor: %w", err)
+		return nil, fmt.Errorf("creating SPDY executor: %w", err)
 	}
 
-	var stdout bytes.Buffer
-	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-	})
-	if err != nil {
-		return "", err
-	}
-	return stdout.String(), nil
+	pr, pw := io.Pipe()
+	go func() {
+		err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+			Stdout: pw,
+		})
+		// Close the writer so the reader sees EOF (or the error).
+		pw.CloseWithError(err)
+	}()
+	return pr, nil
 }
 
 // getContainerResult checks the runner container's exit code.

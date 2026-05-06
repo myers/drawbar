@@ -23,23 +23,23 @@ import (
 // mockPodExecutor implements PodExecutor for testing.
 type mockPodExecutor struct {
 	mu      sync.Mutex
-	outputs []string // sequential outputs for each Exec call
+	outputs []string // sequential outputs for each ExecStream call
 	errs    []error
 	idx     int
 }
 
-func (m *mockPodExecutor) Exec(_ context.Context, _, _, _ string, _ []string) (string, error) {
+func (m *mockPodExecutor) ExecStream(_ context.Context, _, _, _ string, _ []string) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	i := m.idx
 	m.idx++
 	if i < len(m.errs) && m.errs[i] != nil {
-		return "", m.errs[i]
+		return nil, m.errs[i]
 	}
 	if i < len(m.outputs) {
-		return m.outputs[i], nil
+		return io.NopCloser(strings.NewReader(m.outputs[i])), nil
 	}
-	return "", fmt.Errorf("terminated")
+	return nil, fmt.Errorf("terminated")
 }
 
 // mockLogStreamer implements LogStreamer for testing.
