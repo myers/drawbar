@@ -612,6 +612,32 @@ func TestHealthzHandler_BothBranchesStale_PollLoopWins(t *testing.T) {
 	assert.Equal(t, "poll loop", wedgeKind)
 }
 
+func TestHealthzHandler_BackoffDoesNotSuppressSuccessfulFetchStaleness(t *testing.T) {
+	// During a backoff sleep, the loop is alive (inBackoff=true) so the
+	// poll-staleness branch is suppressed. The successful-fetch branch is
+	// NOT suppressed during backoff: if RPCs are returning errors for so
+	// long that lastSuccessfulFetch is stale, the transport really is not
+	// getting through and 503 is correct.
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	var inBackoff atomic.Bool
+	inBackoff.Store(true)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "successful fetch", wedgeKind)
+}
+
 func TestPollStalenessThreshold(t *testing.T) {
 	assert.Equal(t, 30*time.Second, pollStalenessThreshold(2*time.Second))
 	assert.Equal(t, 30*time.Second, pollStalenessThreshold(time.Second))
