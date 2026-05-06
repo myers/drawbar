@@ -290,10 +290,11 @@ func run(ctx context.Context, cfg *config.Config, deps runDeps) error {
 		"job_namespace", deps.namespace,
 		"poll_staleness_threshold", pollStaleness,
 		"success_fetch_staleness_threshold", successFetchStaleness,
+		"shutdown_timeout", cfg.Runner.ShutdownTimeout,
 	)
 	poller.Run(ctx)
-	slog.Info("poller stopped, draining in-flight tasks")
-	shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	slog.Info("poller stopped, draining in-flight tasks", "timeout", cfg.Runner.ShutdownTimeout)
+	shutCtx, cancel := context.WithTimeout(context.Background(), cfg.Runner.ShutdownTimeout)
 	defer cancel()
 	if err := poller.Shutdown(shutCtx); err != nil {
 		slog.Warn("shutdown drain ended early", "error", err)
