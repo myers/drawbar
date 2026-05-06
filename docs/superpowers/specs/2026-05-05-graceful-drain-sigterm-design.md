@@ -54,7 +54,7 @@ Add `Runner.ShutdownTimeout time.Duration` (yaml: `shutdown_timeout`) to `pkg/co
   1. `rep.AddLog("controller restart, results may be incomplete")`
   2. `rep.Close(shutdownReportCtx, runnerv1.Result_RESULT_FAILURE)` — push the failure to the forge using the still-live ctx.
   3. `cfg.K8sClient.BatchV1().Jobs(cfg.Namespace).Delete(shutdownReportCtx, created.Name, metav1.DeleteOptions{PropagationPolicy: &foreground})` — kill the surviving Job pod cleanly. Foreground propagation so the apiserver waits for the pod to terminate before deleting the Job, but the apiserver returns immediately; we don't block on pod death.
-  4. Skip the snapshot block (no point snapshotting a pod we just killed).
+  4. Skip snapshot *creation* (no point snapshotting a pod we just killed). Still call `cfg.SnapshotManager.DeletePVC(shutdownReportCtx, snapshotPVCName)` if a PVC was created — PVCs aren't owned by the k8s Job and would otherwise leak across controller restarts.
 - Wrap this whole recovery branch in a deferred `recover()` that logs the panic stack and returns cleanly. A panic here would crash the controller process before other handlers finish their drain.
 - Otherwise (success path or non-shutdown error), behavior unchanged.
 
