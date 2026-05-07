@@ -1,0 +1,113 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgejo-data
+  namespace: forgejo
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forgejo
+  namespace: forgejo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forgejo
+  template:
+    metadata:
+      labels:
+        app: forgejo
+    spec:
+      containers:
+        - name: forgejo
+          image: codeberg.org/forgejo/forgejo:14
+          ports:
+            - containerPort: 3000
+          env:
+            - name: USER_UID
+              value: "1000"
+            - name: USER_GID
+              value: "1000"
+            - name: FORGEJO__security__INSTALL_LOCK
+              value: "true"
+            - name: FORGEJO__server__HTTP_PORT
+              value: "3000"
+            - name: FORGEJO__server__ROOT_URL
+              value: "http://localhost:8080/"
+            - name: FORGEJO__server__DISABLE_SSH
+              value: "true"
+            - name: FORGEJO__server__START_SSH_SERVER
+              value: "false"
+            - name: FORGEJO__server__LFS_START_SERVER
+              value: "false"
+            - name: FORGEJO__database__DB_TYPE
+              value: "sqlite3"
+            - name: FORGEJO__database__PATH
+              value: "/data/gitea/forgejo.db"
+            - name: FORGEJO__service__DISABLE_REGISTRATION
+              value: "false"
+            - name: FORGEJO__service__REQUIRE_SIGNIN_VIEW
+              value: "false"
+            - name: FORGEJO__actions__ENABLED
+              value: "true"
+            - name: FORGEJO__actions__DEFAULT_ACTIONS_URL
+              value: "https://codeberg.org"
+            - name: FORGEJO__api__ENABLE_SWAGGER
+              value: "true"
+            - name: FORGEJO__log__LEVEL
+              value: "info"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/v1/version
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 250m
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: forgejo-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgejo
+  namespace: forgejo
+spec:
+  selector:
+    app: forgejo
+  ports:
+    - port: 80
+      targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: forgejo
+  namespace: forgejo
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: forgejo
+                port:
+                  number: 80

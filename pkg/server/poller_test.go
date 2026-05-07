@@ -1,0 +1,639 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"connectrpc.com/connect"
+	gouuid "github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+)
+
+// shutdownPoller waits for in-flight handlers via Shutdown with a graceful
+// timeout. Equivalent to the old Drain(timeout) for tests where we just
+// want the handlers to finish normally.
+func shutdownPoller(t *testing.T, p *Poller, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = p.Shutdown(ctx)
+}
+
+// mockPollerClient implements PollerClient for testing.
+type mockPollerClient struct {
+	mu        sync.Mutex
+	responses []*runnerv1.FetchTaskResponse
+	errs      []error
+	callCount int
+	endpoint  string
+	interval  time.Duration
+}
+
+func (m *mockPollerClient) FetchTask(_ context.Context, _ *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idx := m.callCount
+	m.callCount++
+	if idx < len(m.errs) && m.errs[idx] != nil {
+		return nil, m.errs[idx]
+	}
+	if idx < len(m.responses) {
+		return connect.NewResponse(m.responses[idx]), nil
+	}
+	return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
+}
+
+func (m *mockPollerClient) Endpoint() string             { return m.endpoint }
+func (m *mockPollerClient) FetchInterval() time.Duration { return m.interval }
+func (m *mockPollerClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+
+func TestPoller_DispatchesTask(t *testing.T) {
+	var handled atomic.Int64
+	handler := func(_ context.Context, task *runnerv1.Task) {
+		handled.Store(task.GetId())
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 42}}},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+	shutdownPoller(t, p, time.Second)
+
+	assert.Equal(t, int64(42), handled.Load())
+}
+
+func TestPoller_NoTask(t *testing.T) {
+	var count atomic.Int64
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		count.Add(1)
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{}},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	assert.Equal(t, int64(0), count.Load())
+}
+
+func TestPoller_FetchError_DeadlineExceeded(t *testing.T) {
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		errs:     []error{connect.NewError(connect.CodeDeadlineExceeded, nil)},
+	}
+
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	// Should not panic or crash.
+	p.Run(ctx)
+}
+
+func TestPoller_ContextCancellation(t *testing.T) {
+	mock := &mockPollerClient{interval: 10 * time.Millisecond}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+		// Good, returned promptly.
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+func TestShutdown_WaitsForTasks(t *testing.T) {
+	var finished atomic.Bool
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		time.Sleep(50 * time.Millisecond)
+		finished.Store(true)
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutCancel()
+	if err := p.Shutdown(shutCtx); err != nil {
+		t.Fatalf("Shutdown: want nil, got %v", err)
+	}
+
+	assert.True(t, finished.Load())
+}
+
+func TestPoller_Ephemeral(t *testing.T) {
+	var taskCount atomic.Int32
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		taskCount.Add(1)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{
+			{Task: &runnerv1.Task{Id: 1}},
+			{Task: &runnerv1.Task{Id: 2}}, // should never be picked up
+		},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, true, slog.Default())
+
+	start := time.Now()
+	p.Run(context.Background()) // should return after first task
+	shutdownPoller(t, p, time.Second)
+	elapsed := time.Since(start)
+
+	assert.Equal(t, int32(1), taskCount.Load(), "ephemeral mode should handle exactly one task")
+	assert.Less(t, elapsed, 2*time.Second, "should exit promptly after task completes")
+}
+
+func TestPoller_LastPollAt(t *testing.T) {
+	mock := &mockPollerClient{interval: 10 * time.Millisecond}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	// Before Run is called, LastPollAt is the zero time (never polled).
+	assert.True(t, p.LastPollAt().IsZero(), "LastPollAt should be zero before any poll")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	before := time.Now()
+	p.Run(ctx)
+	after := time.Now()
+
+	got := p.LastPollAt()
+	assert.False(t, got.IsZero(), "LastPollAt should be set after Run")
+	assert.False(t, got.Before(before), "LastPollAt %s should be >= test start %s", got, before)
+	assert.False(t, got.After(after), "LastPollAt %s should be <= test end %s", got, after)
+}
+
+func TestShutdown_Timeout(t *testing.T) {
+	started := make(chan struct{})
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		// Respect ctx so Shutdown's hard cancel can return.
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	// Run the poll loop with context.Background() so jobsCtx is not tied to
+	// any external cancellation — only Shutdown's hard cancel should fire it.
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	// Wait until the handler is running before calling Shutdown.
+	<-started
+
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer shutCancel()
+	start := time.Now()
+	err := p.Shutdown(shutCtx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Shutdown: want non-nil err on timeout, got nil")
+	}
+	assert.Less(t, elapsed, 500*time.Millisecond, "Shutdown should return promptly after cancelling handler")
+	<-runDone
+}
+
+func TestPoller_LastSuccessfulFetchAt_SuccessUpdatesBoth(t *testing.T) {
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{}, {}, {}},
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	// Both heartbeats are zero before any poll.
+	assert.True(t, p.LastPollAt().IsZero())
+	assert.True(t, p.LastSuccessfulFetchAt().IsZero())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	// After at least one successful fetch both timestamps should be set.
+	assert.False(t, p.LastPollAt().IsZero(), "LastPollAt should be set after a successful poll")
+	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "LastSuccessfulFetchAt should be set after a successful poll")
+}
+
+func TestPoller_LastSuccessfulFetchAt_TransportErrorOnlyUpdatesPoll(t *testing.T) {
+	// All FetchTask calls return a non-deadline error. lastPollNs should
+	// advance (the goroutine is alive and attempting RPCs); however
+	// lastSuccessfulFetchNs must NOT advance — that's what catches the wedge
+	// if h2 PINGs ever fail to detect a dead conn.
+	transportErr := connect.NewError(connect.CodeUnavailable, errors.New("transport error"))
+	// All errors share the same wedge mode, so it doesn't matter how many
+	// fire within the test window. The slice is oversized on purpose so
+	// the test doesn't depend on backoff arithmetic — only that the
+	// non-deadline error path runs at least once and lastSuccessfulFetchNs
+	// stays at its zero value.
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = transportErr
+	}
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		errs:     errs,
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	assert.False(t, p.LastPollAt().IsZero(), "poll heartbeat should advance even on errors")
+	assert.True(t, p.LastSuccessfulFetchAt().IsZero(), "successful-fetch heartbeat must not advance on transport errors")
+}
+
+func TestPoller_LastSuccessfulFetchAt_DeadlineExceededCounts(t *testing.T) {
+	// Long-poll's "no work" response is CodeDeadlineExceeded — that's still
+	// a healthy round trip and must update lastSuccessfulFetchNs.
+	deadlineErr := connect.NewError(connect.CodeDeadlineExceeded, errors.New("no tasks"))
+	errs := make([]error, 100)
+	for i := range errs {
+		errs[i] = deadlineErr
+	}
+	mock := &mockPollerClient{
+		interval: 10 * time.Millisecond,
+		errs:     errs,
+	}
+	handler := func(_ context.Context, _ *runnerv1.Task) {}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+
+	assert.False(t, p.LastPollAt().IsZero())
+	assert.False(t, p.LastSuccessfulFetchAt().IsZero(), "DeadlineExceeded is a successful round trip; should update")
+}
+
+func TestPoller_InFlight_TracksRunningHandlers(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-release
+	}
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go p.Run(ctx)
+
+	<-started
+	assert.Equal(t, int64(1), p.InFlight(), "handler running -> InFlight==1")
+	close(release)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && p.InFlight() != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	assert.Equal(t, int64(0), p.InFlight(), "handler returned -> InFlight==0")
+	cancel()
+}
+
+func TestPoller_Shutdown_GracefulDrain(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sawJobsCancel atomic.Bool
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		select {
+		case <-release:
+			// Graceful path: ctx should still be alive.
+			if ctx.Err() != nil {
+				sawJobsCancel.Store(true)
+			}
+		case <-ctx.Done():
+			sawJobsCancel.Store(true)
+		}
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	<-started
+	close(release)
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Shutdown(shutCtx); err != nil {
+		t.Fatalf("Shutdown: want nil, got %v", err)
+	}
+	if sawJobsCancel.Load() {
+		t.Fatal("graceful path: handler must not see jobsCtx cancellation")
+	}
+	<-runDone
+}
+
+func TestPoller_Shutdown_HardTimeout(t *testing.T) {
+	started := make(chan struct{})
+	var sawJobsCancel atomic.Bool
+	handler := func(ctx context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-ctx.Done()
+		sawJobsCancel.Store(true)
+	}
+
+	mock := &mockPollerClient{
+		interval:  10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{{Task: &runnerv1.Task{Id: 1}}},
+	}
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+
+	runDone := make(chan struct{})
+	go func() {
+		p.Run(context.Background())
+		close(runDone)
+	}()
+
+	<-started
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := p.Shutdown(shutCtx)
+	if err == nil {
+		t.Fatal("Shutdown: want non-nil err on timeout, got nil")
+	}
+	if !sawJobsCancel.Load() {
+		t.Fatal("hard path: handler must see jobsCtx cancellation")
+	}
+	<-runDone
+}
+
+// fetchCountingClient records every FetchTask call so a test can assert
+// the loop does NOT call FetchTask while at capacity.
+type fetchCountingClient struct {
+	mu        sync.Mutex
+	calls     int
+	responses []*runnerv1.FetchTaskResponse
+	idx       int
+	interval  time.Duration
+}
+
+func (c *fetchCountingClient) FetchTask(_ context.Context, _ *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.idx < len(c.responses) {
+		r := c.responses[c.idx]
+		c.idx++
+		return connect.NewResponse(r), nil
+	}
+	return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
+}
+func (c *fetchCountingClient) Endpoint() string             { return "" }
+func (c *fetchCountingClient) FetchInterval() time.Duration { return c.interval }
+func (c *fetchCountingClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+func (c *fetchCountingClient) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestPoller_AcquireBeforeFetch pins down the structural invariant: while
+// at capacity, the loop must NOT call FetchTask. Today's code violates
+// this — the test is expected to fail against pre-reshape code and pass
+// after Task 6.
+func TestPoller_AcquireBeforeFetch(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ *runnerv1.Task) {
+		close(started)
+		<-release
+	}
+
+	c := &fetchCountingClient{
+		interval: 10 * time.Millisecond,
+		responses: []*runnerv1.FetchTaskResponse{
+			{Task: &runnerv1.Task{Id: 1}},
+		},
+	}
+	p := NewPoller(c, handler, 1, time.Second, false, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	<-started
+
+	// Hold the handler busy for ~5 FetchInterval durations. The loop is
+	// blocked at the semaphore acquire, so no further FetchTask calls
+	// should fire while the slot is held — total stays at 1.
+	time.Sleep(50 * time.Millisecond)
+	if calls := c.Calls(); calls != 1 {
+		t.Fatalf("at capacity: want exactly 1 FetchTask call, got %d", calls)
+	}
+
+	close(release)
+	cancel()
+}
+
+func TestPoller_InBackoff_FalseOnStartup(t *testing.T) {
+	mock := &mockPollerClient{interval: 10 * time.Millisecond}
+	p := NewPoller(mock, func(context.Context, *runnerv1.Task) {}, 1, time.Second, false, slog.Default())
+
+	assert.False(t, p.InBackoff(), "InBackoff must be false before Run starts")
+}
+
+func TestPoller_InBackoff_FlagDuringWait(t *testing.T) {
+	// First call returns an error so the poller enters waitBackoff;
+	// subsequent calls block on a channel we control so the goroutine
+	// stays inside the backoff sleep when we observe InBackoff().
+	gate := make(chan struct{})
+	mock := &errGatedClient{
+		interval: 50 * time.Millisecond,
+		errOnce:  errors.New("transport boom"),
+		gate:     gate,
+	}
+
+	p := NewPoller(mock, func(context.Context, *runnerv1.Task) {}, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	// The first FetchTask returns an error; waitBackoff is entered with
+	// d == base interval (50ms). Wait for the flag to go true.
+	deadline := time.Now().Add(2 * time.Second)
+	for !p.InBackoff() {
+		if time.Now().After(deadline) {
+			t.Fatal("InBackoff never went true")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	assert.True(t, p.InBackoff(), "InBackoff must be true while waitBackoff is sleeping")
+
+	cancel()
+	close(gate) // unblock any pending FetchTask call
+	<-done
+
+	assert.False(t, p.InBackoff(), "InBackoff must be false after Run returns")
+}
+
+// errGatedClient is a PollerClient that returns errOnce on its first call,
+// then blocks all subsequent calls on gate until the test closes it.
+type errGatedClient struct {
+	mu       sync.Mutex
+	interval time.Duration
+	errOnce  error
+	gate     chan struct{}
+	calls    int
+}
+
+func (c *errGatedClient) FetchTask(ctx context.Context, _ *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	if n == 1 {
+		return nil, c.errOnce
+	}
+	select {
+	case <-c.gate:
+		return connect.NewResponse(&runnerv1.FetchTaskResponse{}), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *errGatedClient) Endpoint() string             { return "" }
+func (c *errGatedClient) FetchInterval() time.Duration { return c.interval }
+func (c *errGatedClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+
+// giteaLikePollerClient mirrors gitea's FetchTask gating: PickTask only runs
+// when the request's tasksVersion differs from the server's latestVersion.
+// Without this gating, the poller_test mock can't catch bug 012.
+type giteaLikePollerClient struct {
+	mu            sync.Mutex
+	queue         []*runnerv1.Task // FIFO of waiting tasks
+	latestVersion int64            // bumped on enqueue
+	requests      []int64          // tasksVersion seen on each FetchTask
+	interval      time.Duration
+}
+
+func (g *giteaLikePollerClient) enqueue(task *runnerv1.Task) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.queue = append(g.queue, task)
+	g.latestVersion++
+}
+
+func (g *giteaLikePollerClient) FetchTask(_ context.Context, req *connect.Request[runnerv1.FetchTaskRequest]) (*connect.Response[runnerv1.FetchTaskResponse], error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.requests = append(g.requests, req.Msg.GetTasksVersion())
+	resp := &runnerv1.FetchTaskResponse{TasksVersion: g.latestVersion}
+	if req.Msg.GetTasksVersion() != g.latestVersion && len(g.queue) > 0 {
+		resp.Task = g.queue[0]
+		g.queue = g.queue[1:]
+	}
+	return connect.NewResponse(resp), nil
+}
+
+func (g *giteaLikePollerClient) Endpoint() string             { return "" }
+func (g *giteaLikePollerClient) FetchInterval() time.Duration { return g.interval }
+func (g *giteaLikePollerClient) SetRequestKey(_ gouuid.UUID) func() {
+	return func() {}
+}
+
+// TestPoller_DoesNotLatchCursorOnEmptyResponse is the bug-012 regression test.
+// Two tasks are enqueued back-to-back (one push, two workflow files). The
+// poller picks up task 1, then keeps polling. The pre-fix code would latch
+// its cursor to gitea's latestVersion after every empty response — including
+// the empty response from gitea's "version unchanged" path — so task 2 would
+// never be delivered until something else bumped latestVersion. The fix:
+// only advance the cursor when a task is actually returned.
+func TestPoller_DoesNotLatchCursorOnEmptyResponse(t *testing.T) {
+	var handled []int64
+	var hmu sync.Mutex
+	handler := func(_ context.Context, task *runnerv1.Task) {
+		hmu.Lock()
+		defer hmu.Unlock()
+		handled = append(handled, task.GetId())
+	}
+
+	mock := &giteaLikePollerClient{interval: 10 * time.Millisecond}
+	mock.enqueue(&runnerv1.Task{Id: 71})
+	mock.enqueue(&runnerv1.Task{Id: 72})
+
+	p := NewPoller(mock, handler, 1, time.Second, false, slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+	shutdownPoller(t, p, time.Second)
+
+	hmu.Lock()
+	defer hmu.Unlock()
+	assert.Equal(t, []int64{71, 72}, handled, "both queued tasks must be delivered without an external version bump")
+}

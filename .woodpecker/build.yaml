@@ -1,0 +1,92 @@
+when:
+  - event: [pull_request, manual]
+  - event: push
+    branch: main
+
+steps:
+  - name: build
+    image: moby/buildkit:buildx-stable-1
+    environment:
+      BUILDKIT_HOST: tcp://buildkitd.woodpecker-jobs.svc:1234
+    commands:
+      - |
+        buildctl \
+          --tlscacert=/certs/ca.crt \
+          --tlscert=/certs/tls.crt \
+          --tlskey=/certs/tls.key \
+          build \
+          --frontend dockerfile.v0 \
+          --local context=. \
+          --local dockerfile=. \
+          --output type=image,name=fj.monoloco.net/${CI_REPO}:test-${CI_COMMIT_SHA:0:8},push=false
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: buildkit-client-certs
+            target:
+              file: /certs
+
+  - name: push-image
+    image: moby/buildkit:buildx-stable-1
+    environment:
+      BUILDKIT_HOST: tcp://buildkitd.woodpecker-jobs.svc:1234
+    commands:
+      - |
+        mkdir -p ~/.docker
+        env | grep '^REGISTRY_' > /tmp/reg.env
+        awk -F= '
+          /^REGISTRY_USER=/{u=$2}
+          /^REGISTRY_TOKEN=/{t=$2}
+          END {
+            cmd = "echo -n \"" u ":" t "\" | base64"
+            cmd | getline auth
+            close(cmd)
+            print "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"" auth "\"}}}"
+          }
+        ' /tmp/reg.env > ~/.docker/config.json
+      - |
+        buildctl \
+          --tlscacert=/certs/ca.crt \
+          --tlscert=/certs/tls.crt \
+          --tlskey=/certs/tls.key \
+          build \
+          --frontend dockerfile.v0 \
+          --local context=. \
+          --local dockerfile=. \
+          --output type=image,name=fj.monoloco.net/${CI_REPO}:${CI_COMMIT_BRANCH}-${CI_PIPELINE_CREATED}-${CI_COMMIT_SHA:0:8},push=true
+    when:
+      - event: push
+        branch: main
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: buildkit-client-certs
+            target:
+              file: /certs
+          - name: forgejo-registry-creds
+
+  - name: push-helm
+    image: alpine/helm:3.17.3
+    commands:
+      - |
+        mkdir -p ~/.config/helm/registry
+        env | grep '^REGISTRY_' > /tmp/reg.env
+        awk -F= '
+          /^REGISTRY_USER=/{u=$2}
+          /^REGISTRY_TOKEN=/{t=$2}
+          END {
+            cmd = "echo -n \"" u ":" t "\" | base64"
+            cmd | getline auth
+            close(cmd)
+            print "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"" auth "\"}}}"
+          }
+        ' /tmp/reg.env > ~/.config/helm/registry/config.json
+      - helm package deploy/helm/drawbar
+      - helm push drawbar-*.tgz oci://fj.monoloco.net/chaos-inc
+    when:
+      - event: push
+        branch: main
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: forgejo-registry-creds

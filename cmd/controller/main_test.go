@@ -1,0 +1,1029 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
+	"github.com/nektos/act/pkg/model"
+	"github.com/myers/drawbar/pkg/config"
+	"github.com/myers/drawbar/pkg/server"
+	"github.com/myers/drawbar/pkg/labels"
+	"github.com/myers/drawbar/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+)
+
+func TestTruncate(t *testing.T) {
+	tests := []struct {
+		name string
+		s    string
+		n    int
+		want string
+	}{
+		{"short", "hello", 10, "hello"},
+		{"exact", "hello", 5, "hello"},
+		{"long", "hello world", 5, "hello..."},
+		{"empty", "", 5, ""},
+		{"unicode", "こんにちは世界", 3, "こんに..."},
+		{"zero", "hello", 0, "..."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncate(tt.s, tt.n)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCleanupOrphanedJobs(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+
+	activeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "active-job",
+			Namespace: ns,
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "drawbar"},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	completedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "completed-job",
+			Namespace: ns,
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "drawbar"},
+		},
+		Status: batchv1.JobStatus{Active: 0},
+	}
+
+	client := fake.NewSimpleClientset(activeJob, completedJob)
+	cleanupOrphanedJobs(ctx, client, ns)
+
+	// Active job should be deleted.
+	jobs, err := client.BatchV1().Jobs(ns).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+
+	var remaining []string
+	for _, j := range jobs.Items {
+		remaining = append(remaining, j.Name)
+	}
+	assert.Contains(t, remaining, "completed-job")
+	assert.NotContains(t, remaining, "active-job")
+}
+
+func TestCleanupOrphanedJobs_NoJobs(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+	// Should not panic or error.
+	cleanupOrphanedJobs(ctx, client, "empty-ns")
+}
+
+// --- convertServices ---
+
+func TestConvertServices(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"postgres": {
+			Image: "postgres:16",
+			Env:   map[string]string{"POSTGRES_PASSWORD": "test"},
+			Ports: []string{"5432"},
+			Cmd:   []string{"postgres", "-c", "log_statement=all"},
+		},
+		"redis": {
+			Image: "redis:7",
+			Ports: []string{"6379"},
+		},
+		"empty": nil,
+		"no-image": {
+			Image: "",
+		},
+	}
+
+	result := convertServices(services)
+
+	// nil and empty image should be skipped.
+	assert.Len(t, result, 2)
+
+	names := map[string]bool{}
+	for _, svc := range result {
+		names[svc.Name] = true
+	}
+	assert.True(t, names["postgres"])
+	assert.True(t, names["redis"])
+}
+
+func TestConvertServices_InvalidPort(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"svc": {
+			Image: "alpine",
+			Ports: []string{"not-a-port", "8080"},
+		},
+	}
+	result := convertServices(services)
+	require.Len(t, result, 1)
+	// Only valid port should be included.
+	assert.Len(t, result[0].Ports, 1)
+	assert.Equal(t, int32(8080), result[0].Ports[0])
+}
+
+// --- buildArtifactEnv ---
+
+func TestBuildArtifactEnv(t *testing.T) {
+	t.Run("uses server URL", func(t *testing.T) {
+		env := make(map[string]string)
+		buildArtifactEnv(env, "https://gitea.example.com/", "")
+		assert.Equal(t, "https://gitea.example.com/api/actions_pipeline/", env["ACTIONS_RUNTIME_URL"])
+		assert.Equal(t, "https://gitea.example.com/", env["ACTIONS_RESULTS_URL"])
+	})
+	t.Run("gitCloneURL overrides", func(t *testing.T) {
+		env := make(map[string]string)
+		buildArtifactEnv(env, "https://public.example.com", "https://internal.example.com")
+		assert.Equal(t, "https://internal.example.com/api/actions_pipeline/", env["ACTIONS_RUNTIME_URL"])
+	})
+}
+
+// --- buildAptProxyEnv ---
+
+func TestBuildAptProxyEnv(t *testing.T) {
+	t.Run("populates HTTP proxy and no_proxy when URL set", func(t *testing.T) {
+		env := make(map[string]string)
+		buildAptProxyEnv(env, "http://apt-cache.gitea.svc:3142")
+		assert.Equal(t, "http://apt-cache.gitea.svc:3142", env["http_proxy"])
+		assert.Equal(t, "http://apt-cache.gitea.svc:3142", env["HTTP_PROXY"])
+		// HTTPS deliberately NOT proxied — apt-cacher-ng can't MITM TLS.
+		assert.Empty(t, env["https_proxy"])
+		assert.Empty(t, env["HTTPS_PROXY"])
+		// Pin the exact no_proxy string so accidental delimiter or ordering
+		// changes regress visibly. Leading-dot form gives suffix-match.
+		expectedNoProxy := "localhost,127.0.0.1,.svc,.cluster.local," +
+			".github.com,.githubusercontent.com," +
+			".monoloco.net," +
+			".docker.io,.docker.com," +
+			".ghcr.io," +
+			".crates.io"
+		assert.Equal(t, expectedNoProxy, env["no_proxy"])
+		assert.Equal(t, expectedNoProxy, env["NO_PROXY"])
+	})
+
+	t.Run("noop when URL empty", func(t *testing.T) {
+		env := map[string]string{"existing": "stay"}
+		buildAptProxyEnv(env, "")
+		assert.Equal(t, "stay", env["existing"])
+		assert.NotContains(t, env, "http_proxy")
+		assert.NotContains(t, env, "HTTP_PROXY")
+		assert.NotContains(t, env, "no_proxy")
+		assert.NotContains(t, env, "NO_PROXY")
+	})
+}
+
+// --- convertJobSecrets ---
+
+func TestConvertJobSecrets(t *testing.T) {
+	secrets := []config.JobSecret{
+		{Name: "my-secret", MountPath: "/secrets/my-secret"},
+		{Name: "env-secret", MountPath: ""},
+	}
+	mounts := convertJobSecrets(secrets)
+	require.Len(t, mounts, 2)
+	assert.Equal(t, "my-secret", mounts[0].Name)
+	assert.Equal(t, "/secrets/my-secret", mounts[0].MountPath)
+	assert.Equal(t, "", mounts[1].MountPath)
+}
+
+func TestConvertJobSecrets_Empty(t *testing.T) {
+	mounts := convertJobSecrets(nil)
+	assert.Nil(t, mounts)
+}
+
+// --- resolveJobImage ---
+
+func TestResolveJobImage_FromLabels(t *testing.T) {
+	l := labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")}
+	image := resolveJobImage(l, []string{"ubuntu-latest"}, nil)
+	assert.Equal(t, "node:24", image)
+}
+
+func TestResolveJobImage_ContainerOverride(t *testing.T) {
+	l := labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")}
+	container := &model.ContainerSpec{Image: "custom:latest"}
+	image := resolveJobImage(l, []string{"ubuntu-latest"}, container)
+	assert.Equal(t, "custom:latest", image)
+}
+
+func TestResolveJobImage_NilContainer(t *testing.T) {
+	l := labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")}
+	image := resolveJobImage(l, []string{"ubuntu-latest"}, nil)
+	assert.Equal(t, "node:24", image)
+}
+
+func TestResolveJobImage_EmptyContainerImage(t *testing.T) {
+	l := labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")}
+	container := &model.ContainerSpec{Image: ""}
+	image := resolveJobImage(l, []string{"ubuntu-latest"}, container)
+	assert.Equal(t, "node:24", image)
+}
+
+// --- collectSecrets ---
+
+// --- parseTimeoutMinutes ---
+
+func TestParseTimeoutMinutes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  float64
+	}{
+		{"", 0},
+		{"5", 5},
+		{"1.5", 1.5},
+		{"0", 0},
+		{"-1", 0},
+		{"invalid", 0},
+		{"120", 120},
+		{"0.1", 0.1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseTimeoutMinutes(tt.input)
+			assert.InDelta(t, tt.want, got, 0.001)
+		})
+	}
+}
+
+func TestCollectSecrets(t *testing.T) {
+	task := &runnerv1.Task{
+		Secrets: map[string]string{
+			"MY_SECRET": "secret-value",
+		},
+		Context: &structpb.Struct{
+			Fields: map[string]*structpb.Value{
+				"token":                structpb.NewStringValue("github-token"),
+				"gitea_runtime_token":  structpb.NewStringValue("runtime-token"),
+			},
+		},
+	}
+
+	secrets := collectSecrets(task)
+	assert.Contains(t, secrets, "secret-value")
+	assert.Contains(t, secrets, "github-token")
+	assert.Contains(t, secrets, "runtime-token")
+}
+
+// --- healthzHandler ---
+//
+// Signature reminder for these tests:
+//
+//   healthzHandler(lastPoll, lastSuccessfulFetch, inFlight, inBackoff,
+//                  pollStaleness, successFetchStaleness, capacity, onWedge)
+//
+// The "always idle" defaults below: inFlight=0, inBackoff=false, capacity=1.
+// Tests that exercise the new guards override these explicitly.
+
+func neverInBackoff() bool { return false }
+
+func TestHealthzHandler_BothFresh(t *testing.T) {
+	now := time.Now()
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok", w.Body.String())
+}
+
+func TestHealthzHandler_NoPollYet(t *testing.T) {
+	handler := healthzHandler(
+		func() time.Time { return time.Time{} },
+		func() time.Time { return time.Time{} },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestHealthzHandler_StalePoll(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	handler := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "poll loop stale")
+}
+
+func TestHealthzHandler_StaleSuccessfulFetch(t *testing.T) {
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "successful fetch stale")
+}
+
+func TestHealthzHandler_StaleSuccessfulFetch_ZeroIgnored(t *testing.T) {
+	now := time.Now()
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return time.Time{} },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1, nil,
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestHealthzHandler_OnWedgeFiresOnce(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	var calls atomic.Int32
+	handler := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
+		func(_ string, _, _ time.Duration) { calls.Add(1) },
+	)
+	for range 5 {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	}
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHealthzHandler_OnWedgeFiresForSuccessfulFetchStaleness(t *testing.T) {
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	var calls atomic.Int32
+	handler := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
+		func(_ string, _, _ time.Duration) { calls.Add(1) },
+	)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestHealthzHandler_OnWedgePassesKind(t *testing.T) {
+	t.Run("poll", func(t *testing.T) {
+		stale := time.Now().Add(-time.Hour)
+		now := time.Now()
+		var gotKind string
+		handler := healthzHandler(
+			func() time.Time { return stale },
+			func() time.Time { return now },
+			func() int64 { return 0 },
+			neverInBackoff,
+			30*time.Second, 5*time.Minute, 1,
+			func(kind string, _, _ time.Duration) { gotKind = kind },
+		)
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, "poll loop", gotKind)
+	})
+
+	t.Run("successful fetch", func(t *testing.T) {
+		now := time.Now()
+		stale := time.Now().Add(-time.Hour)
+		var gotKind string
+		handler := healthzHandler(
+			func() time.Time { return now },
+			func() time.Time { return stale },
+			func() int64 { return 0 },
+			neverInBackoff,
+			30*time.Second, 5*time.Minute, 1,
+			func(kind string, _, _ time.Duration) { gotKind = kind },
+		)
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		w := httptest.NewRecorder()
+		handler(w, req)
+		assert.Equal(t, "successful fetch", gotKind)
+	})
+}
+
+// TestHealthzHandler_BusySuppressesStaleness covers bug 013's existing
+// behavior: while a handler is in flight, the poll-staleness 503 is
+// suppressed. With the bug 014 fix layered on, the same in-flight state
+// also satisfies the inFlight==capacity successful-fetch suppression at
+// capacity 1, so this test runs against capacity=1 and confirms BOTH
+// branches stay 200 while busy and the poll-stale branch trips when idle.
+func TestHealthzHandler_BusySuppressesStaleness(t *testing.T) {
+	pollStale := 50 * time.Millisecond
+	succStale := time.Hour
+	pollT := time.Now().Add(-time.Hour)
+	var inFlight atomic.Int64
+
+	var wedgeKind string
+	onWedge := func(kind string, _, _ time.Duration) { wedgeKind = kind }
+
+	h := healthzHandler(
+		func() time.Time { return pollT },
+		func() time.Time { return time.Now() },
+		inFlight.Load,
+		neverInBackoff,
+		pollStale, succStale, 1,
+		onWedge,
+	)
+
+	inFlight.Store(1)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("busy poll-stale: want 200, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "" {
+		t.Fatalf("busy: onWedge must not fire, got %q", wedgeKind)
+	}
+
+	inFlight.Store(0)
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("idle poll-stale: want 503, got %d (%q)", rec.Code, rec.Body.String())
+	}
+	if wedgeKind != "poll loop" {
+		t.Fatalf("idle: want wedgeKind=poll loop, got %q", wedgeKind)
+	}
+}
+
+// --- New tests for bugs 014 and 015 ---
+
+func TestHealthzHandler_BackoffSuppressesPollStaleness(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	var inBackoff atomic.Bool
+	inBackoff.Store(true)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "in-backoff must suppress poll-stale 503")
+	assert.Equal(t, "", wedgeKind, "onWedge must not fire while in backoff")
+}
+
+func TestHealthzHandler_BackoffEndsExposesStaleness(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	now := time.Now()
+	var inBackoff atomic.Bool
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return now },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+
+	inBackoff.Store(true)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	inBackoff.Store(false)
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "poll loop", wedgeKind)
+}
+
+func TestHealthzHandler_AtCapacitySuppressesSuccessfulFetch(t *testing.T) {
+	cases := []struct {
+		name     string
+		capacity int64
+	}{
+		{"cap1", 1},
+		{"cap2", 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			stale := time.Now().Add(-time.Hour)
+
+			var wedgeKind string
+			h := healthzHandler(
+				func() time.Time { return now },
+				func() time.Time { return stale },
+				func() int64 { return tc.capacity }, // inFlight == capacity
+				neverInBackoff,
+				30*time.Second, 5*time.Minute, tc.capacity,
+				func(kind string, _, _ time.Duration) { wedgeKind = kind },
+			)
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			assert.Equal(t, http.StatusOK, rec.Code, "at-capacity must suppress successful-fetch 503")
+			assert.Equal(t, "", wedgeKind)
+		})
+	}
+}
+
+func TestHealthzHandler_BelowCapacityExposesSuccessfulFetch(t *testing.T) {
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 1 }, // inFlight < capacity (capacity 2)
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 2,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "successful fetch", wedgeKind)
+}
+
+func TestHealthzHandler_BothBranchesStale_PollLoopWins(t *testing.T) {
+	// inFlight=0, inBackoff=false, both heartbeats stale. Poll-loop branch
+	// is evaluated first and wins (matches existing dumpOnce semantics).
+	stale := time.Now().Add(-time.Hour)
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return stale },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		neverInBackoff,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "poll loop", wedgeKind)
+}
+
+func TestHealthzHandler_BackoffDoesNotSuppressSuccessfulFetchStaleness(t *testing.T) {
+	// During a backoff sleep, the loop is alive (inBackoff=true) so the
+	// poll-staleness branch is suppressed. The successful-fetch branch is
+	// NOT suppressed during backoff: if RPCs are returning errors for so
+	// long that lastSuccessfulFetch is stale, the transport really is not
+	// getting through and 503 is correct.
+	now := time.Now()
+	stale := time.Now().Add(-time.Hour)
+	var inBackoff atomic.Bool
+	inBackoff.Store(true)
+
+	var wedgeKind string
+	h := healthzHandler(
+		func() time.Time { return now },
+		func() time.Time { return stale },
+		func() int64 { return 0 },
+		inBackoff.Load,
+		30*time.Second, 5*time.Minute, 1,
+		func(kind string, _, _ time.Duration) { wedgeKind = kind },
+	)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "successful fetch", wedgeKind)
+}
+
+func TestPollStalenessThreshold(t *testing.T) {
+	assert.Equal(t, 30*time.Second, pollStalenessThreshold(2*time.Second))
+	assert.Equal(t, 30*time.Second, pollStalenessThreshold(time.Second))
+	assert.Equal(t, 100*time.Second, pollStalenessThreshold(10*time.Second))
+	assert.Equal(t, 5*time.Minute, pollStalenessThreshold(30*time.Second))
+}
+
+func TestSuccessFetchStalenessThreshold(t *testing.T) {
+	// Floor of 2 minutes — successful-fetch staleness is the slower detector;
+	// it should tolerate a brief outage before tripping the probe.
+	assert.Equal(t, 2*time.Minute, successFetchStalenessThreshold(2*time.Second))
+	assert.Equal(t, 2*time.Minute, successFetchStalenessThreshold(10*time.Second))
+	// 10x interval applies above the floor.
+	assert.Equal(t, 5*time.Minute, successFetchStalenessThreshold(30*time.Second))
+	assert.Equal(t, 10*time.Minute, successFetchStalenessThreshold(time.Minute))
+}
+
+// --- readyzHandler ---
+
+func TestReadyzHandler_Ready(t *testing.T) {
+	var registered atomic.Bool
+	registered.Store(true)
+	handler := readyzHandler(&registered)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestReadyzHandler_NotReady(t *testing.T) {
+	var registered atomic.Bool
+	registered.Store(false)
+	handler := readyzHandler(&registered)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+// --- metricsHandler ---
+
+func TestMetricsHandler(t *testing.T) {
+	var active atomic.Int64
+	active.Store(2)
+	handler := metricsHandler(&active, 3)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/active-jobs", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"active":2,"capacity":3}`, w.Body.String())
+}
+
+func TestMetricsHandler_Zero(t *testing.T) {
+	var active atomic.Int64
+	handler := metricsHandler(&active, 1)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/active-jobs", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	assert.JSONEq(t, `{"active":0,"capacity":1}`, w.Body.String())
+}
+
+// --- startCacheServer ---
+
+func TestStartCacheServer(t *testing.T) {
+	cacheDir := t.TempDir()
+	cfg := config.CacheConfig{
+		Enabled: true,
+		Dir:     cacheDir,
+		Port:    0,
+	}
+
+	handler, err := startCacheServer(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, handler)
+	defer handler.Close()
+
+	assert.NotEmpty(t, handler.ExternalURL())
+	_, err = os.Stat(cacheDir)
+	assert.NoError(t, err)
+}
+
+// --- setupLogging / parseLabels ---
+
+func TestSetupLogging(t *testing.T) {
+	for _, level := range []string{"debug", "info", "warn", "error", ""} {
+		logger := setupLogging(level)
+		assert.NotNil(t, logger)
+	}
+}
+
+func TestParseLabels(t *testing.T) {
+	labels, err := parseLabels([]string{"ubuntu:docker://node:24", "self:host"})
+	require.NoError(t, err)
+	assert.Len(t, labels, 2)
+}
+
+func TestParseLabels_Invalid(t *testing.T) {
+	_, err := parseLabels([]string{"bad:invalidscheme"})
+	assert.Error(t, err)
+}
+
+// --- parseFlags ---
+
+func TestParseFlags_Defaults(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	f, err := parseFlags(fs, []string{})
+	require.NoError(t, err)
+	assert.Equal(t, "config.yaml", f.ConfigPath)
+	assert.Equal(t, "", f.CredentialFile)
+	assert.Equal(t, "drawbar", f.SecretName)
+	assert.Equal(t, "", f.SecretNamespace)
+	assert.Equal(t, "", f.Kubeconfig)
+	assert.Equal(t, "", f.JobNamespace)
+}
+
+func TestParseFlags_AllSet(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	f, err := parseFlags(fs, []string{
+		"-config", "/etc/runner.yaml",
+		"-credential-file", "/creds.json",
+		"-secret-name", "my-secret",
+		"-secret-namespace", "runner-ns",
+		"-kubeconfig", "/home/user/.kube/config",
+		"-job-namespace", "jobs",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/etc/runner.yaml", f.ConfigPath)
+	assert.Equal(t, "/creds.json", f.CredentialFile)
+	assert.Equal(t, "my-secret", f.SecretName)
+	assert.Equal(t, "runner-ns", f.SecretNamespace)
+	assert.Equal(t, "/home/user/.kube/config", f.Kubeconfig)
+	assert.Equal(t, "jobs", f.JobNamespace)
+}
+
+func TestParseFlags_UnknownFlag(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	_, err := parseFlags(fs, []string{"-unknown-flag"})
+	assert.Error(t, err)
+}
+
+// --- resolveNamespace ---
+
+func TestResolveNamespace(t *testing.T) {
+	assert.Equal(t, "explicit", resolveNamespace("explicit", "fallback"))
+	assert.Equal(t, "fallback", resolveNamespace("", "fallback"))
+}
+
+// --- createStore ---
+
+func TestCreateStore_FileStore(t *testing.T) {
+	store := createStore("/path/to/creds.json", nil, "ns", "secret")
+	_, ok := store.(*server.FileStore)
+	assert.True(t, ok)
+}
+
+func TestCreateStore_SecretStore(t *testing.T) {
+	k8sClient := fake.NewSimpleClientset()
+	store := createStore("", k8sClient, "runner-ns", "runner-secret")
+	ss, ok := store.(*server.SecretStore)
+	assert.True(t, ok)
+	assert.Equal(t, "runner-ns", ss.Namespace)
+	assert.Equal(t, "runner-secret", ss.Name)
+}
+
+func TestCollectSecrets_NoContext(t *testing.T) {
+	task := &runnerv1.Task{
+		Secrets: map[string]string{"A": "val-a"},
+	}
+	secrets := collectSecrets(task)
+	assert.Contains(t, secrets, "val-a")
+}
+
+// --- buildGitHubEnv ---
+
+func TestBuildGitHubEnv(t *testing.T) {
+	taskCtx := map[string]*structpb.Value{
+		"server_url":       structpb.NewStringValue("https://gitea.example.com"),
+		"repository":       structpb.NewStringValue("myorg/myrepo"),
+		"repository_owner": structpb.NewStringValue("myorg"),
+		"run_id":           structpb.NewStringValue("42"),
+		"sha":              structpb.NewStringValue("abc123"),
+		"ref":              structpb.NewStringValue("refs/heads/main"),
+		"event_name":       structpb.NewStringValue("push"),
+		"token":            structpb.NewStringValue("secret-token"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	assert.Equal(t, "https://gitea.example.com", env["GITHUB_SERVER_URL"])
+	assert.Equal(t, "myorg/myrepo", env["GITHUB_REPOSITORY"])
+	assert.Equal(t, "myorg", env["GITHUB_REPOSITORY_OWNER"])
+	assert.Equal(t, "42", env["GITHUB_RUN_ID"])
+	assert.Equal(t, "abc123", env["GITHUB_SHA"])
+	assert.Equal(t, "refs/heads/main", env["GITHUB_REF"])
+	assert.Equal(t, "push", env["GITHUB_EVENT_NAME"])
+	assert.Equal(t, "secret-token", env["GITHUB_TOKEN"])
+}
+
+func TestBuildGitHubEnv_OIDC(t *testing.T) {
+	taskCtx := map[string]*structpb.Value{
+		"server_url": structpb.NewStringValue("https://gitea.example.com"),
+		"forgejo_actions_id_token_request_token": structpb.NewStringValue("oidc-jwt-token"),
+		"forgejo_actions_id_token_request_url":   structpb.NewStringValue("https://gitea.example.com/api/actions/_apis/pipelines/workflows/1/idtoken"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	assert.Equal(t, "oidc-jwt-token", env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"])
+	assert.Equal(t, "https://gitea.example.com/api/actions/_apis/pipelines/workflows/1/idtoken", env["ACTIONS_ID_TOKEN_REQUEST_URL"])
+}
+
+func TestBuildGitHubEnv_OIDC_NotPresent(t *testing.T) {
+	// When Gitea doesn't inject OIDC fields (disabled or fork PR), env vars should be absent.
+	taskCtx := map[string]*structpb.Value{
+		"server_url": structpb.NewStringValue("https://gitea.example.com"),
+		"token":      structpb.NewStringValue("test-token"),
+	}
+
+	env := make(map[string]string)
+	buildGitHubEnv(env, taskCtx)
+
+	_, hasToken := env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+	_, hasURL := env["ACTIONS_ID_TOKEN_REQUEST_URL"]
+	assert.False(t, hasToken, "OIDC token should not be set when not in context")
+	assert.False(t, hasURL, "OIDC URL should not be set when not in context")
+}
+
+func TestBuildGitHubEnv_EmptyContext(t *testing.T) {
+	env := make(map[string]string)
+	buildGitHubEnv(env, map[string]*structpb.Value{})
+	// No keys should be set for missing context values.
+	assert.Empty(t, env)
+}
+
+// --- BuildKit auto-detection ---
+
+func TestIsBuildKitImage(t *testing.T) {
+	assert.True(t, isBuildKitImage("moby/buildkit:rootless"))
+	assert.True(t, isBuildKitImage("moby/buildkit:latest"))
+	assert.True(t, isBuildKitImage("docker.io/moby/buildkit:v0.20"))
+	assert.False(t, isBuildKitImage("postgres:16"))
+	assert.False(t, isBuildKitImage("alpine"))
+}
+
+func TestConvertServices_BuildKitAutoDetect(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"buildkit": {
+			Image: "moby/buildkit:rootless",
+			Ports: []string{"1234"},
+		},
+	}
+
+	result := convertServices(services)
+	require.Len(t, result, 1)
+	svc := result[0]
+
+	// Should have custom SecurityContext with unconfined seccomp.
+	require.NotNil(t, svc.SecurityContext)
+	require.NotNil(t, svc.SecurityContext.SeccompProfile)
+	assert.Equal(t, corev1.SeccompProfileTypeUnconfined, svc.SecurityContext.SeccompProfile.Type)
+
+	// AppArmor stays at runtime-default; userns isolates rootlesskit's mounts
+	// from the host AppArmor profile. The nil assertion guards against
+	// reintroducing the override.
+	assert.Nil(t, svc.SecurityContext.AppArmorProfile, "BuildKit sidecar should not pin AppArmor (userns handles isolation)")
+
+	// Should have SETUID+SETGID caps added.
+	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETUID"))
+	assert.Contains(t, svc.SecurityContext.Capabilities.Add, corev1.Capability("SETGID"))
+
+	// Should inject --oci-worker-no-process-sandbox and --addr as Args.
+	assert.Contains(t, svc.Args, "--oci-worker-no-process-sandbox")
+	assert.Contains(t, svc.Args, "--addr=tcp://0.0.0.0:1234")
+
+	// Cmd should remain empty (don't override image entrypoint).
+	assert.Empty(t, svc.Cmd)
+}
+
+func TestConvertServices_BuildKitNoDoubleInject(t *testing.T) {
+	services := map[string]*model.ContainerSpec{
+		"buildkit": {
+			Image: "moby/buildkit:rootless",
+			Ports: []string{"1234"},
+			Cmd:   []string{"--oci-worker-no-process-sandbox"},
+		},
+	}
+
+	result := convertServices(services)
+	require.Len(t, result, 1)
+
+	// The Cmd is set by the user (override entrypoint); Args should
+	// still get the flag since user set it in Cmd, not Args.
+	// But the auto-detect checks Args, so it will add it.
+	count := 0
+	for _, arg := range result[0].Args {
+		if arg == "--oci-worker-no-process-sandbox" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "should not double-inject in Args")
+}
+
+func TestExtractCacheInfo_AcceptsAllShapes(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "target\n~/.cargo/registry\n/var/cache/apt",
+		},
+	}}
+	key, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if key != "k" {
+		t.Errorf("key: got %q, want %q", key, "k")
+	}
+	want := []string{"target", "~/.cargo/registry", "/var/cache/apt"}
+	if len(paths) != len(want) {
+		t.Fatalf("paths len: got %d, want %d", len(paths), len(want))
+	}
+	for i, p := range want {
+		if paths[i] != p {
+			t.Errorf("paths[%d]: got %q, want %q", i, paths[i], p)
+		}
+	}
+}
+
+func TestExtractCacheInfo_RejectsTraversal(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "../escape",
+		},
+	}}
+	_, _, _, err := extractCacheInfo(steps)
+	if err == nil {
+		t.Fatal("expected error for ../ traversal")
+	}
+}
+
+func TestExtractCacheInfo_RejectsTraversalInMiddle(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "good/../bad",
+		},
+	}}
+	_, _, _, err := extractCacheInfo(steps)
+	if err == nil {
+		t.Fatal("expected error for embedded ../")
+	}
+}
+
+func TestExtractCacheInfo_DedupesPaths(t *testing.T) {
+	steps := []types.StepSpec{{
+		Env: map[string]string{
+			"INPUT_KEY":  "k",
+			"INPUT_PATH": "target\ntarget\n~/.cargo\n~/.cargo",
+		},
+	}}
+	_, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Errorf("expected dedup to 2 paths, got %d: %v", len(paths), paths)
+	}
+}
+
+func TestExtractCacheInfo_NoCacheStep(t *testing.T) {
+	steps := []types.StepSpec{{Env: map[string]string{}}}
+	key, paths, _, err := extractCacheInfo(steps)
+	if err != nil {
+		t.Fatalf("extractCacheInfo: %v", err)
+	}
+	if key != "" || len(paths) != 0 {
+		t.Errorf("expected empty result, got key=%q paths=%v", key, paths)
+	}
+}
+
