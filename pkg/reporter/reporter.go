@@ -10,6 +10,7 @@ import (
 
 	runnerv1 "code.gitea.io/actions-proto-go/runner/v1"
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -182,6 +183,7 @@ func (r *Reporter) flushLogs(ctx context.Context, noMore bool) error {
 	r.mu.Lock()
 	rows := make([]*runnerv1.LogRow, len(r.logRows))
 	copy(rows, r.logRows)
+	offset := r.logOffset
 	r.mu.Unlock()
 
 	if len(rows) == 0 && !noMore {
@@ -190,7 +192,7 @@ func (r *Reporter) flushLogs(ctx context.Context, noMore bool) error {
 
 	resp, err := r.client.UpdateLog(ctx, connect.NewRequest(&runnerv1.UpdateLogRequest{
 		TaskId: r.taskID,
-		Index:  int64(r.logOffset),
+		Index:  int64(offset),
 		Rows:   rows,
 		NoMore: noMore,
 	}))
@@ -218,8 +220,7 @@ func (r *Reporter) flushState(ctx context.Context) error {
 	r.mu.Lock()
 	steps := make([]*runnerv1.StepState, len(r.state.Steps))
 	for i, s := range r.state.Steps {
-		clone := *s
-		steps[i] = &clone
+		steps[i] = proto.Clone(s).(*runnerv1.StepState)
 	}
 	state := &runnerv1.TaskState{
 		Id:        r.state.Id,
@@ -297,7 +298,9 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 			slog.Warn("final log flush failed, retrying",
 				"attempt", attempt+1, "error", err)
 			lastErr = err
-			time.Sleep(backoff)
+			if err := waitOrCancel(ctx, backoff); err != nil {
+				return fmt.Errorf("close interrupted: %w", err)
+			}
 			backoff *= 2
 			continue
 		}
@@ -306,7 +309,9 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 			slog.Warn("final state flush failed, retrying",
 				"attempt", attempt+1, "error", err)
 			lastErr = err
-			time.Sleep(backoff)
+			if err := waitOrCancel(ctx, backoff); err != nil {
+				return fmt.Errorf("close interrupted: %w", err)
+			}
 			backoff *= 2
 			continue
 		}
@@ -315,4 +320,16 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 	}
 
 	return fmt.Errorf("failed to send final report after retries: %w", lastErr)
+}
+
+// waitOrCancel sleeps for d, or returns ctx.Err() early if ctx is cancelled.
+func waitOrCancel(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

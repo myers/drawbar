@@ -1,7 +1,15 @@
 # Reporter has a data race on `r.logOffset` and ignores ctx during Close retries
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1
-(synthetic whole-codebase audit). Two findings in
+**Status: resolved 2026-05-06.** Both findings fixed in
+`pkg/reporter/reporter.go`: `flushLogs` now snapshots `logOffset` under
+the same lock that copies `logRows`; `Close`'s retry loop replaces
+`time.Sleep` with a ctx-aware `waitOrCancel`. Confirmed by a new
+`TestReporter_ConcurrentFlushNoRace` (race detector clean) and
+`TestReporter_CloseHonorsCtxCancel` (returns within ms of ctx cancel
+instead of ~100s).
+
+**Original status: filed.** Surfaced 2026-05-06 via `/ultrareview` run
+on PR #1 (synthetic whole-codebase audit). Two findings in
 `pkg/reporter/reporter.go`, both about how the reporter behaves when
 things go wrong (concurrent flush, retry-on-shutdown).
 

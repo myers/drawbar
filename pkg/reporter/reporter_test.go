@@ -354,6 +354,87 @@ func TestReporter_SetSecrets_MasksLogs(t *testing.T) {
 	assert.Equal(t, "token is *** here", calls[0].Rows[0].Content)
 }
 
+// TestReporter_CloseHonorsCtxCancel exercises bug 017 finding B: when ctx is
+// cancelled during Close's retry loop, the loop must return promptly instead
+// of sleeping through up to ~100s of cumulative backoff.
+func TestReporter_CloseHonorsCtxCancel(t *testing.T) {
+	mc := newMockClient()
+	mc.logErr = fmt.Errorf("network error") // every flush fails — retry forever (until ctx)
+	rep := New(mc, 1, 0, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel ctx after a short delay so Close is mid-retry-sleep when the
+	// signal arrives. With a 100ms initial backoff doubling, the second
+	// retry's sleep is 200ms; we cancel during the first sleep.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := rep.Close(ctx, runnerv1.Result_RESULT_SUCCESS)
+	elapsed := time.Since(start)
+
+	require.Error(t, err) // ctx cancel surfaces as an error
+	// Without the fix Close would sleep through the full backoff schedule
+	// (~100s). With the fix it returns within a fraction of a second of
+	// the cancel.
+	assert.Less(t, elapsed, 500*time.Millisecond,
+		"Close should return promptly after ctx cancel, took %s", elapsed)
+}
+
+// TestReporter_ConcurrentFlushNoRace exercises bug 017 finding A: a concurrent
+// flush must not race on r.logOffset. The first flush is held inside UpdateLog
+// while a second flush starts; without the fix the second flush reads
+// r.logOffset while the first is about to write it, which `go test -race` will
+// detect.
+func TestReporter_ConcurrentFlushNoRace(t *testing.T) {
+	mc := &mockClient{
+		taskResp: &runnerv1.UpdateTaskResponse{},
+		ackFunc: func(req *runnerv1.UpdateLogRequest) int64 {
+			return req.Index + int64(len(req.Rows))
+		},
+	}
+
+	// Gate the first UpdateLog call inside the RPC so the second Flush
+	// runs concurrently with the first one's post-RPC write of logOffset.
+	released := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	originalAck := mc.ackFunc
+	mc.ackFunc = func(req *runnerv1.UpdateLogRequest) int64 {
+		select {
+		case entered <- struct{}{}:
+			<-released
+		default:
+			// Subsequent calls run normally.
+		}
+		return originalAck(req)
+	}
+
+	rep := New(mc, 1, 1, time.Hour)
+	rep.StartStep(0)
+	rep.AddLog("line0")
+
+	done := make(chan error, 2)
+	go func() { done <- rep.Flush(context.Background()) }()
+
+	// Wait for the first flush to be inside UpdateLog.
+	<-entered
+
+	// Second flush starts while the first is parked inside the RPC; both
+	// read r.logOffset, the first then writes it under lock — race.
+	go func() { done <- rep.Flush(context.Background()) }()
+
+	// Give the second goroutine a chance to reach the unprotected read.
+	time.Sleep(20 * time.Millisecond)
+	close(released)
+
+	for range 2 {
+		require.NoError(t, <-done)
+	}
+}
+
 func TestNewLogMasker_MixedLengths(t *testing.T) {
 	m := newLogMasker([]string{"ab", "long-secret", "x"})
 	require.NotNil(t, m) // "long-secret" qualifies
