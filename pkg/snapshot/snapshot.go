@@ -143,16 +143,43 @@ func newestSnapshot(items []snapshotv1.VolumeSnapshot) *snapshotv1.VolumeSnapsho
 	return latest
 }
 
+// PVCOption configures optional fields on PVCs created by the Manager.
+type PVCOption func(*pvcOptions)
+
+type pvcOptions struct {
+	labels map[string]string
+}
+
+// WithLabel attaches an arbitrary label to a PVC at creation. The standard
+// labelManagedBy label is always applied and cannot be overridden via
+// WithLabel — callers can tag PVCs (e.g. by task-id for orphan cleanup)
+// without risk of clobbering the manager's identity label.
+func WithLabel(key, value string) PVCOption {
+	return func(o *pvcOptions) {
+		if o.labels == nil {
+			o.labels = map[string]string{}
+		}
+		o.labels[key] = value
+	}
+}
+
+func applyPVCOptions(opts []PVCOption) pvcOptions {
+	var o pvcOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // CreatePVCFromSnapshot creates a PVC backed by a VolumeSnapshot (ZFS clone).
-// extraLabels are merged onto the standard labelManagedBy label and let
-// callers tag the PVC for later lookup (e.g. by task-id during orphan cleanup).
-func (m *Manager) CreatePVCFromSnapshot(ctx context.Context, snapshot *snapshotv1.VolumeSnapshot, pvcName string, extraLabels map[string]string) (*corev1.PersistentVolumeClaim, error) {
+func (m *Manager) CreatePVCFromSnapshot(ctx context.Context, snapshot *snapshotv1.VolumeSnapshot, pvcName string, opts ...PVCOption) (*corev1.PersistentVolumeClaim, error) {
 	size := resource.MustParse(m.PVCSize)
+	o := applyPVCOptions(opts)
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
 			Namespace: m.Namespace,
-			Labels:    mergeLabels(extraLabels, map[string]string{labelManagedBy: managerName}),
+			Labels:    mergeLabels(o.labels, map[string]string{labelManagedBy: managerName}),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -177,15 +204,14 @@ func (m *Manager) CreatePVCFromSnapshot(ctx context.Context, snapshot *snapshotv
 }
 
 // CreateEmptyPVC creates a fresh PVC for a cache miss.
-// extraLabels are merged onto the standard labelManagedBy label and let
-// callers tag the PVC for later lookup (e.g. by task-id during orphan cleanup).
-func (m *Manager) CreateEmptyPVC(ctx context.Context, pvcName string, extraLabels map[string]string) (*corev1.PersistentVolumeClaim, error) {
+func (m *Manager) CreateEmptyPVC(ctx context.Context, pvcName string, opts ...PVCOption) (*corev1.PersistentVolumeClaim, error) {
 	size := resource.MustParse(m.PVCSize)
+	o := applyPVCOptions(opts)
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
 			Namespace: m.Namespace,
-			Labels:    mergeLabels(extraLabels, map[string]string{labelManagedBy: managerName}),
+			Labels:    mergeLabels(o.labels, map[string]string{labelManagedBy: managerName}),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},

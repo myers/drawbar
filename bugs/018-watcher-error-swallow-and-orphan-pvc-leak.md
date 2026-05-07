@@ -7,12 +7,26 @@ just touched. Same domain (watcher / cleanup), same diagnostic toolkit
 
 **Resolution.**
 - Finding A: `watchJobWith` now inspects the streamLogs error. On a non-EOF
-  error it calls a new `waitForContainerTerminated` helper (bounded 30s)
-  before reading exit code, so a still-running container doesn't get
-  reported as `runner container status not found` / `RESULT_FAILURE`.
+  error it calls a new `waitForContainerTerminated` helper (bounded by
+  `WatchConfig.LogErrorTerminationTimeout`, default 30s) **before**
+  cancelling the live state stream and draining `state.jsonl`. Order matters:
+  the state goroutine keeps consuming events live during the wait, so step
+  start/end events written while the container finishes are captured in
+  real time rather than relying on the best-effort one-shot drain. The
+  helper treats `Pod NotFound` and `Phase=Failed` as terminal so it doesn't
+  spin until timeout when the pod is truly gone.
 - Finding B: snapshot-cache PVCs are now labeled with `drawbar.dev/task-id`
   at creation. `cleanupOrphanedJobs` deletes any matching PVC alongside
-  each orphaned Job, so controller restarts don't leak cache PVCs.
+  each orphaned Job, so controller restarts don't leak cache PVCs. The
+  PVC delete may stall in `Terminating` until the still-running pod is
+  reaped via the Job's background propagation, at which point the
+  `kubernetes.io/pvc-protection` finalizer clears and the queued PVC
+  delete proceeds.
+
+**Upgrade caveat.** PVCs created by older controllers (no
+`drawbar.dev/task-id` label) won't be matched on the first restart after
+upgrade. drawbar is alpha and CLAUDE.md notes there are no in-flight users
+to protect, so a one-shot legacy sweep is intentionally not implemented.
 
 ## Finding A — `watchJobWith` swallows non-EOF log-stream errors and reports the job failed
 

@@ -369,6 +369,13 @@ func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, names
 // Called for each orphaned Job so the snapshot-cache PVC bound to that job
 // (cache-<taskID>, see makeTaskHandler) does not survive a controller
 // restart and accumulate over time.
+//
+// The Job above is deleted with DeletePropagationBackground, so the pod is
+// reaped asynchronously. The PVC delete request lands while the pod still
+// mounts the PVC, leaving the PVC in Terminating until the
+// kubernetes.io/pvc-protection finalizer clears once the pod stops mounting
+// it — at which point the queued PVC delete proceeds. We don't block
+// waiting for that here.
 func cleanupOrphanedCachePVCs(ctx context.Context, client kubernetes.Interface, namespace, taskID string) {
 	selector := fmt.Sprintf("app.kubernetes.io/managed-by=drawbar,drawbar.dev/task-id=%s", taskID)
 	pvcs, err := client.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{
@@ -810,13 +817,11 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 				// Tag the PVC with the task-id so cleanupOrphanedJobs can find
 				// and delete leftover PVCs after a controller restart that
 				// occurred while a task was running (bug 018, finding B).
-				pvcLabels := map[string]string{
-					"drawbar.dev/task-id": fmt.Sprintf("%d", task.GetId()),
-				}
+				taskIDLabel := snapshot.WithLabel("drawbar.dev/task-id", fmt.Sprintf("%d", task.GetId()))
 				if snap != nil {
-					_, err = cfg.SnapshotManager.CreatePVCFromSnapshot(ctx, snap, pvcName, pvcLabels)
+					_, err = cfg.SnapshotManager.CreatePVCFromSnapshot(ctx, snap, pvcName, taskIDLabel)
 				} else {
-					_, err = cfg.SnapshotManager.CreateEmptyPVC(ctx, pvcName, pvcLabels)
+					_, err = cfg.SnapshotManager.CreateEmptyPVC(ctx, pvcName, taskIDLabel)
 				}
 				if err != nil {
 					slog.Warn("failed to create snapshot cache PVC", "error", err)

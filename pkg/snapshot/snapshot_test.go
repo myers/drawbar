@@ -78,7 +78,7 @@ func TestCreatePVCFromSnapshot(t *testing.T) {
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	pvc, err := m.CreatePVCFromSnapshot(ctx, snap, "workspace-42", nil)
+	pvc, err := m.CreatePVCFromSnapshot(ctx, snap, "workspace-42")
 	require.NoError(t, err)
 	assert.Equal(t, "workspace-42", pvc.Name)
 	assert.Equal(t, "VolumeSnapshot", pvc.Spec.DataSource.Kind)
@@ -90,7 +90,7 @@ func TestCreatePVCFromSnapshot(t *testing.T) {
 	assert.Equal(t, managerName, got.Labels[labelManagedBy])
 }
 
-func TestCreatePVCFromSnapshot_ExtraLabels(t *testing.T) {
+func TestCreatePVCFromSnapshot_WithLabel(t *testing.T) {
 	m, k8sClient, snapClient := newTestManager()
 	ctx := context.Background()
 
@@ -99,9 +99,8 @@ func TestCreatePVCFromSnapshot_ExtraLabels(t *testing.T) {
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	_, err = m.CreatePVCFromSnapshot(ctx, snap, "workspace-43", map[string]string{
-		"drawbar.dev/task-id": "43",
-	})
+	_, err = m.CreatePVCFromSnapshot(ctx, snap, "workspace-43",
+		WithLabel("drawbar.dev/task-id", "43"))
 	require.NoError(t, err)
 
 	got, err := k8sClient.CoreV1().PersistentVolumeClaims("test-ns").Get(ctx, "workspace-43", metav1.GetOptions{})
@@ -114,7 +113,7 @@ func TestCreateEmptyPVC(t *testing.T) {
 	m, k8sClient, _ := newTestManager()
 	ctx := context.Background()
 
-	pvc, err := m.CreateEmptyPVC(ctx, "workspace-empty", nil)
+	pvc, err := m.CreateEmptyPVC(ctx, "workspace-empty")
 	require.NoError(t, err)
 	assert.Equal(t, "workspace-empty", pvc.Name)
 	assert.Nil(t, pvc.Spec.DataSource) // no snapshot source
@@ -124,15 +123,33 @@ func TestCreateEmptyPVC(t *testing.T) {
 	assert.Equal(t, managerName, got.Labels[labelManagedBy])
 }
 
-func TestCreateEmptyPVC_ExtraLabelsCannotClobberManagedBy(t *testing.T) {
+func TestCreateEmptyPVC_MultipleWithLabel(t *testing.T) {
+	// Two distinct WithLabel calls must produce two distinct labels —
+	// neither overwrites the other, and both coexist with the always-set
+	// labelManagedBy default.
 	m, k8sClient, _ := newTestManager()
 	ctx := context.Background()
 
-	// Try to override the managed-by label via extraLabels — defaults must win.
-	_, err := m.CreateEmptyPVC(ctx, "workspace-clobber", map[string]string{
-		labelManagedBy:        "evil",
-		"drawbar.dev/task-id": "99",
-	})
+	_, err := m.CreateEmptyPVC(ctx, "workspace-multi",
+		WithLabel("drawbar.dev/task-id", "1"),
+		WithLabel("drawbar.dev/run-id", "rid-7"))
+	require.NoError(t, err)
+
+	got, err := k8sClient.CoreV1().PersistentVolumeClaims("test-ns").Get(ctx, "workspace-multi", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "1", got.Labels["drawbar.dev/task-id"])
+	assert.Equal(t, "rid-7", got.Labels["drawbar.dev/run-id"])
+	assert.Equal(t, managerName, got.Labels[labelManagedBy])
+}
+
+func TestCreateEmptyPVC_WithLabelCannotClobberManagedBy(t *testing.T) {
+	m, k8sClient, _ := newTestManager()
+	ctx := context.Background()
+
+	// Attempt to override the managed-by label via WithLabel — defaults win.
+	_, err := m.CreateEmptyPVC(ctx, "workspace-clobber",
+		WithLabel(labelManagedBy, "evil"),
+		WithLabel("drawbar.dev/task-id", "99"))
 	require.NoError(t, err)
 
 	got, err := k8sClient.CoreV1().PersistentVolumeClaims("test-ns").Get(ctx, "workspace-clobber", metav1.GetOptions{})
@@ -164,7 +181,7 @@ func TestDeletePVC(t *testing.T) {
 	ctx := context.Background()
 
 	// Create then delete.
-	_, err := m.CreateEmptyPVC(ctx, "to-delete", nil)
+	_, err := m.CreateEmptyPVC(ctx, "to-delete")
 	require.NoError(t, err)
 
 	err = m.DeletePVC(ctx, "to-delete")

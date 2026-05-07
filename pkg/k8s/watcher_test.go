@@ -932,3 +932,98 @@ func TestWatchJobWith_LogStreamErrorWaitsForTermination(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, result)
 }
+
+// TestWatchJobWith_EOFSkipsWait locks in the EOF path: when streamLogs
+// returns nil (clean EOF), watchJobWith must NOT route through
+// waitForContainerTerminated. The pod here stays Running with no Terminated
+// state — if the wait branch were entered we'd see the wrap error
+// "waiting for container after log stream failure"; instead we expect the
+// existing "runner container status not found" from getContainerResult.
+func TestWatchJobWith_EOFSkipsWait(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ns := "default"
+	jobName := "eof-job"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "eof-pod", Namespace: ns,
+			Labels: map[string]string{"job-name": jobName},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "runner",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}},
+		},
+	}
+	_, err := client.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	executor := &mockPodExecutor{errs: []error{fmt.Errorf("terminated")}}
+	logStreamer := &mockLogStreamer{content: "build output\n"} // returns clean EOF
+	rep := newTestReporter(1, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// LogErrorTerminationTimeout is set short so a regression (wait branch
+	// incorrectly entered on EOF) surfaces the wrap-error message in well
+	// under the 2s parent ctx, instead of racing the ctx deadline.
+	_, err = watchJobWith(ctx, client, executor, logStreamer, ns, jobName, rep,
+		WatchConfig{
+			PollInterval:               20 * time.Millisecond,
+			LogErrorTerminationTimeout: 100 * time.Millisecond,
+		})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "runner container status not found")
+	assert.NotContains(t, err.Error(), "waiting for container after log stream failure")
+}
+
+func TestWaitForContainerTerminated_PodNotFound(t *testing.T) {
+	// Empty fake clientset — the pod doesn't exist. The helper should treat
+	// NotFound as terminal and return nil so getContainerResult's existing
+	// diagnostic surfaces, rather than timing out with "did not terminate".
+	client := fake.NewSimpleClientset()
+
+	err := waitForContainerTerminated(context.Background(), client, "default", "ghost-pod", "runner",
+		200*time.Millisecond, 10*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestWaitForContainerTerminated_PodPhaseFailed(t *testing.T) {
+	// Pod evicted: Phase=Failed but the runner container's State is still
+	// Running (eviction races the container state). The helper should treat
+	// Phase=Failed as terminal — the pod is dead and won't update further.
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "runner", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		},
+	})
+
+	err := waitForContainerTerminated(context.Background(), client, "default", "pod1", "runner",
+		200*time.Millisecond, 10*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestWaitForContainerTerminated_PodPhaseSucceeded(t *testing.T) {
+	// Symmetric to the Failed test: Phase=Succeeded with runner still
+	// reported as Running. Helper should treat the pod as terminal rather
+	// than spin to timeout.
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "runner", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		},
+	})
+
+	err := waitForContainerTerminated(context.Background(), client, "default", "pod1", "runner",
+		200*time.Millisecond, 10*time.Millisecond)
+	assert.NoError(t, err)
+}
