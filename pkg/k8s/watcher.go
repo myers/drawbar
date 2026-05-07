@@ -120,8 +120,12 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 		stateDone <- streamResult{offset: off, err: sErr}
 	}()
 
-	// Wait for log streaming to finish (container exits).
-	<-logDone
+	// Wait for log streaming to finish. streamLogs returns nil on EOF (the
+	// expected "container exited" path) and a non-EOF error on any read
+	// failure mid-stream — apiserver GOAWAY, network reset, watch closed.
+	// The latter does not imply the container exited; the runner may still
+	// be running. Treat the two cases differently below.
+	logErr := <-logDone
 
 	// Stop the live state streamer and pick up its final offset.
 	cancelStream()
@@ -129,6 +133,18 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 
 	// Authoritatively drain anything written after the last streamed line.
 	drainStateFile(ctx, executor, namespace, podName, rep, res.offset)
+
+	// If the log stream broke mid-job, the container may still be running.
+	// Wait (bounded) for it to actually terminate before reading exit code,
+	// otherwise getContainerResult sees Running and returns "runner container
+	// status not found" — reporting a still-executing job as failed.
+	if logErr != nil && !errors.Is(logErr, io.EOF) {
+		slog.Warn("log stream ended before EOF, waiting for container to terminate",
+			"pod", podName, "err", logErr)
+		if waitErr := waitForContainerTerminated(ctx, client, namespace, podName, "runner", 30*time.Second, cfg.PollInterval); waitErr != nil {
+			return runnerv1.Result_RESULT_FAILURE, fmt.Errorf("waiting for container after log stream failure: %w", waitErr)
+		}
+	}
 
 	// Determine result from container exit code.
 	result, err := getContainerResult(ctx, client, namespace, podName)
@@ -457,6 +473,38 @@ func waitForContainerRunning(ctx context.Context, client kubernetes.Interface, n
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-time.After(poll):
+		}
+	}
+}
+
+// waitForContainerTerminated waits up to timeout for the named container to
+// reach State.Terminated. Returns nil once terminated, ctx.Err() on cancel,
+// or a deadline error if the container never terminates within timeout. Used
+// by watchJobWith to guard getContainerResult after a mid-stream log error,
+// where the container may still be running and a naive read would falsely
+// report "runner container status not found".
+func waitForContainerTerminated(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string, timeout, poll time.Duration) error {
+	if poll <= 0 {
+		poll = 500 * time.Millisecond
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		pod, err := client.CoreV1().Pods(namespace).Get(waitCtx, podName, metav1.GetOptions{})
+		if err == nil {
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.Name == containerName && cs.State.Terminated != nil {
+					return nil
+				}
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return fmt.Errorf("container %s did not terminate within %s", containerName, timeout)
+			}
+			return waitCtx.Err()
 		case <-time.After(poll):
 		}
 	}

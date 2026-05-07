@@ -332,6 +332,11 @@ func parseLabels(rawLabels []string) (labels.Labels, error) {
 	return parsed, nil
 }
 
+// cleanupOrphanedJobs sweeps Jobs left over from a previous controller
+// process that died mid-task (controller restart while a task was running).
+// Jobs are matched by managed-by label; each active orphan is deleted, along
+// with any snapshot-cache PVC tagged with the same drawbar.dev/task-id —
+// without the PVC sweep, every controller restart-during-task leaks one PVC.
 func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, namespace string) {
 	jobs, err := client.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app.kubernetes.io/managed-by=drawbar",
@@ -343,11 +348,40 @@ func cleanupOrphanedJobs(ctx context.Context, client kubernetes.Interface, names
 
 	propagation := metav1.DeletePropagationBackground
 	for _, job := range jobs.Items {
-		if job.Status.Active > 0 {
-			slog.Info("cleaning up orphaned job", "job", job.Name)
-			_ = client.BatchV1().Jobs(namespace).Delete(ctx, job.Name, metav1.DeleteOptions{
-				PropagationPolicy: &propagation,
-			})
+		if job.Status.Active == 0 {
+			continue
+		}
+		slog.Info("cleaning up orphaned job", "job", job.Name)
+		if err := client.BatchV1().Jobs(namespace).Delete(ctx, job.Name, metav1.DeleteOptions{
+			PropagationPolicy: &propagation,
+		}); err != nil {
+			slog.Warn("failed to delete orphaned job", "job", job.Name, "error", err)
+		}
+		taskID := job.Labels["drawbar.dev/task-id"]
+		if taskID == "" {
+			continue
+		}
+		cleanupOrphanedCachePVCs(ctx, client, namespace, taskID)
+	}
+}
+
+// cleanupOrphanedCachePVCs deletes any PVC tagged with the given task-id.
+// Called for each orphaned Job so the snapshot-cache PVC bound to that job
+// (cache-<taskID>, see makeTaskHandler) does not survive a controller
+// restart and accumulate over time.
+func cleanupOrphanedCachePVCs(ctx context.Context, client kubernetes.Interface, namespace, taskID string) {
+	selector := fmt.Sprintf("app.kubernetes.io/managed-by=drawbar,drawbar.dev/task-id=%s", taskID)
+	pvcs, err := client.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		slog.Warn("failed to list orphaned cache PVCs", "task_id", taskID, "error", err)
+		return
+	}
+	for _, pvc := range pvcs.Items {
+		slog.Info("cleaning up orphaned cache PVC", "pvc", pvc.Name, "task_id", taskID)
+		if err := client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{}); err != nil {
+			slog.Warn("failed to delete orphaned cache PVC", "pvc", pvc.Name, "task_id", taskID, "error", err)
 		}
 	}
 }
@@ -773,10 +807,16 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 				if err != nil {
 					slog.Warn("snapshot lookup failed", "error", err)
 				}
+				// Tag the PVC with the task-id so cleanupOrphanedJobs can find
+				// and delete leftover PVCs after a controller restart that
+				// occurred while a task was running (bug 018, finding B).
+				pvcLabels := map[string]string{
+					"drawbar.dev/task-id": fmt.Sprintf("%d", task.GetId()),
+				}
 				if snap != nil {
-					_, err = cfg.SnapshotManager.CreatePVCFromSnapshot(ctx, snap, pvcName)
+					_, err = cfg.SnapshotManager.CreatePVCFromSnapshot(ctx, snap, pvcName, pvcLabels)
 				} else {
-					_, err = cfg.SnapshotManager.CreateEmptyPVC(ctx, pvcName)
+					_, err = cfg.SnapshotManager.CreateEmptyPVC(ctx, pvcName, pvcLabels)
 				}
 				if err != nil {
 					slog.Warn("failed to create snapshot cache PVC", "error", err)

@@ -91,6 +91,123 @@ func TestCleanupOrphanedJobs_NoJobs(t *testing.T) {
 	cleanupOrphanedJobs(ctx, client, "empty-ns")
 }
 
+// TestCleanupOrphanedJobs_DeletesCachePVC covers bug 018, finding B: an
+// orphaned Job's matching snapshot-cache PVC must be deleted alongside the
+// Job, otherwise every controller-restart-during-task leaks a PVC.
+func TestCleanupOrphanedJobs_DeletesCachePVC(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+
+	activeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "active-job",
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "drawbar",
+				"drawbar.dev/task-id":          "42",
+			},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	cachePVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-42",
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "drawbar",
+				"drawbar.dev/task-id":          "42",
+			},
+		},
+	}
+	// Unrelated PVC — must not be touched.
+	otherPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-7",
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "drawbar",
+				"drawbar.dev/task-id":          "7",
+			},
+		},
+	}
+
+	client := fake.NewSimpleClientset(activeJob, cachePVC, otherPVC)
+	cleanupOrphanedJobs(ctx, client, ns)
+
+	// Job and the matching PVC are gone.
+	_, err := client.BatchV1().Jobs(ns).Get(ctx, "active-job", metav1.GetOptions{})
+	assert.Error(t, err)
+	_, err = client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, "cache-42", metav1.GetOptions{})
+	assert.Error(t, err)
+
+	// Unrelated PVC survives.
+	_, err = client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, "cache-7", metav1.GetOptions{})
+	assert.NoError(t, err)
+}
+
+// TestCleanupOrphanedJobs_NoTaskIDLabel ensures we degrade gracefully when an
+// older job (no drawbar.dev/task-id label) is swept — the Job still gets
+// deleted; we just can't identify a PVC to clean up.
+func TestCleanupOrphanedJobs_NoTaskIDLabel(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+
+	activeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "legacy-job",
+			Namespace: ns,
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "drawbar"},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	client := fake.NewSimpleClientset(activeJob)
+	cleanupOrphanedJobs(ctx, client, ns)
+
+	_, err := client.BatchV1().Jobs(ns).Get(ctx, "legacy-job", metav1.GetOptions{})
+	assert.Error(t, err)
+}
+
+// TestCleanupOrphanedJobs_CompletedJobLeavesPVC: cleanupOrphanedJobs only
+// targets Jobs with Active > 0 (still-running orphans). A completed Job and
+// its PVC are out of scope — TTLSecondsAfterFinished and the in-handler
+// DeletePVC are responsible for those, not this sweep.
+func TestCleanupOrphanedJobs_CompletedJobLeavesPVC(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+
+	completedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "completed-job",
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "drawbar",
+				"drawbar.dev/task-id":          "99",
+			},
+		},
+		Status: batchv1.JobStatus{Active: 0},
+	}
+	cachePVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-99",
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "drawbar",
+				"drawbar.dev/task-id":          "99",
+			},
+		},
+	}
+
+	client := fake.NewSimpleClientset(completedJob, cachePVC)
+	cleanupOrphanedJobs(ctx, client, ns)
+
+	// Both still present — out of scope for this sweep.
+	_, err := client.BatchV1().Jobs(ns).Get(ctx, "completed-job", metav1.GetOptions{})
+	assert.NoError(t, err)
+	_, err = client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, "cache-99", metav1.GetOptions{})
+	assert.NoError(t, err)
+}
+
 // --- convertServices ---
 
 func TestConvertServices(t *testing.T) {

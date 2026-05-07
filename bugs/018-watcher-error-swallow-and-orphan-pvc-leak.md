@@ -1,9 +1,18 @@
 # `watchJobWith` reports false failure on transient log-stream errors, and orphaned-job cleanup leaks the snapshot-cache PVC
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
+**Status: fixed 2026-05-07.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
 Two findings on the controller-side k8s lifecycle path that bug 016
 just touched. Same domain (watcher / cleanup), same diagnostic toolkit
 (kube event timing, pod state, PVC ownership).
+
+**Resolution.**
+- Finding A: `watchJobWith` now inspects the streamLogs error. On a non-EOF
+  error it calls a new `waitForContainerTerminated` helper (bounded 30s)
+  before reading exit code, so a still-running container doesn't get
+  reported as `runner container status not found` / `RESULT_FAILURE`.
+- Finding B: snapshot-cache PVCs are now labeled with `drawbar.dev/task-id`
+  at creation. `cleanupOrphanedJobs` deletes any matching PVC alongside
+  each orphaned Job, so controller restarts don't leak cache PVCs.
 
 ## Finding A — `watchJobWith` swallows non-EOF log-stream errors and reports the job failed
 

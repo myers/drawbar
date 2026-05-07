@@ -788,3 +788,147 @@ func TestStreamStateFile_ProductiveStreamResetsAttempts(t *testing.T) {
 		t.Errorf("call count = %d, want 10", exec.callCount())
 	}
 }
+
+// --- waitForContainerTerminated ---
+
+func TestWaitForContainerTerminated_AlreadyTerminated(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "runner", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			},
+		},
+	})
+
+	err := waitForContainerTerminated(context.Background(), client, "default", "pod1", "runner", time.Second, 10*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestWaitForContainerTerminated_TransitionsFromRunning(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "runner", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		},
+	})
+
+	// After a short delay, flip the pod's runner container to Terminated.
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		_, _ = client.CoreV1().Pods("default").UpdateStatus(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "runner", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				},
+			},
+		}, metav1.UpdateOptions{})
+	}()
+
+	err := waitForContainerTerminated(context.Background(), client, "default", "pod1", "runner", time.Second, 10*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestWaitForContainerTerminated_TimesOut(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "runner", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		},
+	})
+
+	// Container stays Running. Helper should return a deadline-exceeded error
+	// distinguishable from the parent ctx being cancelled.
+	err := waitForContainerTerminated(context.Background(), client, "default", "pod1", "runner", 50*time.Millisecond, 10*time.Millisecond)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not terminate")
+}
+
+// erroringLogStreamer yields some bytes, then returns a non-EOF error on the
+// next read. Models the apiserver-flap scenario: stream opens, delivers some
+// log, then the connection drops mid-job.
+type erroringLogStreamer struct {
+	content string
+	readErr error
+}
+
+type errReader struct {
+	rest io.Reader
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	n, err := r.rest.Read(p)
+	if err == io.EOF {
+		// Substitute the configured non-EOF error.
+		return n, r.err
+	}
+	return n, err
+}
+
+func (r *errReader) Close() error { return nil }
+
+func (s *erroringLogStreamer) StreamLogs(_ context.Context, _, _, _ string) (io.ReadCloser, error) {
+	return &errReader{rest: strings.NewReader(s.content), err: s.readErr}, nil
+}
+
+// TestWatchJobWith_LogStreamErrorWaitsForTermination simulates Finding A's
+// scenario: the log stream breaks mid-job (non-EOF error) while the runner
+// container is still Running. The function must wait for the container to
+// terminate before reading exit code, not immediately fall through to
+// "runner container status not found" and report a healthy job as failed.
+func TestWatchJobWith_LogStreamErrorWaitsForTermination(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ns := "default"
+	jobName := "flap-job"
+
+	// Pod starts with the runner container Running, not Terminated.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "flap-pod", Namespace: ns,
+			Labels: map[string]string{"job-name": jobName},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "runner",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}},
+		},
+	}
+	_, err := client.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// After log error fires, transition the container to Terminated(ExitCode=0).
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		_, _ = client.CoreV1().Pods(ns).UpdateStatus(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "flap-pod", Namespace: ns,
+				Labels: map[string]string{"job-name": jobName}},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "runner",
+					State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+				}},
+			},
+		}, metav1.UpdateOptions{})
+	}()
+
+	executor := &mockPodExecutor{errs: []error{fmt.Errorf("terminated")}}
+	logStreamer := &erroringLogStreamer{
+		content: "build output\n",
+		readErr: fmt.Errorf("connection reset by peer"),
+	}
+	rep := newTestReporter(1, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := watchJobWith(ctx, client, executor, logStreamer, ns, jobName, rep, WatchConfig{PollInterval: 20 * time.Millisecond})
+	require.NoError(t, err)
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, result)
+}
