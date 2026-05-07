@@ -3,6 +3,7 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -22,6 +23,11 @@ CREATE INDEX IF NOT EXISTS idx_caches_key_version ON caches(key, version);
 CREATE INDEX IF NOT EXISTS idx_caches_complete ON caches(complete);
 CREATE INDEX IF NOT EXISTS idx_caches_used_at ON caches(used_at);
 `
+
+// likeEscaper escapes the SQL LIKE metacharacters `%` and `_` (and the
+// escape char `\` itself) so user-supplied prefixes are matched literally.
+// Pair with `ESCAPE '\'` in the query.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // Cache represents a cache entry in the database.
 type Cache struct {
@@ -67,12 +73,15 @@ func FindCache(db *sql.DB, keys []string, version string) (*Cache, error) {
 		if c != nil {
 			return c, nil
 		}
-		// Prefix match.
+		// Prefix match. Escape LIKE wildcards in the user-supplied prefix
+		// — workflow restore-keys can include literal `%` or `_` and we
+		// must not let those broaden the match.
+		escaped := likeEscaper.Replace(prefix)
 		c, err = queryOne(db,
 			`SELECT id, key, version, size, complete, used_at, created_at
 			 FROM caches
-			 WHERE key LIKE ? AND version = ? AND complete = 1
-			 ORDER BY created_at DESC LIMIT 1`, prefix+"%", version)
+			 WHERE key LIKE ? ESCAPE '\' AND version = ? AND complete = 1
+			 ORDER BY created_at DESC LIMIT 1`, escaped+"%", version)
 		if err != nil {
 			return nil, err
 		}
