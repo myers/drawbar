@@ -103,7 +103,7 @@ func (s *Storage) Remove(id uint64) {
 }
 
 func (s *Storage) filename(id uint64) string {
-	return filepath.Join(s.rootDir, fmt.Sprintf("%02x", id%0xff), fmt.Sprint(id))
+	return filepath.Join(s.rootDir, fmt.Sprintf("%02x", id%0x100), fmt.Sprint(id))
 }
 
 func (s *Storage) tempDir(id uint64) string {
