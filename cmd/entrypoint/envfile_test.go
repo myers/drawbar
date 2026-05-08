@@ -74,6 +74,32 @@ func TestParseEnvFile_ValueWithEquals(t *testing.T) {
 	assertEq(t, got["URL"], "https://example.com?a=1&b=2")
 }
 
+// TestParseEnvFile_ValueContainingDoubleAngle is the bug 020 finding-C
+// regression. A line like `KEY=value<<weird` is a key=value pair, not the
+// start of a heredoc. parseEnvFile previously short-circuited on `<<` and
+// treated KEY=value as the heredoc key, leaving the parser hung waiting
+// for delimiter `weird`.
+func TestParseEnvFile_ValueContainingDoubleAngle(t *testing.T) {
+	f := writeTemp(t, "KEY=value<<weird\nFOLLOWUP=ok\n")
+	got, err := parseEnvFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEq(t, got["KEY"], "value<<weird")
+	assertEq(t, got["FOLLOWUP"], "ok")
+}
+
+// TestParseEnvFile_HeredocStillWorks locks in that the `<<` precedence
+// fix doesn't regress the heredoc form when there's no `=` before the `<<`.
+func TestParseEnvFile_HeredocAfterFixStillParses(t *testing.T) {
+	f := writeTemp(t, "PATCH<<END\ndiff --git a/x b/x\nEND\n")
+	got, err := parseEnvFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEq(t, got["PATCH"], "diff --git a/x b/x")
+}
+
 func TestParsePaths(t *testing.T) {
 	f := writeTemp(t, "/usr/local/bin\n/opt/bin\n\n")
 	got, err := parsePaths(f)

@@ -188,7 +188,7 @@ func TestSetStepResult(t *testing.T) {
 	}
 	eval := NewEvaluator(env)
 
-	eval.SetStepResult("build", "success", map[string]string{"artifact": "myapp.tar"})
+	eval.SetStepResult("build", "success", false, map[string]string{"artifact": "myapp.tar"})
 
 	assert.NotNil(t, env.Steps["build"])
 	assert.Equal(t, model.StepStatusSuccess, env.Steps["build"].Conclusion)
@@ -213,8 +213,67 @@ func TestSetStepResult_Failure(t *testing.T) {
 		Steps:  make(map[string]*model.StepResult),
 	}
 	eval := NewEvaluator(env)
-	eval.SetStepResult("deploy", "failure", nil)
+	eval.SetStepResult("deploy", "failure", false, nil)
 
 	assert.Equal(t, model.StepStatusFailure, env.Steps["deploy"].Conclusion)
 	assert.Equal(t, model.StepStatusFailure, env.Steps["deploy"].Outcome)
+}
+
+// TestSetStepResult_OutcomeAndConclusionTable is the bug 020 finding-B
+// regression. Per GitHub Actions spec, Outcome reflects the raw step exit
+// status and Conclusion applies continue-on-error: a failure with
+// continue-on-error: true is recorded as outcome=failure, conclusion=success.
+// Drawbar previously conflated the two and ignored continue-on-error here.
+func TestSetStepResult_OutcomeAndConclusionTable(t *testing.T) {
+	cases := []struct {
+		name            string
+		outcome         string
+		continueOnError bool
+		wantOutcome     string
+		wantConclusion  string
+	}{
+		{"success without continue-on-error", "success", false, "success", "success"},
+		{"success with continue-on-error", "success", true, "success", "success"},
+		{"failure without continue-on-error", "failure", false, "failure", "failure"},
+		{"failure with continue-on-error masks conclusion", "failure", true, "failure", "success"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := &exprparser.EvaluationEnvironment{
+				Github: &model.GithubContext{},
+				Steps:  make(map[string]*model.StepResult),
+			}
+			eval := NewEvaluator(env)
+			eval.SetStepResult("step", tc.outcome, tc.continueOnError, nil)
+
+			// model.StepStatus is unexported; compare via the exported
+			// constants' String() output.
+			assert.Equal(t, tc.wantOutcome, env.Steps["step"].Outcome.String(), "outcome")
+			assert.Equal(t, tc.wantConclusion, env.Steps["step"].Conclusion.String(), "conclusion")
+		})
+	}
+}
+
+// TestSetStepResult_FailureFunctionRespectsConclusion locks in the
+// downstream consequence of finding B: ${{ failure() }} must consult
+// conclusion (continue-on-error masked), not raw outcome. After a failed
+// step with continue-on-error: true, a subsequent step's `if: failure()`
+// should evaluate to false — the prior failure was swallowed.
+func TestSetStepResult_FailureFunctionRespectsConclusion(t *testing.T) {
+	env := &exprparser.EvaluationEnvironment{
+		Github: &model.GithubContext{},
+		Job:    &model.JobContext{Status: "success"},
+		Steps:  make(map[string]*model.StepResult),
+	}
+	eval := NewEvaluator(env)
+
+	// Step 1 fails but continue-on-error: true → conclusion is success and
+	// the entrypoint correspondingly does NOT call SetJobStatus("failure").
+	eval.SetStepResult("flaky", "failure", true, nil)
+
+	// Step 2's `if: failure()` should NOT trip.
+	tripped, err := eval.EvalCondition("failure()")
+	require.NoError(t, err)
+	assert.False(t, tripped,
+		"failure() must not trip when the only failed step had continue-on-error: true")
 }

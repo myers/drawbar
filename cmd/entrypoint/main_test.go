@@ -150,6 +150,43 @@ func TestExecuteStep_BashMode(t *testing.T) {
 	assert.Contains(t, captured.Path, "bash")
 }
 
+// TestExecuteStep_BashUsesPipefail is the bug 020 finding-A regression.
+// GitHub Actions runs bash steps with `set -eo pipefail`. Drawbar previously
+// used only `-e`, so a pipeline like `false | true` returned exit 0 and
+// upstream failures were silently swallowed.
+func TestExecuteStep_BashUsesPipefail(t *testing.T) {
+	var captured *exec.Cmd
+	origRunner := runCommand
+	runCommand = func(cmd *exec.Cmd) error {
+		captured = cmd
+		return nil
+	}
+	defer func() { runCommand = origRunner }()
+
+	step := StepDef{Command: "true", Shell: "bash"}
+	executeStep(context.Background(), step, map[string]string{"PATH": "/usr/bin"})
+	require.NotNil(t, captured)
+	assert.Contains(t, captured.Args, "-eo",
+		"bash should be invoked with -eo so pipefail is set per GitHub Actions spec")
+	assert.Contains(t, captured.Args, "pipefail",
+		"bash should be invoked with pipefail option after -eo")
+}
+
+// TestExecuteStep_BashPipefailRealShell exercises the real /bin/bash to
+// confirm the flag combination actually enables pipefail (i.e. runCommand
+// is not stubbed). Skipped if /bin/bash is unavailable.
+func TestExecuteStep_BashPipefailRealShell(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("/bin/bash not available on this host")
+	}
+	// `false | true` exits 0 without pipefail and 1 with pipefail. Point
+	// WorkDir at a real directory so the chdir doesn't fail before bash runs.
+	step := StepDef{Command: "false | true", Shell: "bash", WorkDir: t.TempDir()}
+	code := executeStep(context.Background(), step, map[string]string{"PATH": "/usr/bin:/bin"})
+	assert.NotEqual(t, 0, code,
+		"with pipefail, `false | true` must propagate the upstream failure")
+}
+
 func TestExecuteStep_DirectArgs(t *testing.T) {
 	var captured *exec.Cmd
 	origRunner := runCommand

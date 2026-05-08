@@ -26,10 +26,15 @@ func parseEnvFile(path string) (map[string]string, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Check for heredoc: key<<DELIMITER
-		if idx := strings.Index(line, "<<"); idx > 0 {
-			key := line[:idx]
-			delim := line[idx+2:]
+		// Heredoc form is `KEY<<DELIMITER`; key=value form is `KEY=VALUE`.
+		// They are mutually exclusive on a single line. A `<<` in the value
+		// of a key=value line (e.g. `URL=foo<<bar`) must NOT be treated as
+		// a heredoc start — only `<<` appearing in the KEY portion counts.
+		eqIdx := strings.IndexByte(line, '=')
+		hereIdx := strings.Index(line, "<<")
+		if hereIdx > 0 && (eqIdx < 0 || hereIdx < eqIdx) {
+			key := line[:hereIdx]
+			delim := line[hereIdx+2:]
 			var value strings.Builder
 			found := false
 			for scanner.Scan() {
@@ -51,9 +56,9 @@ func parseEnvFile(path string) (map[string]string, error) {
 		}
 
 		// Simple key=value
-		if idx := strings.IndexByte(line, '='); idx > 0 {
-			key := line[:idx]
-			val := line[idx+1:]
+		if eqIdx > 0 {
+			key := line[:eqIdx]
+			val := line[eqIdx+1:]
 			result[key] = val
 		}
 	}

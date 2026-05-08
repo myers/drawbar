@@ -86,19 +86,29 @@ func (e *Evaluator) InterpolateMap(m map[string]string) map[string]string {
 	return result
 }
 
-// SetStepResult records a completed step's result for future ${{ steps.* }} references.
-func (e *Evaluator) SetStepResult(stepID string, outcome string, outputs map[string]string) {
+// SetStepResult records a completed step's result for future ${{ steps.* }}
+// references. Outcome is the raw step exit status (success or failure);
+// Conclusion applies the continueOnError modifier — a failed step with
+// continueOnError=true records outcome=failure but conclusion=success, so
+// downstream ${{ failure() }} / ${{ success() }} (which consult conclusion)
+// don't trip on a swallowed failure. See GitHub Actions docs for the
+// outcome-vs-conclusion split.
+func (e *Evaluator) SetStepResult(stepID string, outcome string, continueOnError bool, outputs map[string]string) {
 	if e.env.Steps == nil {
 		e.env.Steps = make(map[string]*model.StepResult)
 	}
-	e.env.Steps[stepID] = &model.StepResult{
-		Conclusion: model.StepStatusSuccess,
-		Outcome:    model.StepStatusSuccess,
-		Outputs:    outputs,
-	}
+	outcomeStatus := model.StepStatusSuccess
+	conclusionStatus := model.StepStatusSuccess
 	if outcome == "failure" {
-		e.env.Steps[stepID].Conclusion = model.StepStatusFailure
-		e.env.Steps[stepID].Outcome = model.StepStatusFailure
+		outcomeStatus = model.StepStatusFailure
+		if !continueOnError {
+			conclusionStatus = model.StepStatusFailure
+		}
+	}
+	e.env.Steps[stepID] = &model.StepResult{
+		Outcome:    outcomeStatus,
+		Conclusion: conclusionStatus,
+		Outputs:    outputs,
 	}
 }
 

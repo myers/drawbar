@@ -229,7 +229,7 @@ func runEntrypoint(manifestPath, workDir string) bool {
 					eval.SetJobStatus("failure")
 				}
 			}
-			eval.SetStepResult(step.ID, outcome, outputs)
+			eval.SetStepResult(step.ID, outcome, step.ContinueOnError, outputs)
 		}
 
 		// Write step end event.
@@ -319,7 +319,12 @@ func executeStep(ctx context.Context, step StepDef, env map[string]string) int {
 
 		switch shell {
 		case "bash":
-			cmd = exec.CommandContext(ctx, "/bin/bash", "-e", "-c", step.Command)
+			// Match GitHub Actions: bash steps run with -eo pipefail so
+			// upstream failures in pipelines aren't silently swallowed.
+			// --noprofile --norc keeps behavior reproducible across base
+			// images by ignoring /etc/profile and ~/.bashrc.
+			cmd = exec.CommandContext(ctx, "/bin/bash",
+				"--noprofile", "--norc", "-eo", "pipefail", "-c", step.Command)
 		case "python":
 			cmd = exec.CommandContext(ctx, "python3", "-c", step.Command)
 		default:

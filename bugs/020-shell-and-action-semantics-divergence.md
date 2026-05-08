@@ -1,6 +1,6 @@
 # Entrypoint shell and action-result semantics diverge from GitHub Actions
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
+**Status: fixed 2026-05-07.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
 Three findings about places where drawbar's behavior subtly differs
 from documented GitHub/Forgejo Actions behavior. All diagnosable by
 reading the actions-runner spec and our entrypoint side-by-side.
@@ -200,3 +200,32 @@ Filed via `/ultrareview` run on PR #1, 2026-05-06.
 - Bug 016 area: per-step reporting. Finding B affects how
   `${{ steps.X.outcome }}` references resolve in later steps' `if:`
   conditions, which the entrypoint evaluates at runtime.
+
+## Resolution
+
+All three findings fixed.
+
+**A:** `cmd/entrypoint/main.go::executeStep` now invokes
+`/bin/bash --noprofile --norc -eo pipefail -c <command>` for `bash`
+shell steps, matching documented GitHub Actions behavior.
+Regression tests in `cmd/entrypoint/main_test.go` assert both the
+flag set (`TestExecuteStep_BashUsesPipefail`) and the actual
+end-to-end pipefail behavior against the real `/bin/bash`
+(`TestExecuteStep_BashPipefailRealShell`, runs `false | true` and
+expects non-zero exit).
+
+**B:** `Evaluator.SetStepResult` (`pkg/expressions/eval.go`) now
+takes `continueOnError bool` and records distinct values for
+`Outcome` (raw exit status) and `Conclusion` (continue-on-error
+masked). The entrypoint passes `step.ContinueOnError`. Tests:
+`TestSetStepResult_OutcomeAndConclusionTable` covers the four
+cells of the spec table, and
+`TestSetStepResult_FailureFunctionRespectsConclusion` locks in
+that `${{ failure() }}` doesn't trip after a failed step with
+`continue-on-error: true` (since `failure()` consults conclusion).
+
+**C:** `parseEnvFile` (`cmd/entrypoint/envfile.go`) now compares
+the index of `=` and `<<` and only treats a line as a heredoc
+start if `<<` appears in the key portion (i.e. before any `=`).
+A line like `KEY=value<<weird` parses as the obvious key=value.
+Test: `TestParseEnvFile_ValueContainingDoubleAngle`.
