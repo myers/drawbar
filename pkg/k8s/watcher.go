@@ -44,8 +44,10 @@ type WatchConfig struct {
 	Streamer     LogStreamer                 // optional; defaults to K8sLogStreamer
 	CommandProc  *reporter.CommandProcessor  // optional; if set, parses workflow commands from log lines
 	// LogErrorTerminationTimeout bounds the wait for the runner container
-	// to reach Terminated after a non-EOF log-stream error. Zero falls
-	// back to defaultLogErrorTerminationTimeout.
+	// to reach Terminated after the log stream ends — both on a non-EOF
+	// error (mid-stream apiserver disconnect) and on clean EOF (container
+	// exit, where the kubelet may not have propagated Terminated to the
+	// apiserver yet). Zero falls back to defaultLogErrorTerminationTimeout.
 	LogErrorTerminationTimeout time.Duration
 }
 
@@ -152,13 +154,21 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 		drainStateFile(ctx, executor, namespace, podName, rep, res.offset)
 	}
 
-	// On a mid-stream log error, wait (bounded) for the container to
-	// actually terminate BEFORE cancelling the state stream. The state
-	// goroutine keeps consuming events live during the wait, so step
-	// start/end events written while the container finishes are captured
-	// in real time. Cancelling the state stream first would force
+	// Wait (bounded) for the runner container to reach Terminated BEFORE
+	// cancelling the state stream. The wait runs on both log-stream paths:
+	//
+	//   - non-EOF error: the container may still be running mid-stream;
+	//     without the wait, getContainerResult would race the kubelet and
+	//     report "runner container status not found" on a healthy job.
+	//   - clean EOF: the container has exited, but the kubelet's pod-status
+	//     update with Terminated may not have hit the apiserver yet —
+	//     bug 023. A naive read would see Running and report failure.
+	//
+	// The state goroutine keeps consuming events live during the wait, so
+	// step start/end events written while the container finishes are
+	// captured in real time. Cancelling the state stream first would force
 	// drainStateFile to cover the entire wait window in a single one-shot
-	// read, which is best-effort — it can lose events if state.jsonl grows
+	// read, which is best-effort and can lose events if state.jsonl grows
 	// between drain and re-open.
 	//
 	// The state goroutine's reconnect is itself best-effort:
@@ -170,10 +180,10 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	if logErr != nil && !errors.Is(logErr, io.EOF) {
 		slog.Warn("log stream ended before EOF, waiting for container to terminate",
 			"pod", podName, "err", logErr)
-		if waitErr := waitForContainerTerminated(ctx, client, namespace, podName, "runner", cfg.LogErrorTerminationTimeout, cfg.PollInterval); waitErr != nil {
-			stopAndDrain()
-			return runnerv1.Result_RESULT_FAILURE, fmt.Errorf("waiting for container after log stream failure: %w", waitErr)
-		}
+	}
+	if waitErr := waitForContainerTerminated(ctx, client, namespace, podName, "runner", cfg.LogErrorTerminationTimeout, cfg.PollInterval); waitErr != nil {
+		stopAndDrain()
+		return runnerv1.Result_RESULT_FAILURE, fmt.Errorf("waiting for container after log stream end: %w", waitErr)
 	}
 
 	stopAndDrain()
@@ -521,15 +531,18 @@ func waitForContainerRunning(ctx context.Context, client kubernetes.Interface, n
 // Other Get errors are logged at warn (not silently swallowed) so a 30-second
 // timeout doesn't hide an RBAC or apiserver outage.
 //
-// Used by watchJobWith to guard getContainerResult after a mid-stream log
-// error, where the container may still be running and a naive read would
-// falsely report "runner container status not found".
+// Used by watchJobWith to guard getContainerResult after the log stream
+// ends — both on mid-stream errors (container may still be running) and on
+// clean EOF (kubelet may not have propagated Terminated to the apiserver
+// yet, bug 023). Without the wait, a naive read of pod status falsely
+// reports "runner container status not found" on a healthy job.
 func waitForContainerTerminated(ctx context.Context, client kubernetes.Interface, namespace, podName, containerName string, timeout, poll time.Duration) error {
 	if poll <= 0 {
 		poll = 500 * time.Millisecond
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	first := true
 	for {
 		pod, err := client.CoreV1().Pods(namespace).Get(waitCtx, podName, metav1.GetOptions{})
 		switch {
@@ -547,6 +560,14 @@ func waitForContainerTerminated(ctx context.Context, client kubernetes.Interface
 					return nil
 				}
 			}
+		}
+		if first {
+			// Only log when the first poll didn't already see Terminated.
+			// The fast happy path stays silent so we don't emit one info
+			// line per task.
+			slog.Info("waiting for runner container status to propagate",
+				"pod", podName, "container", containerName)
+			first = false
 		}
 		select {
 		case <-waitCtx.Done():

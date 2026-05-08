@@ -1,9 +1,11 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -933,17 +935,21 @@ func TestWatchJobWith_LogStreamErrorWaitsForTermination(t *testing.T) {
 	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, result)
 }
 
-// TestWatchJobWith_EOFSkipsWait locks in the EOF path: when streamLogs
-// returns nil (clean EOF), watchJobWith must NOT route through
-// waitForContainerTerminated. The pod here stays Running with no Terminated
-// state — if the wait branch were entered we'd see the wrap error
-// "waiting for container after log stream failure"; instead we expect the
-// existing "runner container status not found" from getContainerResult.
-func TestWatchJobWith_EOFSkipsWait(t *testing.T) {
+// TestWatchJobWith_EOFWaitsForTerminationStatus is the bug 023 regression.
+// When streamLogs returns nil (clean container exit), the kubelet may not
+// have propagated containerStatuses[*].state.terminated to the apiserver
+// yet — the running-container set is GC'd before the status update lands.
+// In that window, post-exit drain exec fails with "container not found"
+// and a naive read of pod status sees Running, not Terminated, and we'd
+// report failure on a healthy job. watchJobWith must wait for Terminated
+// to propagate before reading the exit code.
+func TestWatchJobWith_EOFWaitsForTerminationStatus(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ns := "default"
 	jobName := "eof-job"
 
+	// Pod starts with the runner container Running. EOF on log stream means
+	// the container has exited, but the apiserver hasn't seen Terminated yet.
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "eof-pod", Namespace: ns,
@@ -959,24 +965,114 @@ func TestWatchJobWith_EOFSkipsWait(t *testing.T) {
 	_, err := client.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	executor := &mockPodExecutor{errs: []error{fmt.Errorf("terminated")}}
-	logStreamer := &mockLogStreamer{content: "build output\n"} // returns clean EOF
+	// Simulate the kubelet propagating Terminated(ExitCode=0) shortly after
+	// the log stream EOFs.
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		_, _ = client.CoreV1().Pods(ns).UpdateStatus(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "eof-pod", Namespace: ns,
+				Labels: map[string]string{"job-name": jobName}},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "runner",
+					State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+				}},
+			},
+		}, metav1.UpdateOptions{})
+	}()
+
+	// Post-exit drain exec hits "container not found" — exactly the warning
+	// the bug 023 timeline shows. This must not propagate as failure.
+	executor := &mockPodExecutor{errs: []error{fmt.Errorf("unable to upgrade connection: container not found (\"runner\")")}}
+	logStreamer := &mockLogStreamer{content: "build output\n"} // clean EOF
 	rep := newTestReporter(1, 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// LogErrorTerminationTimeout is set short so a regression (wait branch
-	// incorrectly entered on EOF) surfaces the wrap-error message in well
-	// under the 2s parent ctx, instead of racing the ctx deadline.
-	_, err = watchJobWith(ctx, client, executor, logStreamer, ns, jobName, rep,
-		WatchConfig{
-			PollInterval:               20 * time.Millisecond,
-			LogErrorTerminationTimeout: 100 * time.Millisecond,
-		})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "runner container status not found")
-	assert.NotContains(t, err.Error(), "waiting for container after log stream failure")
+	result, err := watchJobWith(ctx, client, executor, logStreamer, ns, jobName, rep,
+		WatchConfig{PollInterval: 20 * time.Millisecond})
+	require.NoError(t, err)
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, result)
+}
+
+// TestWaitForContainerTerminated_LogsWhenWaitingActuallySpins is the TDD
+// follow-up to bug 023. The wait now runs unconditionally, including the
+// fast happy path where pod status is already Terminated. To keep that
+// happy path silent (no log spam per task) but still surface the slow
+// kubelet-status-update path for debugging, the helper must log only
+// when the first poll observed a non-terminal state.
+func TestWaitForContainerTerminated_LogsWhenWaitingActuallySpins(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	client := fake.NewSimpleClientset()
+	ns := "default"
+
+	// Pod starts Running — the wait will have to spin at least once.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "slow-pod", Namespace: ns},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "runner",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}},
+		},
+	}
+	_, err := client.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		_, _ = client.CoreV1().Pods(ns).UpdateStatus(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "slow-pod", Namespace: ns},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "runner",
+					State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+				}},
+			},
+		}, metav1.UpdateOptions{})
+	}()
+
+	err = waitForContainerTerminated(context.Background(), client, ns, "slow-pod", "runner",
+		2*time.Second, 20*time.Millisecond)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "waiting for runner container status to propagate",
+		"expected an info log when the wait had to spin; got: %q", buf.String())
+}
+
+// TestWaitForContainerTerminated_SilentWhenAlreadyTerminated locks in the
+// other half of the contract: if the pod is already Terminated on the very
+// first poll, the wait must return without logging — every healthy task
+// goes through this path now and we don't want one info log per task.
+func TestWaitForContainerTerminated_SilentWhenAlreadyTerminated(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	client := fake.NewSimpleClientset()
+	ns := "default"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "fast-pod", Namespace: ns},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "runner",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			}},
+		},
+	}
+	_, err := client.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = waitForContainerTerminated(context.Background(), client, ns, "fast-pod", "runner",
+		2*time.Second, 20*time.Millisecond)
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), "waiting for runner container status to propagate",
+		"expected no log on the fast happy path; got: %q", buf.String())
 }
 
 func TestWaitForContainerTerminated_PodNotFound(t *testing.T) {
