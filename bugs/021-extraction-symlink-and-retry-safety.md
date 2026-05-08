@@ -1,9 +1,17 @@
 # Cache mirror and action fetch follow symlinks / fail on retry
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
-Two findings about file extraction into a tree we don't own. Same
-toolkit: `O_NOFOLLOW`, atomic-rename-then-promote, idempotent
+**Status: fixed 2026-05-08.** Surfaced 2026-05-06 via `/ultrareview` run
+on PR #1. Two findings about file extraction into a tree we don't own.
+Same toolkit: `O_NOFOLLOW`, atomic-rename-then-promote, idempotent
 extraction.
+
+Fix: `cmd/entrypoint/cache_mirror.go::copyFile` now opens with
+`O_NOFOLLOW` and unlinks-then-retries on `ELOOP`. `cmd/entrypoint/
+setup.go::fetchAction` extracts into a `target.partial.<rand>` sibling
+and atomically renames it to `target` on success, with `untarInto`'s
+regular-file open also using `O_NOFOLLOW` as belt-and-suspenders.
+Tests in `cache_mirror_test.go::TestMergeDir_RefusesToWriteThroughSymlink`
+and `setup_test.go::TestRunSetup_RecoversFromPartialExtraction`.
 
 ## Finding A — `mergeDir.copyFile` follows symlinks in destination, allowing writes outside the cache
 

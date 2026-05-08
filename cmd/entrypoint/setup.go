@@ -2,13 +2,17 @@ package main
 
 import (
 	"archive/tar"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/myers/drawbar/pkg/types"
@@ -62,17 +66,24 @@ var errFetchNotFound = errors.New("not found")
 
 // fetchAction downloads a single action tarball into actionsDir/<a.Dir>/.
 // Retries on 5xx and network errors; bails immediately on 404.
+//
+// Each attempt extracts into a fresh sibling temp dir
+// (target.partial.<rand>) and atomically renames it to target on
+// success. This makes retries idempotent against partial extractions
+// (a network blip used to leave EEXIST-tripping debris) and means
+// concurrent readers of target either see no extraction or a complete
+// one, never a half-finished tree.
 func fetchAction(a types.ActionFetch, actionsDir string) error {
-	target := filepath.Join(actionsDir, a.Dir)
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return fmt.Errorf("mkdir target: %w", err)
+	if err := os.MkdirAll(actionsDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir actions dir: %w", err)
 	}
+	target := filepath.Join(actionsDir, a.Dir)
 
 	client := &http.Client{Timeout: setupHTTPTimeout}
 
 	var lastErr error
 	for attempt := 1; attempt <= setupMaxAttempts; attempt++ {
-		err := tryFetch(client, a.URL, target)
+		err := tryFetchAndPromote(client, a.URL, target)
 		if err == nil {
 			return nil
 		}
@@ -85,6 +96,61 @@ func fetchAction(a types.ActionFetch, actionsDir string) error {
 		}
 	}
 	return fmt.Errorf("after %d attempts: %w", setupMaxAttempts, lastErr)
+}
+
+// tryFetchAndPromote performs one fetch attempt: extract to a sibling
+// temp dir, then rename it over target. The temp dir is cleaned up on
+// every error path. On success the rename consumes the temp dir, so
+// the deferred RemoveAll is a no-op.
+func tryFetchAndPromote(client *http.Client, url, target string) error {
+	tmp, err := makePartialDir(target)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+
+	if err := tryFetch(client, url, tmp); err != nil {
+		return err
+	}
+
+	// Promote tmp -> target. Common case: target is missing (this is
+	// the first install for this action), so a single Rename suffices
+	// and the directory is never observed in an absent state. Only if
+	// a prior run left target behind do we RemoveAll first.
+	if _, statErr := os.Lstat(target); statErr == nil {
+		if err := os.RemoveAll(target); err != nil {
+			return fmt.Errorf("removing prior target %q: %w", target, err)
+		}
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return fmt.Errorf("stat target %q: %w", target, statErr)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return fmt.Errorf("promoting %q to %q: %w", tmp, target, err)
+	}
+	return nil
+}
+
+// makePartialDir creates an empty sibling of target named
+// target.partial.<8 hex bytes>. The random suffix avoids collisions
+// when a previous run left a stale partial dir behind. On the
+// vanishingly unlikely EEXIST (same 64-bit suffix as a leftover dir)
+// we re-roll up to a few times before giving up.
+func makePartialDir(target string) (string, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return "", fmt.Errorf("rand: %w", err)
+		}
+		tmp := target + ".partial." + hex.EncodeToString(buf[:])
+		err := os.Mkdir(tmp, 0o755)
+		if err == nil {
+			return tmp, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("mkdir partial: %w", err)
+		}
+	}
+	return "", fmt.Errorf("mkdir partial: exhausted random suffixes for %q", target)
 }
 
 func tryFetch(client *http.Client, url, target string) error {
@@ -142,7 +208,12 @@ func untarInto(r io.Reader, target string) error {
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 				return fmt.Errorf("mkdir parent %s: %w", dest, err)
 			}
-			f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			// O_NOFOLLOW: defense-in-depth against an earlier-in-stream
+			// symlink redirecting our write outside target. Symlink
+			// linknames are already validated above (no abs, no ".."),
+			// so this should not trigger in practice — but if it does,
+			// fail loudly rather than write through.
+			f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
 				return fmt.Errorf("create %s: %w", dest, err)
 			}

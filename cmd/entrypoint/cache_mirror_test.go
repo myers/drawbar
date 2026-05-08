@@ -122,6 +122,51 @@ func TestMirrorOne_PreservesSymlinkDuringMerge(t *testing.T) {
 	}
 }
 
+// TestMergeDir_RefusesToWriteThroughSymlink covers Finding A from
+// bug 021: a malicious step plants a symlink in the cache tree
+// pointing outside it (here, at a tempfile we control). The next
+// mergeDir pass must not write through that symlink.
+func TestMergeDir_RefusesToWriteThroughSymlink(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	mustWriteFile(t, filepath.Join(src, "escape"), "pwned")
+
+	// External target the symlink would redirect writes to. If
+	// O_NOFOLLOW is missing, the merge writes "pwned" here.
+	externalDir := t.TempDir()
+	externalTarget := filepath.Join(externalDir, "victim")
+	mustWriteFile(t, externalTarget, "original")
+
+	mustSymlink(t, externalTarget, filepath.Join(dst, "escape"))
+
+	if err := mergeDir(src, dst); err != nil {
+		t.Fatalf("mergeDir returned error: %v", err)
+	}
+
+	// The external file must be untouched.
+	got, err := os.ReadFile(externalTarget)
+	if err != nil {
+		t.Fatalf("read external: %v", err)
+	}
+	if string(got) != "original" {
+		t.Errorf("external target was overwritten through symlink: got %q, want %q", got, "original")
+	}
+
+	// The merge should still produce a usable result: dst/escape is
+	// now a regular file containing the source content (the stale
+	// symlink was unlinked and replaced).
+	dstEscape := filepath.Join(dst, "escape")
+	info, err := os.Lstat(dstEscape)
+	if err != nil {
+		t.Fatalf("lstat dst/escape: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("dst/escape should be a regular file, still a symlink")
+	}
+	assertFile(t, dstEscape, "pwned")
+}
+
 func TestMirrorOne_LeavesRegularFileAlone(t *testing.T) {
 	ws, cache := tmpWorkspaceAndCache(t)
 	wsTarget := filepath.Join(ws, "target")

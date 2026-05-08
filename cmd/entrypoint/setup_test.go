@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -145,6 +146,87 @@ func TestRunSetup_FailsFastOn404(t *testing.T) {
 	err := runSetup(manifestPath, actionsDir, shimDir)
 	assert.Error(t, err)
 	assert.Equal(t, int32(1), calls.Load(), "404 must not be retried")
+}
+
+// TestRunSetup_RecoversFromPartialExtraction covers Finding B from
+// bug 021: the first attempt's response is truncated mid-tar, leaving
+// some entries half-extracted. With atomic-rename-then-promote each
+// attempt extracts to a fresh sibling temp dir, so the second
+// attempt's full tar succeeds — the first attempt's debris was
+// confined to the temp dir and cleaned up.
+func TestRunSetup_RecoversFromPartialExtraction(t *testing.T) {
+	fullTar := makeTar(t, map[string]string{
+		"action.yml":    "name: foo",
+		"dist/index.js": "console.log(1)",
+	})
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			// Lie about Content-Length, then write only a prefix and
+			// hijack-close. The client reads the partial body and
+			// errors with io.ErrUnexpectedEOF.
+			w.Header().Set("Content-Type", "application/x-tar")
+			w.Header().Set("Content-Length", strconv.Itoa(len(fullTar)))
+			w.WriteHeader(http.StatusOK)
+			// Write enough to include the first tar header (512 bytes)
+			// + a few bytes of body, then bail.
+			cut := 600
+			if cut > len(fullTar) {
+				cut = len(fullTar) / 2
+			}
+			_, _ = w.Write(fullTar[:cut])
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("ResponseWriter is not a Hijacker")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.Write(fullTar)
+	}))
+	defer srv.Close()
+
+	oldBackoff := setupRetryBackoff
+	setupRetryBackoff = 0
+	defer func() { setupRetryBackoff = oldBackoff }()
+
+	tmp := t.TempDir()
+	actionsDir := filepath.Join(tmp, "actions")
+	shimDir := filepath.Join(tmp, "shim")
+	manifestPath := writeManifest(t, tmp, []types.ActionFetch{
+		{Dir: "foo", URL: srv.URL},
+	})
+
+	err := runSetup(manifestPath, actionsDir, shimDir)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load(), "should have retried after partial extraction")
+
+	// Final tree contains both files from the fully-streamed attempt.
+	body, err := os.ReadFile(filepath.Join(actionsDir, "foo", "action.yml"))
+	require.NoError(t, err)
+	assert.Equal(t, "name: foo", string(body))
+	body, err = os.ReadFile(filepath.Join(actionsDir, "foo", "dist", "index.js"))
+	require.NoError(t, err)
+	assert.Equal(t, "console.log(1)", string(body))
+
+	// No debris from the partial attempt remains beside the target.
+	entries, err := os.ReadDir(actionsDir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if e.Name() == "foo" {
+			continue
+		}
+		t.Errorf("unexpected leftover entry in actions dir: %q", e.Name())
+	}
 }
 
 func TestRunSetup_RejectsTarTraversal(t *testing.T) {

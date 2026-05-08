@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // cacheMirrorRoot is where the snapshot-cache PVC is mounted inside the
@@ -167,13 +168,22 @@ func mergeDir(src, dst string) error {
 	return nil
 }
 
+// copyFile writes src's contents to dst, creating dst if missing and
+// truncating it otherwise. O_NOFOLLOW refuses to follow a symlink at
+// the final path component — this matters because dst lives in a tree
+// (the snapshot cache) that prior workflow steps can plant symlinks
+// into; without O_NOFOLLOW a checkout that wrote dst/foo -> /etc/passwd
+// would have us writing into /etc/passwd on the next mirror pass.
+//
+// On ELOOP we treat the existing entry as a stale/adversarial symlink,
+// unlink it, and retry the open once.
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	out, err := openNoFollowForWrite(dst, mode)
 	if err != nil {
 		return err
 	}
@@ -182,4 +192,22 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+// openNoFollowForWrite opens dst for writing with O_NOFOLLOW. If the
+// open fails because the final path component is a symlink, the
+// symlink is removed and the open is retried once.
+func openNoFollowForWrite(dst string, mode os.FileMode) (*os.File, error) {
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
+	out, err := os.OpenFile(dst, flags, mode)
+	if err == nil {
+		return out, nil
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		return nil, err
+	}
+	if rmErr := os.Remove(dst); rmErr != nil {
+		return nil, fmt.Errorf("removing symlink %q before write: %w", dst, rmErr)
+	}
+	return os.OpenFile(dst, flags, mode)
 }
