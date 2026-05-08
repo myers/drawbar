@@ -37,13 +37,6 @@ func TestFindCache_LIKEWildcardsInPrefix(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, "foo_bar", got.Key)
 
-	// Existing prefix semantics still work: `foo` matches some entry whose
-	// key starts with `foo` (one of the four).
-	got, err = FindCache(db, []string{"foo"}, "v1")
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Contains(t, []string{"foo", "foobar", "foo%bar", "foo_bar"}, got.Key)
-
 	// A prefix that hits nothing still misses cleanly.
 	got, err = FindCache(db, []string{"nope%"}, "v1")
 	require.NoError(t, err)

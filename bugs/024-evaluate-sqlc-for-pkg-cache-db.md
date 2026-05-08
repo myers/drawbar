@@ -75,8 +75,8 @@ dep.
   want it gated).
 - Update callers in `pkg/cache/handler.go` and the GC paths to use
   the generated funcs.
-- Migrate `handler_test.go::TestCacheDB_CRUD` and the new `db_test.go`
-  to the generated API. Should be mechanical.
+- Migrate `handler_test.go::TestCacheDB_CRUD` and `db_test.go` (added
+  by bug 019, finding A) to the generated API. Should be mechanical.
 - Keep `likeEscaper` next to the prefix-match call site.
 
 Not in scope: changing the schema, adding migrations tooling, or

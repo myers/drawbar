@@ -108,9 +108,18 @@ func TestActionRef_ActionDir(t *testing.T) {
 	assert.Equal(t, dir, ref.ActionDir())
 }
 
-// TestActionRef_ActionDir_NoCollisions guards against bug 019 finding C:
-// distinct refs that sanitize to the same prefix must still produce
-// distinct ActionDir outputs.
+// TestActionRef_ActionDir_NoCollisions guards against bug 019 finding C
+// for the case the bug is actually about: distinct git Refs (different
+// versions of the same action) that happen to sanitize to the same
+// prefix must still produce distinct ActionDir outputs.
+//
+// We deliberately do NOT vary Path here. Subdir actions like
+// `org/repo/sub@v1` and `org/repo/other@v1` share the same on-disk
+// action source on purpose — they live in the same git clone, and
+// loader.go::actionPath() appends Ref.Path to the dir at use time. So
+// two refs differing only in Path are *expected* to produce the same
+// ActionDir (they share a clone) and tightening that would just waste
+// cache by re-fetching the same git repo per subdir.
 func TestActionRef_ActionDir_NoCollisions(t *testing.T) {
 	refs := []string{"v4.0.0", "v4-0-0", "v4_0_0", "v4/0/0", "v4 0 0"}
 	seen := make(map[string]string, len(refs))

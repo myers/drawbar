@@ -72,6 +72,14 @@ users to protect this is acceptable, but worth noting in the commit
 message. If anyone has a populated cache, they need to either
 re-warm or run a one-shot rebucket script.
 
+To be precise about which ids drift: under the old `id%0xff`, bucket
+`00` held the natural-mod-256 ids `0, 256, 512, ...` *plus* the
+overflow set `255, 510, 765, ...` (every `255 + 255k`). Under the new
+`id%0x100`, the natural set still hashes to `00` and remains findable;
+the overflow set hashes to `ff, fe, fd, ...` and is unfindable until
+re-warmed. So the unfindable subset is specifically `{255 + 255k}`,
+not all of bucket `00`.
+
 ## Finding C — `ActionDir` collision: refs differing only in `.` vs `-` map to same dir
 
 **Location:** `pkg/actions/resolve.go:110-121`.

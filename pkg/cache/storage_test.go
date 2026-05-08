@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -8,19 +9,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestStorageFilename_AllBucketsReachable asserts that ids in [0, 256)
-// land in 256 distinct buckets — i.e. the modulo really is mod-256, not
-// mod-255 (which would leave bucket `ff` unreachable and double-up `00`).
-func TestStorageFilename_AllBucketsReachable(t *testing.T) {
+// TestStorageFilename_BucketIsIdMod256 pins the contract: each id lands
+// in bucket fmt.Sprintf("%02x", id%256). This catches the bug-019 mod-255
+// typo (which left bucket `ff` unreachable) and any future drift in the
+// modulo or format.
+func TestStorageFilename_BucketIsIdMod256(t *testing.T) {
 	s, err := NewStorage(t.TempDir())
 	require.NoError(t, err)
 
-	buckets := make(map[string]struct{}, 256)
 	for id := uint64(0); id < 256; id++ {
-		buckets[filepath.Base(filepath.Dir(s.filename(id)))] = struct{}{}
+		bucket := filepath.Base(filepath.Dir(s.filename(id)))
+		assert.Equal(t, fmt.Sprintf("%02x", id), bucket, "id=%d", id)
 	}
-	assert.Len(t, buckets, 256, "ids 0..255 must land in 256 distinct buckets")
 
-	// Bucket `ff` specifically must be reachable.
-	assert.Equal(t, "ff", filepath.Base(filepath.Dir(s.filename(0xff))))
+	// Spot-check a few ids past the first 256 to confirm the modulo
+	// (not just the prefix-zero-padded format) is what's being asserted.
+	assert.Equal(t, "00", filepath.Base(filepath.Dir(s.filename(256))))
+	assert.Equal(t, "ff", filepath.Base(filepath.Dir(s.filename(511))))
 }
