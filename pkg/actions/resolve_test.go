@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,11 +91,43 @@ func TestActionRef_CloneURL(t *testing.T) {
 }
 
 func TestActionRef_ActionDir(t *testing.T) {
+	// Format: <sanitized org-repo-ref>-<8 hex chars FNV-1a>.
+	// We assert structure, not the hash digits, so tests don't break if the
+	// hash content (currently "org/repo@ref") is ever tweaked.
 	ref := &ActionRef{Org: "actions", Repo: "cache", Ref: "v4"}
-	assert.Equal(t, "actions-cache-v4", ref.ActionDir())
+	dir := ref.ActionDir()
+	assert.True(t, strings.HasPrefix(dir, "actions-cache-v4-"), "got %q", dir)
+	assert.Regexp(t, `^actions-cache-v4-[0-9a-f]{8}$`, dir)
 
 	ref2 := &ActionRef{Org: "Swatinem", Repo: "rust-cache", Ref: "v2.7.0"}
-	assert.Equal(t, "Swatinem-rust-cache-v2-7-0", ref2.ActionDir())
+	dir2 := ref2.ActionDir()
+	assert.True(t, strings.HasPrefix(dir2, "Swatinem-rust-cache-v2-7-0-"), "got %q", dir2)
+	assert.Regexp(t, `^Swatinem-rust-cache-v2-7-0-[0-9a-f]{8}$`, dir2)
+
+	// Same input → same dir (deterministic).
+	assert.Equal(t, dir, ref.ActionDir())
+}
+
+// TestActionRef_ActionDir_NoCollisions guards against bug 019 finding C:
+// distinct refs that sanitize to the same prefix must still produce
+// distinct ActionDir outputs.
+func TestActionRef_ActionDir_NoCollisions(t *testing.T) {
+	refs := []string{"v4.0.0", "v4-0-0", "v4_0_0", "v4/0/0", "v4 0 0"}
+	seen := make(map[string]string, len(refs))
+	for _, r := range refs {
+		dir := (&ActionRef{Org: "actions", Repo: "cache", Ref: r}).ActionDir()
+		if prev, dup := seen[dir]; dup {
+			t.Fatalf("collision: ref %q and %q both map to %q", prev, r, dir)
+		}
+		seen[dir] = r
+		// The result must still pass the cache handler's isSafeActionDir
+		// charset (lowercase/uppercase letters, digits, `-`, `_`).
+		for _, ch := range dir {
+			ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+				(ch >= '0' && ch <= '9') || ch == '-' || ch == '_'
+			assert.True(t, ok, "ref %q produced dir %q with disallowed char %q", r, dir, ch)
+		}
+	}
 }
 
 func TestActionRef_String(t *testing.T) {

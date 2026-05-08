@@ -2,6 +2,7 @@ package actions
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strings"
 )
 
@@ -108,8 +109,10 @@ func (a *ActionRef) CloneURL(defaultActionsURL string) string {
 }
 
 // ActionDir returns a unique directory name for this action within /actions.
+// The sanitized prefix collapses any character outside [a-zA-Z0-9_-] to `-`,
+// which loses information (`v4.0.0` and `v4-0-0` would otherwise collide),
+// so we append an FNV-1a hash of the original org/repo@ref to disambiguate.
 func (a *ActionRef) ActionDir() string {
-	// Sanitize for filesystem: "actions/cache@v4" → "actions-cache-v4"
 	name := fmt.Sprintf("%s-%s-%s", a.Org, a.Repo, a.Ref)
 	name = strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
@@ -117,7 +120,9 @@ func (a *ActionRef) ActionDir() string {
 		}
 		return '-'
 	}, name)
-	return name
+	h := fnv.New32a()
+	fmt.Fprintf(h, "%s/%s@%s", a.Org, a.Repo, a.Ref)
+	return fmt.Sprintf("%s-%08x", name, h.Sum32())
 }
 
 // String returns a human-readable representation.

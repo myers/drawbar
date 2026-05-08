@@ -270,7 +270,7 @@ func TestLoadAction_MagicAction_NoClone(t *testing.T) {
 	require.NotNil(t, meta)
 	assert.True(t, meta.Magic)
 	assert.Equal(t, ref, meta.Ref)
-	assert.Equal(t, "drawbar-cache-v1", meta.Dir)
+	assert.Equal(t, ref.ActionDir(), meta.Dir)
 
 	// Cache dir must not have been created.
 	_, statErr := os.Stat("/nonexistent/should/never/be/created")
