@@ -110,14 +110,14 @@ func TestMakeTaskHandler_RunStep_Success(t *testing.T) {
 	// 2. Fake k8s client with pre-created pod.
 	k8sClient := fake.NewSimpleClientset()
 
-	// The handler creates the job, then WatchJob looks for pods with label job-name=X.
-	// We need to create the pod AFTER the job is created. Use a goroutine to watch for the job.
+	// The handler creates the job, then WatchJob looks for pods with
+	// label job-name=X. Wait until the job exists (bound by t.Context
+	// so a slow handler can't outrun a fixed deadline), then create
+	// the matching pod.
+	spawnCtx := t.Context()
 	go func() {
-		// Wait for job to appear, then create a pod that starts Running
-		// and quickly transitions to Terminated.
-		for i := 0; i < 100; i++ {
-			time.Sleep(10 * time.Millisecond)
-			jobs, _ := k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+		for {
+			jobs, _ := k8sClient.BatchV1().Jobs("test-ns").List(spawnCtx, metav1.ListOptions{})
 			if len(jobs.Items) > 0 {
 				pod := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -139,8 +139,13 @@ func TestMakeTaskHandler_RunStep_Success(t *testing.T) {
 						},
 					},
 				}
-				k8sClient.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
+				k8sClient.CoreV1().Pods("test-ns").Create(spawnCtx, pod, metav1.CreateOptions{})
 				return
+			}
+			select {
+			case <-spawnCtx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}()
@@ -336,12 +341,18 @@ func newHandlerTestEnv(t *testing.T) *handlerTestEnv {
 	}
 }
 
+// spawnPod polls the fake clientset for a Job in ns, then creates a
+// matching Pod (terminated, exit 0) so WatchJob's pod-wait can
+// progress. Bound by t.Context() — auto-cancelled at test cleanup —
+// so a slow handler (e.g. git-cloning an action on a contended CI
+// runner) can't outrun a hardcoded iteration cap. Same shape as
+// production's pkg/k8s.waitForPod.
 func (e *handlerTestEnv) spawnPod(ns string, taskID int64) {
 	e.t.Helper()
+	ctx := e.t.Context()
 	go func() {
-		for i := 0; i < 100; i++ {
-			time.Sleep(10 * time.Millisecond)
-			jobs, _ := e.k8sClient.BatchV1().Jobs(ns).List(context.Background(), metav1.ListOptions{})
+		for {
+			jobs, _ := e.k8sClient.BatchV1().Jobs(ns).List(ctx, metav1.ListOptions{})
 			if len(jobs.Items) > 0 {
 				pod := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -355,8 +366,13 @@ func (e *handlerTestEnv) spawnPod(ns string, taskID int64) {
 						}},
 					},
 				}
-				e.k8sClient.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+				e.k8sClient.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}()
@@ -684,10 +700,10 @@ func TestMakeTaskHandler_ShutdownRecovery_ReportsFailureAndDeletesJob(t *testing
 	//    waitForContainerRunning unblocks and we get into the streaming phase
 	//    where the blocking executor/streamer can be cancelled.
 	k8sClient := fake.NewSimpleClientset()
+	spawnCtx := t.Context()
 	go func() {
-		for i := 0; i < 100; i++ {
-			time.Sleep(10 * time.Millisecond)
-			jobs, _ := k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+		for {
+			jobs, _ := k8sClient.BatchV1().Jobs("test-ns").List(spawnCtx, metav1.ListOptions{})
 			if len(jobs.Items) > 0 {
 				pod := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -704,8 +720,13 @@ func TestMakeTaskHandler_ShutdownRecovery_ReportsFailureAndDeletesJob(t *testing
 						},
 					},
 				}
-				k8sClient.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
+				k8sClient.CoreV1().Pods("test-ns").Create(spawnCtx, pod, metav1.CreateOptions{})
 				return
+			}
+			select {
+			case <-spawnCtx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}()

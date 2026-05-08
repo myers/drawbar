@@ -156,11 +156,12 @@ jobs:
 	// 2. Fake k8s client.
 	k8sClient := fake.NewSimpleClientset()
 
-	// Goroutine to create pod once job appears.
+	// Goroutine to create pod once job appears. Bound by t.Context()
+	// so the goroutine can't outlive the test.
+	spawnCtx := t.Context()
 	go func() {
-		for i := 0; i < 200; i++ {
-			time.Sleep(10 * time.Millisecond)
-			jobs, _ := k8sClient.BatchV1().Jobs("ci-jobs").List(context.Background(), metav1.ListOptions{})
+		for {
+			jobs, _ := k8sClient.BatchV1().Jobs("ci-jobs").List(spawnCtx, metav1.ListOptions{})
 			if len(jobs.Items) > 0 {
 				pod := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -175,8 +176,13 @@ jobs:
 						}},
 					},
 				}
-				k8sClient.CoreV1().Pods("ci-jobs").Create(context.Background(), pod, metav1.CreateOptions{})
+				k8sClient.CoreV1().Pods("ci-jobs").Create(spawnCtx, pod, metav1.CreateOptions{})
 				return
+			}
+			select {
+			case <-spawnCtx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}()
@@ -219,10 +225,10 @@ jobs:
 	// 5. Run with timeout — cancel after task should be done.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-	// Cancel once task is reported.
+	// Cancel run() once the task result has been reported. Outer ctx
+	// (5s) is the safety net if the task never reports.
 	go func() {
-		for i := 0; i < 200; i++ {
-			time.Sleep(25 * time.Millisecond)
+		for {
 			fjs.mu.Lock()
 			done := fjs.lastResult != runnerv1.Result_RESULT_UNSPECIFIED
 			fjs.mu.Unlock()
@@ -231,8 +237,12 @@ jobs:
 				cancel()
 				return
 			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(25 * time.Millisecond):
+			}
 		}
-		cancel()
 	}()
 
 	err = run(ctx, cfg, runDeps{
