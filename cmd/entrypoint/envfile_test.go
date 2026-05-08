@@ -89,9 +89,11 @@ func TestParseEnvFile_ValueContainingDoubleAngle(t *testing.T) {
 	assertEq(t, got["FOLLOWUP"], "ok")
 }
 
-// TestParseEnvFile_HeredocStillWorks locks in that the `<<` precedence
-// fix doesn't regress the heredoc form when there's no `=` before the `<<`.
-func TestParseEnvFile_HeredocAfterFixStillParses(t *testing.T) {
+// TestParseEnvFile_HeredocWithoutEquals locks in the heredoc form when
+// no `=` precedes the `<<`. Sits next to TestParseEnvFile_ValueContainingDoubleAngle
+// so the precedence rule is self-documenting: with `=` before `<<` the
+// line is key=value; without, it's a heredoc start.
+func TestParseEnvFile_HeredocWithoutEquals(t *testing.T) {
 	f := writeTemp(t, "PATCH<<END\ndiff --git a/x b/x\nEND\n")
 	got, err := parseEnvFile(f)
 	if err != nil {

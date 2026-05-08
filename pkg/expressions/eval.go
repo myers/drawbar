@@ -97,13 +97,22 @@ func (e *Evaluator) SetStepResult(stepID string, outcome string, continueOnError
 	if e.env.Steps == nil {
 		e.env.Steps = make(map[string]*model.StepResult)
 	}
-	outcomeStatus := model.StepStatusSuccess
-	conclusionStatus := model.StepStatusSuccess
-	if outcome == "failure" {
+	var outcomeStatus, conclusionStatus = model.StepStatusSuccess, model.StepStatusSuccess
+	switch outcome {
+	case "success":
+		// Both already success; nothing to do.
+	case "failure":
 		outcomeStatus = model.StepStatusFailure
 		if !continueOnError {
 			conclusionStatus = model.StepStatusFailure
 		}
+	default:
+		// An unknown outcome is a contract violation by the caller — today
+		// only "success" and "failure" are passed. Don't fail a healthy
+		// job over it; warn so the divergence is visible and fall through
+		// to the success default.
+		slog.Warn("unknown step outcome, defaulting to success",
+			"step", stepID, "outcome", outcome)
 	}
 	e.env.Steps[stepID] = &model.StepResult{
 		Outcome:    outcomeStatus,

@@ -229,3 +229,27 @@ the index of `=` and `<<` and only treats a line as a heredoc
 start if `<<` appears in the key portion (i.e. before any `=`).
 A line like `KEY=value<<weird` parses as the obvious key=value.
 Test: `TestParseEnvFile_ValueContainingDoubleAngle`.
+
+### Review follow-ups
+
+`/review` of the fix commit raised three minor follow-ups, addressed
+in a small follow-up commit:
+
+- **`--noprofile --norc` workflow risk:** verified — ripgrep across
+  `actions/`, `hack/`, `deploy/`, and all repo `.yml`/`.yaml` files
+  found no workflows that `source ~/.bashrc` or `source /etc/profile`.
+  The repo doesn't ship example workflows; the deploy YAMLs are k8s
+  manifests, not Actions workflows. Matches the GitHub Actions runner
+  default — no action needed.
+- **Test rename:** `TestParseEnvFile_HeredocAfterFixStillParses` →
+  `TestParseEnvFile_HeredocWithoutEquals`. The "AfterFix" qualifier
+  was temporal and would rot; the new name describes the syntax under
+  test (heredoc with no `=` before `<<`).
+- **Outcome-string contract:** `SetStepResult` now uses an explicit
+  `switch` over the documented outcome values (`success`, `failure`)
+  with a default arm that warn-logs the offending value and falls
+  back to success. Today's only callers pass `"success"` or
+  `"failure"`; the guard makes the contract obvious in the function
+  body so a future "skipped" path either extends the switch or calls
+  a new method instead of silently mapping to success. Test:
+  `TestSetStepResult_UnknownOutcomeWarnsAndDefaultsToSuccess`.

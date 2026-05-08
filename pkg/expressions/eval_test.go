@@ -1,6 +1,8 @@
 package expressions
 
 import (
+	"bytes"
+	"log/slog"
 	"testing"
 
 	"github.com/nektos/act/pkg/exprparser"
@@ -276,4 +278,33 @@ func TestSetStepResult_FailureFunctionRespectsConclusion(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, tripped,
 		"failure() must not trip when the only failed step had continue-on-error: true")
+}
+
+// TestSetStepResult_UnknownOutcomeWarnsAndDefaultsToSuccess hardens the
+// outcome-string contract. Today's only callers pass "success" or
+// "failure"; anything else (a future "skipped" path, a typo, a refactor
+// that forgets to extend the function) must NOT silently land as success
+// without surfacing the divergence. Behavior on unknown input: warn-log
+// the offending value AND default to success (preserving prior behavior
+// so an unknown value can't fail a successful job).
+func TestSetStepResult_UnknownOutcomeWarnsAndDefaultsToSuccess(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	env := &exprparser.EvaluationEnvironment{
+		Github: &model.GithubContext{},
+		Steps:  make(map[string]*model.StepResult),
+	}
+	eval := NewEvaluator(env)
+	eval.SetStepResult("weird", "skipped", false, nil)
+
+	assert.Equal(t, "success", env.Steps["weird"].Outcome.String(),
+		"unknown outcome must default to success (preserving prior behavior)")
+	assert.Equal(t, "success", env.Steps["weird"].Conclusion.String())
+	assert.Contains(t, buf.String(), "unknown step outcome",
+		"unknown outcome must surface a warn log; got: %q", buf.String())
+	assert.Contains(t, buf.String(), "skipped",
+		"warn log must include the offending value; got: %q", buf.String())
 }
