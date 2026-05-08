@@ -85,8 +85,12 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		"app.kubernetes.io/managed-by": "drawbar",
 		"drawbar.dev/task-id":          fmt.Sprintf("%d", cfg.TaskID),
 	}
-	if cfg.RunID != "" {
-		labels["drawbar.dev/run-id"] = cfg.RunID
+	// run_id flows in from the forge runner protocol — Forgejo/Gitea ship a
+	// numeric string today, but a malformed/spoofed value would otherwise
+	// fail Job creation with `invalid label value`. Sanitize defensively;
+	// drop the label entirely if nothing usable remains.
+	if runID := SanitizeLabelValue(cfg.RunID); runID != "" {
+		labels["drawbar.dev/run-id"] = runID
 	}
 
 	// Build the manifest JSON.

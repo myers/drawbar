@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/myers/drawbar/pkg/k8s"
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapshotclient "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned"
 
@@ -81,7 +82,7 @@ func (m *Manager) FindSnapshot(ctx context.Context, repo, cacheKey string, resto
 func (m *Manager) findByExactKey(ctx context.Context, repo, cacheKey string) (*snapshotv1.VolumeSnapshot, error) {
 	selector := fmt.Sprintf("%s=%s,%s=%s,%s=%s",
 		labelManagedBy, managerName,
-		labelRepository, sanitizeLabelValue(repo),
+		labelRepository, k8s.SanitizeLabelValue(repo),
 		labelCacheKey, HashCacheKey(cacheKey),
 	)
 
@@ -98,7 +99,7 @@ func (m *Manager) findByPrefix(ctx context.Context, repo string, prefixes []stri
 	// List all snapshots for this repo.
 	selector := fmt.Sprintf("%s=%s,%s=%s",
 		labelManagedBy, managerName,
-		labelRepository, sanitizeLabelValue(repo),
+		labelRepository, k8s.SanitizeLabelValue(repo),
 	)
 
 	list, err := m.SnapshotClient.SnapshotV1().VolumeSnapshots(m.Namespace).List(ctx, metav1.ListOptions{
@@ -154,6 +155,11 @@ type pvcOptions struct {
 // labelManagedBy label is always applied and cannot be overridden via
 // WithLabel — callers can tag PVCs (e.g. by task-id for orphan cleanup)
 // without risk of clobbering the manager's identity label.
+//
+// Value is not sanitized here: callers must pass a value that already
+// matches the k8s label-value regex. Use k8s.SanitizeLabelValue if the
+// source string may contain characters outside [-A-Za-z0-9_.] or have
+// leading/trailing non-alphanumerics.
 func WithLabel(key, value string) PVCOption {
 	return func(o *pvcOptions) {
 		if o.labels == nil {
@@ -238,7 +244,7 @@ func (m *Manager) SnapshotPVC(ctx context.Context, pvcName, snapshotName, repo, 
 			Namespace: m.Namespace,
 			Labels: map[string]string{
 				labelManagedBy:  managerName,
-				labelRepository: sanitizeLabelValue(repo),
+				labelRepository: k8s.SanitizeLabelValue(repo),
 				labelCacheKey:   HashCacheKey(cacheKey),
 			},
 			Annotations: map[string]string{
@@ -332,18 +338,3 @@ func mergeLabels(extra, defaults map[string]string) map[string]string {
 	return out
 }
 
-// sanitizeLabelValue makes a string safe for k8s label values (max 63 chars, alphanumeric + dash/dot/underscore).
-func sanitizeLabelValue(s string) string {
-	if len(s) > 63 {
-		s = s[:63]
-	}
-	var b []byte
-	for _, c := range []byte(s) {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
-			b = append(b, c)
-		} else {
-			b = append(b, '-')
-		}
-	}
-	return string(b)
-}

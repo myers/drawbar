@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -406,6 +407,29 @@ func defaultWatchConfig() k8s.WatchConfig {
 	}
 }
 
+// extractManifestJSON pulls the manifest body out of the setup-shim
+// container's heredoc-wrapped Args[0]. The shim command is
+// `cat > /shim/manifest.json << 'MANIFEST_<hex>'\n<json>\nMANIFEST_<hex>\nexec ...`
+// so we slice between the first newline after the opening delimiter and
+// the matching closing delimiter.
+func extractManifestJSON(t *testing.T, setupCmd string) string {
+	t.Helper()
+	const open = "<< '"
+	o := strings.Index(setupCmd, open)
+	require.GreaterOrEqual(t, o, 0, "no heredoc opener in setup cmd")
+	o += len(open)
+	end := strings.Index(setupCmd[o:], "'")
+	require.GreaterOrEqual(t, end, 0, "no closing quote on heredoc delimiter")
+	delim := setupCmd[o : o+end]
+	bodyStart := o + end + 1
+	nl := strings.Index(setupCmd[bodyStart:], "\n")
+	require.GreaterOrEqual(t, nl, 0, "no newline after heredoc opener")
+	bodyStart += nl + 1
+	closeIdx := strings.Index(setupCmd[bodyStart:], "\n"+delim)
+	require.GreaterOrEqual(t, closeIdx, 0, "no closing delimiter")
+	return setupCmd[bodyStart : bodyStart+closeIdx]
+}
+
 // --- Action step (with pre-cached action) ---
 
 func TestMakeTaskHandler_ActionStep(t *testing.T) {
@@ -478,6 +502,97 @@ jobs:
 	assert.Contains(t, manifest, `"args":["node"`)
 	// And should NOT contain a non-empty "command" for the action step (Script mode).
 	// The only "command" should be empty for the action step.
+}
+
+// TestMakeTaskHandler_AutoStepIDIndexesByWorkflowPosition asserts that auto
+// step IDs ("step-N") track the position of the step in the *workflow*'s
+// steps: array, not the cumulative count of expanded specs. A composite
+// action that expands to N specs must not shift the auto ID of the next
+// workflow step. Bug 022 / Finding A.
+func TestMakeTaskHandler_AutoStepIDIndexesByWorkflowPosition(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	env := newHandlerTestEnv(t)
+	env.spawnPod("test-ns", 22)
+
+	cacheDir := t.TempDir()
+	actionCache := actions.NewActionCache(cacheDir)
+
+	// Composite action that expands to 3 run: steps.
+	baseDir, _, _ := setupActionRepo(t, "myorg", "trio", map[string]string{
+		"action.yml": `name: trio
+runs:
+  using: composite
+  steps:
+    - run: echo one
+      shell: bash
+    - run: echo two
+      shell: bash
+    - run: echo three
+      shell: bash
+`,
+	})
+
+	task := &runnerv1.Task{
+		Id: 22,
+		WorkflowPayload: []byte(`name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: myorg/trio@main
+      - run: echo after
+`),
+		Context: defaultTaskContext(),
+		Secrets: map[string]string{},
+	}
+
+	handler := makeTaskHandler(TaskHandlerConfig{
+		K8sClient:    env.k8sClient,
+		ServerClient: env.forgejoClient,
+		Labels:       labels.Labels{labels.MustParse("ubuntu-latest:docker://node:24")},
+		Namespace:    "test-ns",
+		Timeout:      5 * time.Minute,
+		ActionsURL:   baseDir,
+		ActionCache:  actionCache,
+		WatchConfig:  defaultWatchConfig(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	handler(ctx, task)
+
+	jobs, err := env.k8sClient.BatchV1().Jobs("test-ns").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, jobs.Items)
+	var shim *corev1.Container
+	for i, c := range jobs.Items[0].Spec.Template.Spec.InitContainers {
+		if c.Name == "setup-shim" {
+			shim = &jobs.Items[0].Spec.Template.Spec.InitContainers[i]
+			break
+		}
+	}
+	require.NotNil(t, shim)
+
+	manifestJSON := extractManifestJSON(t, shim.Args[0])
+	var m struct {
+		Steps []struct {
+			ID string `json:"id"`
+		} `json:"steps"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(manifestJSON), &m))
+	require.Len(t, m.Steps, 4, "3 composite expansions + 1 trailing run")
+
+	// First workflow step expands to step-0, step-0-1, step-0-2.
+	assert.Equal(t, "step-0", m.Steps[0].ID)
+	assert.Equal(t, "step-0-1", m.Steps[1].ID)
+	assert.Equal(t, "step-0-2", m.Steps[2].ID)
+	// The trailing run: step is the *second* workflow step, so step-1
+	// (not step-3, which is what the buggy len(steps)-based ID would give).
+	assert.Equal(t, "step-1", m.Steps[3].ID)
 }
 
 // --- Services ---

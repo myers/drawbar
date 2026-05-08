@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	drawbark8s "github.com/myers/drawbar/pkg/k8s"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -55,7 +56,7 @@ func TestFindSnapshot_Hit(t *testing.T) {
 			Namespace: "test-ns",
 			Labels: map[string]string{
 				labelManagedBy:  managerName,
-				labelRepository: sanitizeLabelValue("myorg/myrepo"),
+				labelRepository: drawbark8s.SanitizeLabelValue("myorg/myrepo"),
 				labelCacheKey:   HashCacheKey("my-cache-key"),
 			},
 		},
@@ -166,7 +167,7 @@ func TestSnapshotPVC(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "snap-42", snap.Name)
 	assert.Equal(t, managerName, snap.Labels[labelManagedBy])
-	assert.Equal(t, sanitizeLabelValue("myorg/myrepo"), snap.Labels[labelRepository])
+	assert.Equal(t, drawbark8s.SanitizeLabelValue("myorg/myrepo"), snap.Labels[labelRepository])
 	assert.Equal(t, HashCacheKey("my-cache-key"), snap.Labels[labelCacheKey])
 	assert.Equal(t, "my-cache-key", snap.Annotations[annotationKeyRaw])
 
@@ -232,8 +233,3 @@ func TestGarbageCollect(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestSanitizeLabelValue(t *testing.T) {
-	assert.Equal(t, "myorg-myrepo", sanitizeLabelValue("myorg/myrepo"))
-	assert.Equal(t, "simple", sanitizeLabelValue("simple"))
-	assert.Len(t, sanitizeLabelValue("a very long string that exceeds the sixty three character kubernetes label value limit by quite a bit"), 63)
-}

@@ -38,7 +38,7 @@ steps:
           /^REGISTRY_USER=/{u=$2}
           /^REGISTRY_TOKEN=/{t=$2}
           END {
-            cmd = "echo -n \"" u ":" t "\" | base64"
+            cmd = "printf %s:%s \"" u "\" \"" t "\" | base64 | tr -d \"\\n\""
             cmd | getline auth
             close(cmd)
             print "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"" auth "\"}}}"
@@ -75,7 +75,7 @@ steps:
           /^REGISTRY_USER=/{u=$2}
           /^REGISTRY_TOKEN=/{t=$2}
           END {
-            cmd = "echo -n \"" u ":" t "\" | base64"
+            cmd = "printf %s:%s \"" u "\" \"" t "\" | base64 | tr -d \"\\n\""
             cmd | getline auth
             close(cmd)
             print "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"" auth "\"}}}"

@@ -40,7 +40,7 @@ jobs:
       - name: Push Helm chart
         run: |
           mkdir -p ~/.config/helm/registry
-          AUTH=$(echo -n "${REGISTRY_USER}:${REGISTRY_TOKEN}" | base64)
+          AUTH=$(printf '%s:%s' "${REGISTRY_USER}" "${REGISTRY_TOKEN}" | base64 | tr -d '\n')
           echo "{\"auths\":{\"fj.monoloco.net\":{\"auth\":\"${AUTH}\"}}}" > ~/.config/helm/registry/config.json
           helm package deploy/helm/drawbar
           helm push drawbar-*.tgz oci://fj.monoloco.net/chaos-inc

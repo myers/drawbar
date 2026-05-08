@@ -1,6 +1,14 @@
 # Auto step IDs misalign after composite expansion, k8s label sanitize can produce invalid values, and base64 line-wrap corrupts CI registry auth
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
+**Status: fixed 2026-05-08.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
+
+Follow-up beyond the original three findings: review of the fix flagged
+that `cfg.RunID` (from the forge runner protocol) was reaching k8s job
+labels unsanitized in `pkg/k8s/builder.go`. Same fix family as Finding B
+— defense-in-depth against a malformed/spoofed `run_id` failing job
+creation. `sanitizeLabelValue` was lifted into the new exported
+`k8s.SanitizeLabelValue` so both `pkg/snapshot` and `pkg/k8s` can share
+it.
 Three small independent findings — the "leftovers" group from the
 ultrareview triage. Each is genuinely small; together they're one
 plucking-them-off session.

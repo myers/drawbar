@@ -59,7 +59,7 @@ runs:
         # Registry authentication via docker config (buildctl reads it).
         if [ -n "$REGISTRY" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
           mkdir -p "$HOME/.docker"
-          AUTH=$(printf '%s:%s' "$USERNAME" "$PASSWORD" | base64)
+          AUTH=$(printf '%s:%s' "$USERNAME" "$PASSWORD" | base64 | tr -d '\n')
           printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
         fi
 

@@ -448,3 +448,53 @@ func TestBuildJob_RunnerContainerHasUsernsCapabilities(t *testing.T) {
 		[]corev1.Capability{"SETUID", "SETGID", "CHOWN", "FOWNER", "DAC_OVERRIDE"},
 		runner.SecurityContext.Capabilities.Add)
 }
+
+// TestBuildJob_RunIDLabelSanitized covers the defensive sanitization at
+// builder.go's run-id label assignment. A malformed run_id from the forge
+// runner protocol must not produce an invalid k8s label value.
+func TestBuildJob_RunIDLabelSanitized(t *testing.T) {
+	baseCfg := func(runID string) JobConfig {
+		return JobConfig{
+			TaskID:          1,
+			RunID:           runID,
+			JobName:         "build",
+			Namespace:       "drawbar",
+			Image:           "node:24-trixie",
+			ControllerImage: "ghcr.io/myers/drawbar:latest",
+			Steps:           []types.StepSpec{{ID: "x", Name: "x", Script: "true"}},
+		}
+	}
+
+	t.Run("clean numeric run_id passes through", func(t *testing.T) {
+		job, err := BuildJob(baseCfg("12345"))
+		require.NoError(t, err)
+		assert.Equal(t, "12345", job.Labels["drawbar.dev/run-id"])
+		assert.Equal(t, "12345", job.Spec.Template.Labels["drawbar.dev/run-id"])
+	})
+
+	t.Run("leading underscore is stripped", func(t *testing.T) {
+		job, err := BuildJob(baseCfg("_bad"))
+		require.NoError(t, err)
+		assert.Equal(t, "bad", job.Labels["drawbar.dev/run-id"])
+	})
+
+	t.Run("invalid chars become dashes", func(t *testing.T) {
+		job, err := BuildJob(baseCfg("run/42:abc"))
+		require.NoError(t, err)
+		assert.Equal(t, "run-42-abc", job.Labels["drawbar.dev/run-id"])
+	})
+
+	t.Run("all-invalid input drops the label entirely", func(t *testing.T) {
+		job, err := BuildJob(baseCfg(":::"))
+		require.NoError(t, err)
+		_, ok := job.Labels["drawbar.dev/run-id"]
+		assert.False(t, ok, "run-id label should be omitted when input has no valid chars")
+	})
+
+	t.Run("empty run_id stays absent", func(t *testing.T) {
+		job, err := BuildJob(baseCfg(""))
+		require.NoError(t, err)
+		_, ok := job.Labels["drawbar.dev/run-id"]
+		assert.False(t, ok)
+	})
+}

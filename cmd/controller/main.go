@@ -632,11 +632,13 @@ func makeTaskHandler(cfg TaskHandlerConfig) server.TaskHandler {
 		ectx := actions.NewExpandCtx(cfg.ActionCache, resolvedActionsURL, actionToken)
 
 		// Build step specs — all steps are included, with raw if: expressions.
+		// Auto IDs use the workflow step index so composite-action expansions
+		// (one workflow step → many specs) don't shift later steps' IDs.
 		steps := make([]types.StepSpec, 0, len(parsed.Steps))
-		for _, step := range parsed.Steps {
+		for workflowIdx, step := range parsed.Steps {
 			stepID := step.ID
 			if stepID == "" {
-				stepID = fmt.Sprintf("step-%d", len(steps))
+				stepID = fmt.Sprintf("step-%d", workflowIdx)
 			}
 
 			// Capture the raw if: expression for runtime evaluation.
