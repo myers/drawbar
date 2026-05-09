@@ -441,3 +441,22 @@ func TestNewLogMasker_MixedLengths(t *testing.T) {
 	assert.Equal(t, "has ***", m.mask("has long-secret"))
 	assert.Contains(t, m.mask("ab still here"), "ab") // "ab" not masked (too short)
 }
+
+// TestFormatStepResults pins the bug 025 diagnostic format. Failing this
+// means the slog output the test-cluster agent is parsing has changed
+// shape; update both call sites in lockstep.
+func TestFormatStepResults(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		assert.Equal(t, "[]", formatStepResults(nil))
+	})
+
+	t.Run("mixed", func(t *testing.T) {
+		steps := []*runnerv1.StepState{
+			{Result: runnerv1.Result_RESULT_SUCCESS},
+			{Result: runnerv1.Result_RESULT_SUCCESS},
+			{Result: runnerv1.Result_RESULT_FAILURE},
+			{Result: runnerv1.Result_RESULT_UNSPECIFIED},
+		}
+		assert.Equal(t, "0=SUCCESS,1=SUCCESS,2=FAILURE,3=UNSPECIFIED", formatStepResults(steps))
+	})
+}

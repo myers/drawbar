@@ -231,6 +231,18 @@ func (r *Reporter) flushState(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 
+	// Bug 025 diagnostic: log the per-step Result shape we're about to
+	// ship so we can correlate gitea's persisted records against what
+	// drawbar actually sent. Debug-level — only fires when the
+	// controller runs with LOG_LEVEL=debug.
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("reporter flushState",
+			"task_id", r.taskID,
+			"job_result", state.Result.String(),
+			"steps", formatStepResults(state.Steps),
+		)
+	}
+
 	resp, err := r.client.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: state,
 	}))
@@ -247,6 +259,21 @@ func (r *Reporter) flushState(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// formatStepResults renders a compact "0=SUCCESS,1=SUCCESS,2=UNSPECIFIED"
+// summary of per-step Results. Used as a slog field value for the bug 025
+// diagnostic. Strips the "RESULT_" prefix to keep log lines readable.
+func formatStepResults(steps []*runnerv1.StepState) string {
+	if len(steps) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(steps))
+	for i, s := range steps {
+		name := strings.TrimPrefix(s.GetResult().String(), "RESULT_")
+		parts[i] = fmt.Sprintf("%d=%s", i, name)
+	}
+	return strings.Join(parts, ",")
 }
 
 // RunDaemon starts periodic flushing in the background.

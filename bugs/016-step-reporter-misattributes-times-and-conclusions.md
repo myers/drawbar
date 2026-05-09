@@ -1,8 +1,18 @@
 # Step reporter mis-attributes start/end times and conclusion across sequential steps
 
-**Status: fixed 2026-05-06** in commits `97cfb9f..345fe58` (state
-streaming refactor). See the Resolution section at the bottom of
-this doc and `docs/superpowers/specs/2026-05-06-step-state-streaming-design.md`.
+**Status: fixed-in-part 2026-05-06** in commits `97cfb9f..345fe58`
+(state streaming refactor). The streaming fix addressed the
+lost-trailing-event symptoms — zero durations and mis-attributed
+`started_at`. The remaining symptom from this doc — every step
+reporting `conclusion=failure` when only later steps actually
+failed — was confirmed *still present* by the test-cluster agent
+on image `1a88d9d` (2026-05-09) and has been split out to
+**bug 025**
+(`bugs/025-step-result-fallback-to-job-conclusion.md`).
+
+See the Resolution section at the bottom of this doc and
+`docs/superpowers/specs/2026-05-06-step-state-streaming-design.md`
+for what this fix did cover.
 
 Surfaced 2026-05-06 while shaking down image
 `main-1778069066-4cb729d9` (the bug 014/015 fix). Drawbar is reporting
