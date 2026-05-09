@@ -168,12 +168,15 @@ func (r *Reporter) FinishStep(stepIdx int, result runnerv1.Result) {
 	step.StoppedAt = timestamppb.Now()
 }
 
-// Flush sends pending logs and state to Forgejo.
+// Flush sends pending logs and state to Forgejo. Interim flush — the
+// outbound `state.Result` is forced to RESULT_UNSPECIFIED regardless of
+// internal state, so gitea doesn't treat the call as terminal. Per-step
+// Results are passed through as-is. See bug 025.
 func (r *Reporter) Flush(ctx context.Context) error {
 	if err := r.flushLogs(ctx, false); err != nil {
 		return fmt.Errorf("flushing logs: %w", err)
 	}
-	if err := r.flushState(ctx); err != nil {
+	if err := r.flushState(ctx, false); err != nil {
 		return fmt.Errorf("flushing state: %w", err)
 	}
 	return nil
@@ -216,7 +219,17 @@ func (r *Reporter) flushLogs(ctx context.Context, noMore bool) error {
 	return nil
 }
 
-func (r *Reporter) flushState(ctx context.Context) error {
+// flushState ships the current TaskState to Forgejo. When final is false,
+// state.Result on the outbound payload is forced to RESULT_UNSPECIFIED —
+// gitea uses any non-UNSPECIFIED job-level Result as a signal that the
+// task has terminated, and on a terminated task it reconciles step
+// records by stamping the job conclusion onto any step whose own Result
+// hadn't been observed in a *prior* update. The reference act_runner
+// follows the same pattern (see
+// reference/runner/internal/pkg/report/reporter.go:511). Per-step Results
+// are always passed through as-is — the clamp only affects the
+// job-level field. Bug 025.
+func (r *Reporter) flushState(ctx context.Context, final bool) error {
 	r.mu.Lock()
 	steps := make([]*runnerv1.StepState, len(r.state.Steps))
 	for i, s := range r.state.Steps {
@@ -231,6 +244,10 @@ func (r *Reporter) flushState(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 
+	if !final {
+		state.Result = runnerv1.Result_RESULT_UNSPECIFIED
+	}
+
 	// Bug 025 diagnostic: log the per-step Result shape we're about to
 	// ship so we can correlate gitea's persisted records against what
 	// drawbar actually sent. Debug-level — only fires when the
@@ -238,6 +255,7 @@ func (r *Reporter) flushState(ctx context.Context) error {
 	if slog.Default().Enabled(ctx, slog.LevelDebug) {
 		slog.Debug("reporter flushState",
 			"task_id", r.taskID,
+			"final", final,
 			"job_result", state.Result.String(),
 			"steps", formatStepResults(state.Steps),
 		)
@@ -332,7 +350,7 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 			continue
 		}
 
-		if err := r.flushState(ctx); err != nil {
+		if err := r.flushState(ctx, true); err != nil {
 			slog.Warn("final state flush failed, retrying",
 				"attempt", attempt+1, "error", err)
 			lastErr = err

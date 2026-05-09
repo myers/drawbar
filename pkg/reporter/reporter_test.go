@@ -442,6 +442,84 @@ func TestNewLogMasker_MixedLengths(t *testing.T) {
 	assert.Contains(t, m.mask("ab still here"), "ab") // "ab" not masked (too short)
 }
 
+// TestReporter_FlushClampsJobResultOnInterim verifies the bug 025 fix:
+// an interim Flush() must not ship a non-UNSPECIFIED state.Result, even
+// if the reporter's internal state already reflects step completions.
+// gitea uses the job-level Result as a "task is terminal" signal and
+// reconciles step records against the job conclusion when it sees
+// terminal — so an interim flush carrying SUCCESS/FAILURE causes
+// mid-run steps to be incorrectly stamped with the job conclusion.
+//
+// Per-step Results must always pass through as-is on both interim and
+// close-time flushes; only the job-level field is clamped.
+func TestReporter_FlushClampsJobResultOnInterim(t *testing.T) {
+	mc := newMockClient()
+	rep := New(mc, 1, 3, time.Hour)
+
+	// Mid-run state: one step succeeded, two haven't reached terminal.
+	rep.StartStep(0)
+	rep.FinishStep(0, runnerv1.Result_RESULT_SUCCESS)
+	rep.StartStep(1)
+
+	require.NoError(t, rep.Flush(context.Background()))
+
+	calls := mc.getTaskCalls()
+	require.Len(t, calls, 1)
+	state := calls[0].State
+
+	assert.Equal(t, runnerv1.Result_RESULT_UNSPECIFIED, state.Result,
+		"interim Flush must clamp job-level Result to UNSPECIFIED")
+	// Per-step Results must NOT be clamped.
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, state.Steps[0].Result)
+	assert.Equal(t, runnerv1.Result_RESULT_UNSPECIFIED, state.Steps[1].Result)
+	assert.Equal(t, runnerv1.Result_RESULT_UNSPECIFIED, state.Steps[2].Result)
+}
+
+// TestReporter_CloseShipsTerminalJobResult is the close-time counterpart:
+// the *final* flush from Close must carry the real terminal Result so
+// gitea persists the right job conclusion.
+func TestReporter_CloseShipsTerminalJobResult(t *testing.T) {
+	mc := newMockClient()
+	rep := New(mc, 1, 2, time.Hour)
+
+	rep.StartStep(0)
+	rep.FinishStep(0, runnerv1.Result_RESULT_SUCCESS)
+	rep.StartStep(1)
+	rep.FinishStep(1, runnerv1.Result_RESULT_FAILURE)
+
+	require.NoError(t, rep.Close(context.Background(), runnerv1.Result_RESULT_FAILURE))
+
+	calls := mc.getTaskCalls()
+	require.NotEmpty(t, calls)
+	final := calls[len(calls)-1].State
+	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, final.Result)
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, final.Steps[0].Result)
+	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, final.Steps[1].Result)
+}
+
+// TestReporter_FlushAfterCloseInternalStateSet covers the subtle
+// invariant: even if r.state.Result has been set internally (e.g. by
+// Close, or by some hypothetical future caller), an *interim* Flush
+// must still clamp. The clamp is keyed off the call site, not internal
+// state. This guards against someone "helpfully" setting state.Result
+// early in Close before the daemon has stopped.
+func TestReporter_FlushAfterInternalResultStillClamps(t *testing.T) {
+	mc := newMockClient()
+	rep := New(mc, 1, 1, time.Hour)
+
+	// Reach into the reporter to set the internal job result. This
+	// simulates Close() landing while a daemon Flush is racing.
+	rep.mu.Lock()
+	rep.state.Result = runnerv1.Result_RESULT_SUCCESS
+	rep.mu.Unlock()
+
+	require.NoError(t, rep.Flush(context.Background()))
+
+	calls := mc.getTaskCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, runnerv1.Result_RESULT_UNSPECIFIED, calls[0].State.Result)
+}
+
 // TestFormatStepResults pins the bug 025 diagnostic format. Failing this
 // means the slog output the test-cluster agent is parsing has changed
 // shape; update both call sites in lockstep.

@@ -1,11 +1,23 @@
 # Per-step `conclusion=failure` shipped when only later steps actually failed
 
-**Status: filed 2026-05-09.** Surfaced via test-cluster verification
-of the bug 016 streaming fix on image `1a88d9d`. Split out from
-bug 016: the streaming fix (commits `97cfb9f..345fe58`) addressed
-the lost-trailing-event symptoms (zero durations, mis-attributed
-`started_at`), but the per-step `conclusion=failure` symptom
-described in 016 is still present.
+**Status: fixed 2026-05-09.** H1 confirmed by the diagnostic flush
+captured on image `main-1778339352-79eaf559` (run 100, task 106 on
+`gt.monoloco.net/chaos-inc/bevy_xr_nitro` test.yaml). Drawbar's
+per-step Results were correct end-to-end; gitea was rewriting them
+after receiving an interim `UpdateTask` payload whose job-level
+`state.Result` was non-UNSPECIFIED. Fix mirrors the act_runner
+pattern at `reference/runner/internal/pkg/report/reporter.go:511`:
+interim flushes clamp the outbound `state.Result` to
+`RESULT_UNSPECIFIED`; only the close-time flush carries the real
+terminal value. Per-step Results are passed through as-is on both
+paths. See the Resolution section at the bottom.
+
+Surfaced via test-cluster verification of the bug 016 streaming fix
+on image `1a88d9d`. Split out from bug 016: the streaming fix
+(commits `97cfb9f..345fe58`) addressed the lost-trailing-event
+symptoms (zero durations, mis-attributed `started_at`), but the
+per-step `conclusion=failure` symptom described in 016 was still
+present.
 
 ## Symptom
 
@@ -134,6 +146,70 @@ CANCELLED in the close-time flush instead of SUCCESS).
 | FAILURE | [CANCELLED, CANCELLED, ..., FAILURE] | **H3 confirmed** — events were dropped. Fix is in the watcher. |
 | FAILURE | [SUCCESS, ..., UNSPECIFIED] | step-index misalignment per H2. |
 
+## Diagnostic results (2026-05-09, image `main-1778339352-79eaf559`)
+
+Test-cluster verification on `gt.monoloco.net/chaos-inc/bevy_xr_nitro`,
+run 100 (push-triggered test.yaml), task id 106 (job 105 server-side).
+Controller deployed with `log.level: debug`. Captured deduped
+flushState transitions for task 106 from `kubectl logs` while the run
+ran end-to-end:
+
+| time     | job_result          | steps |
+|----------|---------------------|-------|
+| 15:14:42 | RESULT_UNSPECIFIED  | 0=UNSPECIFIED,1=UNSPECIFIED,2=UNSPECIFIED,3=UNSPECIFIED,4=UNSPECIFIED,5=UNSPECIFIED,6=UNSPECIFIED |
+| 15:14:50 | RESULT_UNSPECIFIED  | 0=SUCCESS,1=UNSPECIFIED,2=UNSPECIFIED,3=UNSPECIFIED,4=UNSPECIFIED,5=UNSPECIFIED,6=UNSPECIFIED |
+| 15:14:52 | RESULT_UNSPECIFIED  | 0=SUCCESS,1=SUCCESS,2=SUCCESS,3=SUCCESS,4=UNSPECIFIED,5=UNSPECIFIED,6=UNSPECIFIED |
+| 15:18:50 | RESULT_UNSPECIFIED  | 0=SUCCESS,1=SUCCESS,2=SUCCESS,3=SUCCESS,4=SUCCESS,5=UNSPECIFIED,6=UNSPECIFIED |
+| 15:26:42 | RESULT_UNSPECIFIED  | 0=SUCCESS,1=SUCCESS,2=SUCCESS,3=SUCCESS,4=SUCCESS,5=FAILURE,6=UNSPECIFIED |
+| 15:28:03 | RESULT_UNSPECIFIED  | 0=SUCCESS,1=SUCCESS,2=SUCCESS,3=SUCCESS,4=SUCCESS,5=FAILURE,6=FAILURE |
+| **15:28:04** (final) | **RESULT_FAILURE** | **0=SUCCESS,1=SUCCESS,2=SUCCESS,3=SUCCESS,4=SUCCESS,5=FAILURE,6=FAILURE** |
+
+Followed immediately by `task completed task_id=106 result=2` at
+15:28:04.792.
+
+What gitea actually displays for run 100, fetched immediately after
+terminal:
+
+```
+job 105: completed/failure
+  steps:
+    0: Run actions/checkout@v4                            completed  failure
+    1: configure netrc for fj git deps                    completed  failure
+    2: Run drawbar/cache@v1                               completed  failure
+    3: cargo test --lib                                   completed  failure
+    4: visual regression suite (bin/visual-test)          completed  failure
+    5: upload visual-test artifacts on failure            completed  failure
+```
+
+### Decision-tree match
+
+The final flush row (`FAILURE` / `[SUCCESS,SUCCESS,SUCCESS,SUCCESS,SUCCESS,FAILURE,FAILURE]`)
+maps to **row 1** of the decision tree:
+
+> **H1 confirmed** — gitea is rewriting step records on terminal job.
+> Fix: send UNSPECIFIED on interim, real on close.
+
+drawbar's outbound state is correct; the per-step conclusions sent to
+gitea reflect actual step outcomes. Yet gitea collapses every step's
+`conclusion` to `failure` on its side after receiving the terminal
+`UpdateTask` whose `state.Result = RESULT_FAILURE`. This matches the
+suspected gitea-side reconcile pattern: when `state.Result` arrives
+non-UNSPECIFIED, gitea treats the call as authoritative-final and
+stamps the job conclusion onto step records.
+
+### Step-index note (separate observation)
+
+drawbar reports **7 steps** (indices 0–6); gitea displays **6 steps**
+(indices 0–5). The step at drawbar's index 0 appears to be the actor's
+internal "Set up job" step which gitea doesn't surface in its API.
+Drawbar's `1..6` map onto gitea's `0..5`, and the per-step conclusions
+are correctly aligned with what each user-visible step actually did
+(visual-test = 5, upload-artifact = 6 → maps to gitea's 4, 5, both
+genuine failures). This off-by-one is *not* the cause of bug 025 — the
+mapping is consistent, gitea just rewrites the data after receiving
+it. But it's worth noting separately for diagnostic clarity in any
+future debugging.
+
 ## Operational impact
 
 Same as bug 016: per-step accounting via the gitea API is
@@ -153,3 +229,26 @@ raw logs.
 - Bug 017: reporter `logOffset` race + ctx-blind close (closed,
   unrelated).
 - Reference act_runner pattern: `reference/runner/internal/pkg/report/reporter.go:510-512`.
+
+## Resolution
+
+`pkg/reporter/reporter.go::flushState` now takes a `final bool`
+parameter. The daemon-driven `Flush` path passes `false` and the
+outbound `state.Result` is forced to `RESULT_UNSPECIFIED` on the
+clone — the reporter's internal `r.state.Result` is unchanged, only
+the wire payload is clamped. The retry loop in `Close` passes
+`true` so the terminal job conclusion ships once per task. Per-step
+Results are passed through unchanged on both paths.
+
+Three regression tests in `pkg/reporter/reporter_test.go`:
+
+- `TestReporter_FlushClampsJobResultOnInterim` — mid-run flush ships
+  `state.Result = UNSPECIFIED` with per-step Results intact.
+- `TestReporter_CloseShipsTerminalJobResult` — close-time flush
+  ships the real terminal Result.
+- `TestReporter_FlushAfterInternalResultStillClamps` — even when
+  internal `r.state.Result` has been set non-UNSPECIFIED, an
+  interim Flush still clamps. Guards against a future caller
+  setting Result early.
+
+Verified to fail without the clamp; all three pass with it.
