@@ -1,6 +1,20 @@
 # `/healthz` successful-fetch heartbeat fires false positive while a long task runs
 
-**Status: filed.** Surfaced 2026-05-05 while shaking down image
+**Status: fixed 2026-05-05** in commit `94d0732` (`controller: gate
+/healthz heartbeats on inBackoff and capacity`). Took fix-sketch
+option 1: the successful-fetch staleness check at
+`cmd/controller/main.go:477` is now suppressed while
+`inFlight() == capacity` (no slot is free for the poller to issue a
+new FetchTask). A real transport wedge surfaces the moment the
+handler returns. Test coverage added in
+`TestHealthzHandler_AtCapacitySuppressesSuccessfulFetch` and
+`TestHealthzHandler_BelowCapacityExposesSuccessfulFetch`.
+
+Original report follows.
+
+---
+
+Surfaced 2026-05-05 while shaking down image
 `main-1778008209-cfda4091` (the bug 013 fix). Bug 013's healthz fix
 suppresses the *poll-staleness* check while a handler is in flight,
 but explicitly leaves the *successful-fetch* check unconditional. With

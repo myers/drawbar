@@ -1,6 +1,10 @@
 # Step reporter mis-attributes start/end times and conclusion across sequential steps
 
-**Status: filed.** Surfaced 2026-05-06 while shaking down image
+**Status: fixed 2026-05-06** in commits `97cfb9f..345fe58` (state
+streaming refactor). See the Resolution section at the bottom of
+this doc and `docs/superpowers/specs/2026-05-06-step-state-streaming-design.md`.
+
+Surfaced 2026-05-06 while shaking down image
 `main-1778069066-4cb729d9` (the bug 014/015 fix). Drawbar is reporting
 per-step `started_at` / `completed_at` / `conclusion` to gitea
 incorrectly when a job has multiple sequential steps where a *later*

@@ -1,6 +1,21 @@
 # Cache layer correctness: LIKE wildcards in user keys, mod-255 bucket skew, ActionDir collision
 
-**Status: filed.** Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
+**Status: fixed 2026-05-08.** All three findings landed in dedicated
+commits with regression tests:
+
+- A: `737c319` — escape LIKE wildcards in `FindCache` prefix match;
+  guarded by `TestFindCache_LIKEWildcardsInPrefix` and
+  `TestFindCache_BackslashInPrefix` in `pkg/cache/db_test.go`.
+- B: `71f1ea6` — `id%0xff` → `id%0x100` in `Storage.filename`;
+  guarded by `TestStorageFilename_BucketIsIdMod256` in
+  `pkg/cache/storage_test.go`.
+- C: `11ffaa7` — append FNV-1a hash suffix to `ActionDir` to
+  disambiguate refs that sanitize to the same prefix; guarded by
+  `TestActionRef_ActionDir` and
+  `TestActionRef_ActionDir_NoCollisions` in
+  `pkg/actions/resolve_test.go`.
+
+Surfaced 2026-05-06 via `/ultrareview` run on PR #1.
 Three findings in the cache-key safety domain — `pkg/cache/db.go`,
 `pkg/cache/storage.go`, `pkg/actions/resolve.go`. All "the cache says
 the right thing but the keying is wrong." One mental model: cache-key

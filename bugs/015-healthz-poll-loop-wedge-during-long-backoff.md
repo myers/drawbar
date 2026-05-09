@@ -1,6 +1,19 @@
 # `/healthz` poll-loop heartbeat fires false positive during normal backoff
 
-**Status: filed.** Surfaced 2026-05-05 immediately after bug 014, on
+**Status: fixed 2026-05-05** in commit `94d0732` (`controller: gate
+/healthz heartbeats on inBackoff and capacity`). Took the
+"`inBackoff()` predicate" approach from the fix sketch: the poller
+exposes an `inBackoff` accessor, and the poll-staleness check at
+`cmd/controller/main.go:461` is now suppressed when it returns true.
+A wedged sleep timer would still surface, but a normal `waitBackoff`
+phase no longer kicks the kubelet. Tests:
+`TestHealthzHandler_BackoffSuppressesPollStaleness` and friends.
+
+Original report follows.
+
+---
+
+Surfaced 2026-05-05 immediately after bug 014, on
 image `main-1778008209-cfda4091`. The `lastPoll` heartbeat is updated
 only when a `FetchTask` call RETURNS (success/error), but the poller's
 own `waitBackoff` can sleep for up to `backoffMax` (60s default)
