@@ -101,6 +101,123 @@ real and our problem:
 3. If the file has the event, the bug is in the drain path. If
    not, the bug is in the entrypoint.
 
+## Findings 2026-05-11 (dev-env, image `e239d63`, gitea 1.26.1)
+
+Triggered three runs (tasks 1, 2, 3) of the level-1 workflow.
+All three showed identical symptom: `0=CANCELLED` on the
+terminal flush. With `log.level: debug` on task 3:
+
+- `step started` logged at `15:12:54.722` (the `start` event
+  was routed via the live streamer).
+- `step completed` was **never logged**.
+- Three interim flushes all showed `0=UNSPECIFIED`. The third
+  flush is `req_bytes=38` (vs prior 6) — `StartedAt` got set
+  by the `start` event being routed, but `Result` stayed
+  UNSPECIFIED.
+- Terminal flush at `15:12:56.622` shipped `0=CANCELLED` (the
+  defensive rewrite in `Close()` UNSPECIFIED→CANCELLED).
+
+So the `start` event reaches the reporter live, but the `end`
+event does not — neither via the live streamer nor via the
+post-exit drain.
+
+## Likely root cause
+
+The streamer (`streamStateFileWith`) runs
+`/shim/entrypoint tail /shim/state.jsonl` as an `exec` inside
+the runner container. When the runner shell exits (step 0
+finishes, container has no more commands to run), the container
+terminates — SIGKILL goes to **every** process inside it,
+including the `entrypoint tail` we're exec'd against. Our exec
+stream EOFs at that moment, regardless of whether the tail
+process has finished reading the trailing lines of
+`state.jsonl`.
+
+Then `drainStateFile` runs a fresh `exec` against the same
+container, but the container is now in Terminated state — the
+kubelet refuses the exec, `executor.ExecStream` returns
+"container not running" (or similar), `drainStateFile` logs a
+warn and returns. The trailing `end` event sits unread in the
+container's `/shim/state.jsonl` filesystem forever (and the
+filesystem itself is GC'd a moment later when the pod is
+reaped).
+
+The streaming refactor's premise — "post-exit drain catches
+trailing events the live stream missed" — is broken because the
+container is gone by the time the drain tries to exec. The
+fix needs to either:
+
+1. **Make the entrypoint tail process outlive the runner
+   shell.** Put it in a separate container in the same pod so
+   it stays alive until explicitly killed. Then the drain can
+   exec against a still-live container and read the trailing
+   bytes. This is the cleanest model but adds a container slot.
+
+2. **Read state.jsonl out-of-band.** Instead of execing into
+   the pod, have the entrypoint write `state.jsonl` to a path
+   that's also visible to the controller (PVC, sidecar that
+   tails over the network). Adds infrastructure.
+
+3. **Flush trailing events before the runner shell exits.**
+   The entrypoint already writes `f.Sync()` after each event,
+   so the bytes are on disk. The issue is reading them, not
+   writing them. A pre-exit sleep in the entrypoint would race
+   the kubelet — not a fix.
+
+4. **Capture the lifecycle log out of the container's stdout.**
+   Drawbar already streams the runner container's stdout in
+   real time. The entrypoint could write a sentinel
+   `::drawbar-state::{...}` line on stdout in addition to
+   `state.jsonl`. The log streamer reads stdout via the
+   apiserver log endpoint, which doesn't require the container
+   to be alive (logs are buffered by the kubelet). This is the
+   smallest delta and works for both pre-exit and post-exit
+   events.
+
+(4) looks cheapest. It also doesn't require adding a sidecar or
+PVC. Risk: stdout interleaving — workflow command parsing
+already needs careful handling, and adding a second sentinel
+syntax is one more thing to mask in logs to users.
+
+## Confirmation on patched gitea (2026-05-11)
+
+Rebuilt gitea locally at commit `601c6eb` (which contains
+upstream PR #37592 — the bug 025 renderer fix), swapped the
+dev-env's gitea pod to that image, and re-queried run 3 (the
+same run as the dev-env Level 1 retry above, no new task ran —
+only the renderer changed):
+
+```
+GET /api/v1/repos/devadmin/bug025/actions/runs/3/jobs
+{
+  "name": "test",
+  "status": "completed",
+  "conclusion": "success",            ← job conclusion: correct
+  "steps": [{
+    "name": "only-step",
+    "conclusion": "cancelled",        ← now shows the real step.Status
+    "completed_at": "1970-01-01T00:00:00Z"  ← step.Stopped was never set
+  }]
+}
+```
+
+Two facts confirmed in one read:
+
+1. **Upstream gitea fix works.** The renderer now reads
+   `step.Status` instead of `job.Status`. Bug 025 closes
+   automatically once gitea ships this commit in a release.
+2. **Bug 026 is real and serves the wrong data to gitea.** Same
+   run data, only renderer changed; the underlying `cancelled`
+   is what drawbar wrote. The 1970 `completed_at` is consistent
+   with drawbar never sending a stop time for step 0 (which
+   ratifies the "end event was never routed" finding).
+
+The patched-gitea image
+(`k3d-k3d-registry:5111/gitea-patched:601c6eb`) stays in the
+local registry so further drawbar fixes can be validated
+end-to-end against the future-gitea renderer rather than the
+masking 1.26.1 renderer.
+
 ## Related
 
 - Bug 016: streaming refactor that this was supposed to fix.
