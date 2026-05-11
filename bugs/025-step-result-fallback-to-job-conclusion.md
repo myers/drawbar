@@ -1,6 +1,56 @@
 # Per-step `conclusion=failure` shipped when only later steps actually failed
 
-**Status: NOT FIXED — re-opening 2026-05-09.** First fix attempt on
+**Status: ROOT CAUSE LOCALIZED TO GITEA, NOT DRAWBAR — 2026-05-11.**
+Bug 025 is **gitea bug [#37592](https://github.com/go-gitea/gitea/pull/37592)**,
+fixed upstream by commit `601c6eb1` on 2026-05-07, not yet in any
+released gitea version (latest release is 1.26.1 from before the fix).
+`services/convert/convert.go::ToActionWorkflowJob` called
+`ToActionsStatus(job.Status)` for every step instead of
+`ToActionsStatus(step.Status)`, so the API response synthesized
+each step's conclusion from the job's overall conclusion. The
+per-step `step.Status` rows in the `action_task_step` table were
+correct; only the API renderer was wrong.
+
+The test-cluster agent saw "all 6 steps = FAILURE" because the
+job failed and the API rendered the job's conclusion onto every
+step record. Drawbar's outbound payload was fine.
+
+Reproduced locally on gitea 1.26.1: drawbar shipped a step record
+with `Result=CANCELLED` (separate bug, see below), the DB stored
+`StatusCancelled`, and the API rendered `conclusion=success`
+because the job succeeded.
+
+The agent's `gt.monoloco.net` test cluster runs a home-built gitea
+from main. If their build predates `601c6eb1` (2026-05-07), they
+will see the all-FAILURE shape. If they pull post-`601c6eb1`, the
+bug will disappear from their view — though see "Drawbar-side
+finding" below for what *will* surface once gitea is fixed.
+
+## Drawbar-side finding (Level 1 dev-env repro, 2026-05-11)
+
+A separate drawbar bug surfaced during the gitea-side debugging.
+On a one-step `echo "hello"` workflow that ran cleanly:
+
+```
+reporter flushState (terminal): job_result=RESULT_SUCCESS steps="0=CANCELLED"
+```
+
+`Close()` saw step 0 still in `Result=UNSPECIFIED` and applied its
+defensive UNSPECIFIED→CANCELLED rewrite. That means the watcher's
+`FinishStep(0, SUCCESS)` call was never made — the entrypoint's
+`state.jsonl` `end` event for step 0 did not reach the reporter.
+
+This is masked on gitea ≤1.26.1 (API renders job conclusion over
+step conclusion), but will surface as soon as gitea ships the
+`601c6eb1` fix. Filed separately — see bug 026.
+
+## Original investigation (resolved by upstream fix)
+
+Below is the original analysis preserved for history.
+
+---
+
+**Earlier status: NOT FIXED — re-opening 2026-05-09.** First fix attempt on
 image `main-1778348893-750a497c` (commit `750a497`, "bugs/025: clamp
 interim flushState job_result to UNSPECIFIED") clamped interim flushes
 correctly but did **not** restore per-step conclusions on the gitea

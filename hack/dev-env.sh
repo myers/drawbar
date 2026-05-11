@@ -116,12 +116,24 @@ cmd_up() {
 
   log "Creating registration token via API..."
   wait_for_url "${SERVER_URL}/api/v1/version" 30
-  REG_TOKEN=$(curl -sf "${SERVER_URL}/api/v1/admin/runners/registration-token" \
-    -u "${ADMIN_USER}:${ADMIN_PASS}" | jq -r '.token' 2>/dev/null || echo "")
+  # gitea moved/changed the endpoint several times. Try the known
+  # variants until one returns a token:
+  #   1.26+: POST /api/v1/admin/actions/runners/registration-token
+  #   1.25 : POST /api/v1/admin/runners/registration-token
+  #   forgejo / older: GET on either path
+  REG_TOKEN=""
+  for method in POST GET; do
+    for path in /api/v1/admin/actions/runners/registration-token /api/v1/admin/runners/registration-token; do
+      REG_TOKEN=$(curl -sf -X "$method" "${SERVER_URL}${path}" \
+        -u "${ADMIN_USER}:${ADMIN_PASS}" | jq -r '.token' 2>/dev/null || echo "")
+      if [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != "null" ]; then
+        break 2
+      fi
+    done
+  done
 
-  if [ -z "$REG_TOKEN" ]; then
-    echo "ERROR: Failed to get registration token."
-    echo "  Try: curl -u ${ADMIN_USER}:${ADMIN_PASS} ${SERVER_URL}/api/v1/admin/runners/registration-token"
+  if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
+    echo "ERROR: Failed to get registration token via any known path."
     return 1
   fi
 
