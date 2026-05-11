@@ -107,7 +107,10 @@ func (f *fullForgejoServer) serveMux(prefix string) *http.ServeMux {
 		func(_ context.Context, req *connect.Request[runnerv1.UpdateTaskRequest]) (*connect.Response[runnerv1.UpdateTaskResponse], error) {
 			f.mu.Lock()
 			f.taskCalls++
-			if req.Msg.State != nil {
+			// Only latch a terminal job result; UNSPECIFIED calls
+			// include interim flushes and the bug 025 readback probe
+			// the reporter sends post-Close.
+			if req.Msg.State != nil && req.Msg.State.Result != runnerv1.Result_RESULT_UNSPECIFIED {
 				f.lastResult = req.Msg.State.Result
 			}
 			f.mu.Unlock()

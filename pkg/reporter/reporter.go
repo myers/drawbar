@@ -2,6 +2,8 @@ package reporter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -248,24 +250,71 @@ func (r *Reporter) flushState(ctx context.Context, final bool) error {
 		state.Result = runnerv1.Result_RESULT_UNSPECIFIED
 	}
 
+	req := &runnerv1.UpdateTaskRequest{State: state}
+
 	// Bug 025 diagnostic: log the per-step Result shape we're about to
 	// ship so we can correlate gitea's persisted records against what
 	// drawbar actually sent. Debug-level — only fires when the
 	// controller runs with LOG_LEVEL=debug.
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		slog.Debug("reporter flushState",
+	//
+	// Final flushes always log (regardless of LOG_LEVEL): they are
+	// once-per-task and the close-time payload is the single most
+	// important diagnostic for bug 025. We include a SHA-256 prefix of
+	// the marshaled request so a slog/wire mismatch — if any — is
+	// detectable by comparing the logged digest against what the
+	// forge actually received.
+	debugOn := slog.Default().Enabled(ctx, slog.LevelDebug)
+	if debugOn || final {
+		reqBytes, _ := proto.Marshal(req)
+		digest := sha256.Sum256(reqBytes)
+		attrs := []any{
 			"task_id", r.taskID,
 			"final", final,
 			"job_result", state.Result.String(),
 			"steps", formatStepResults(state.Steps),
-		)
+			"req_bytes", len(reqBytes),
+			"req_sha256", hex.EncodeToString(digest[:8]),
+		}
+		if final {
+			slog.Info("reporter flushState (terminal)", attrs...)
+		} else {
+			slog.Debug("reporter flushState", attrs...)
+		}
 	}
 
-	resp, err := r.client.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
-		State: state,
-	}))
+	resp, err := r.client.UpdateTask(ctx, connect.NewRequest(req))
 	if err != nil {
 		return err
+	}
+
+	// Log what the forge echoed back. The runner protocol only echoes
+	// task-level Id and Result (not per-step Steps), so this won't
+	// reveal a step-rewrite directly, but it surfaces forge-side
+	// state transitions (e.g. forge says task is cancelled when we
+	// thought it was running) and lets us correlate the request
+	// digest with the response on the forge side.
+	if debugOn || final {
+		var respState *runnerv1.TaskState
+		if resp.Msg != nil {
+			respState = resp.Msg.GetState()
+		}
+		var respResult string
+		var respID int64
+		if respState != nil {
+			respResult = respState.GetResult().String()
+			respID = respState.GetId()
+		}
+		attrs := []any{
+			"task_id", r.taskID,
+			"final", final,
+			"resp_task_id", respID,
+			"resp_job_result", respResult,
+		}
+		if final {
+			slog.Info("reporter flushState response (terminal)", attrs...)
+		} else {
+			slog.Debug("reporter flushState response", attrs...)
+		}
 	}
 
 	// Check if the server cancelled the task.
@@ -361,10 +410,57 @@ func (r *Reporter) Close(ctx context.Context, jobResult runnerv1.Result) error {
 			continue
 		}
 
+		// Bug 025 diagnostic: read-back probe. After the terminal
+		// UpdateTask commits, the forge's task row is in IsDone()
+		// state — re-sending an UpdateTask with UNSPECIFIED + zero
+		// steps hits the forge's "task already done" early-return
+		// (gitea models/actions/task.go:370) and is side-effect-free
+		// on the forge side, but the response echoes what the forge
+		// currently thinks the task status is. If the forge says
+		// SUCCESS when we sent FAILURE (or vice versa) it points at
+		// a race / wrong-task-id / forge-side rewrite path.
+		if err := r.readbackProbe(ctx); err != nil {
+			slog.Warn("readback probe failed", "task_id", r.taskID, "error", err)
+		}
+
 		return nil
 	}
 
 	return fmt.Errorf("failed to send final report after retries: %w", lastErr)
+}
+
+// readbackProbe sends an UNSPECIFIED, zero-step UpdateTask and logs
+// what the forge echoes back. Used post-terminal to detect forge-side
+// drift between what drawbar sent and what the forge persisted.
+// Side-effect-free on gitea/forgejo because their UpdateTaskByState
+// early-returns when task.Status.IsDone(). See bug 025.
+func (r *Reporter) readbackProbe(ctx context.Context) error {
+	resp, err := r.client.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
+		State: &runnerv1.TaskState{
+			Id:     r.taskID,
+			Result: runnerv1.Result_RESULT_UNSPECIFIED,
+		},
+	}))
+	if err != nil {
+		return err
+	}
+
+	var respState *runnerv1.TaskState
+	if resp.Msg != nil {
+		respState = resp.Msg.GetState()
+	}
+	var respResult string
+	var respID int64
+	if respState != nil {
+		respResult = respState.GetResult().String()
+		respID = respState.GetId()
+	}
+	slog.Info("reporter readback probe",
+		"task_id", r.taskID,
+		"resp_task_id", respID,
+		"resp_job_result", respResult,
+	)
+	return nil
 }
 
 // waitOrCancel sleeps for d, or returns ctx.Err() early if ctx is cancelled.

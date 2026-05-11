@@ -550,3 +550,63 @@ The off-by-one (drawbar slot 6 = upload-artifact = FAILURE) is
 still a real drawbar bug to fix independently — gitea/forgejo
 silently drops it. But it cannot turn earlier SUCCESS slots into
 FAILURE.
+
+## Instrumentation 2026-05-11 — drawbar self-diagnostics
+
+Rather than wait on manual data from the agent, the reporter now
+self-instruments on every terminal flush and a post-terminal
+read-back probe.
+
+In `pkg/reporter/reporter.go::flushState`:
+
+1. **Wire-level digest.** Every flush (debug-level on interim,
+   info-level on terminal) logs `req_bytes` and `req_sha256`
+   (first 8 bytes hex of `proto.Marshal(req)`). If a future
+   diagnostic shows we shipped one thing per the slog and gitea
+   persisted another, the forge-side log can prove byte-equal
+   receive vs. drift in transit. The terminal log is unconditional
+   so it lands in every operator's controller log without needing
+   `LOG_LEVEL=debug`.
+2. **Response logging.** Each flush logs `resp_task_id` and
+   `resp_job_result` (the only fields gitea/forgejo echo back via
+   `UpdateTaskResponse.State`). Catches forge-side cancellations
+   and confirms forge's view of the task status.
+3. **Readback probe (Close-only).** After the terminal
+   `flushState` succeeds, `Close` issues a final no-op
+   `UpdateTask{State: {Id: taskID, Result: UNSPECIFIED}}`. Gitea's
+   `UpdateTaskByState` early-returns when `task.Status.IsDone()`
+   (gitea models/actions/task.go:370), so this is side-effect-free
+   on the forge side. The response echoes what the forge currently
+   thinks the task status is. If the forge says `RESULT_SUCCESS`
+   when we sent `RESULT_FAILURE`, that's a smoking-gun for a
+   wrong-task-id race or forge-side rewrite.
+
+What the operator will see in the controller log after the next
+bevy_xr_nitro run:
+
+```
+reporter flushState (terminal)         task_id=N final=true job_result=RESULT_FAILURE steps="0=SUCCESS,...,5=FAILURE,6=FAILURE" req_bytes=... req_sha256=...
+reporter flushState response (terminal) task_id=N resp_task_id=N resp_job_result=RESULT_FAILURE
+reporter readback probe                task_id=N resp_task_id=N resp_job_result=RESULT_FAILURE
+```
+
+Three signals to compare against the agent's gitea API view:
+
+| Signal | Says | Conclusion |
+|---|---|---|
+| `flushState (terminal)` `steps` | what drawbar sent | wire-side truth |
+| `response (terminal)` `resp_job_result` | what forge persisted (job-level) | forge ack |
+| `readback probe` `resp_job_result` | what forge now thinks (post-commit) | forge state after settle |
+
+Combined with the agent's screenshot of the API per-step view, this
+should disambiguate (a) drawbar sent wrong, (b) forge persisted
+right but UI renders wrong, (c) forge has a delayed-rewrite path
+that flips state between the response and the read-back.
+
+Tests:
+- `TestReporter_CloseSendsReadbackProbe` pins the probe contract
+  (UNSPECIFIED + zero steps).
+- Existing terminal/clamp tests still pass; the fake forgejo
+  servers in `cmd/controller/{handler,run}_test.go` now ignore
+  UNSPECIFIED results when latching `lastResult` so the probe
+  doesn't clobber the terminal observation.

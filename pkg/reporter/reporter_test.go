@@ -71,6 +71,21 @@ func (m *mockClient) getTaskCalls() []*runnerv1.UpdateTaskRequest {
 	return cp
 }
 
+// getTerminalCall returns the last UpdateTask request whose state.Result
+// is non-UNSPECIFIED. Used to skip the post-terminal readback probe
+// (sent with UNSPECIFIED for bug 025 diagnostics) when asserting on
+// the close-time terminal payload.
+func (m *mockClient) getTerminalCall() *runnerv1.UpdateTaskRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.taskCalls) - 1; i >= 0; i-- {
+		if m.taskCalls[i].State != nil && m.taskCalls[i].State.Result != runnerv1.Result_RESULT_UNSPECIFIED {
+			return m.taskCalls[i]
+		}
+	}
+	return nil
+}
+
 func TestReporter_AddLog(t *testing.T) {
 	mc := newMockClient()
 	rep := New(mc, 1, 2, time.Hour) // long interval — we'll flush manually
@@ -203,11 +218,10 @@ func TestReporter_CloseSuccess(t *testing.T) {
 	assert.True(t, logCalls[len(logCalls)-1].NoMore)
 
 	// Should have sent final state.
-	taskCalls := mc.getTaskCalls()
-	require.NotEmpty(t, taskCalls)
-	lastState := taskCalls[len(taskCalls)-1].State
-	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, lastState.Result)
-	assert.NotNil(t, lastState.StoppedAt)
+	terminal := mc.getTerminalCall()
+	require.NotNil(t, terminal)
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, terminal.State.Result)
+	assert.NotNil(t, terminal.State.StoppedAt)
 }
 
 func TestReporter_CloseFailure_CancelsUnfinishedSteps(t *testing.T) {
@@ -223,9 +237,9 @@ func TestReporter_CloseFailure_CancelsUnfinishedSteps(t *testing.T) {
 	err := rep.Close(context.Background(), runnerv1.Result_RESULT_FAILURE)
 	require.NoError(t, err)
 
-	taskCalls := mc.getTaskCalls()
-	require.NotEmpty(t, taskCalls)
-	steps := taskCalls[len(taskCalls)-1].State.Steps
+	terminal := mc.getTerminalCall()
+	require.NotNil(t, terminal)
+	steps := terminal.State.Steps
 
 	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, steps[0].Result)
 	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, steps[1].Result)
@@ -489,9 +503,9 @@ func TestReporter_CloseShipsTerminalJobResult(t *testing.T) {
 
 	require.NoError(t, rep.Close(context.Background(), runnerv1.Result_RESULT_FAILURE))
 
-	calls := mc.getTaskCalls()
-	require.NotEmpty(t, calls)
-	final := calls[len(calls)-1].State
+	terminal := mc.getTerminalCall()
+	require.NotNil(t, terminal)
+	final := terminal.State
 	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, final.Result)
 	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, final.Steps[0].Result)
 	assert.Equal(t, runnerv1.Result_RESULT_FAILURE, final.Steps[1].Result)
@@ -537,4 +551,39 @@ func TestFormatStepResults(t *testing.T) {
 		}
 		assert.Equal(t, "0=SUCCESS,1=SUCCESS,2=FAILURE,3=UNSPECIFIED", formatStepResults(steps))
 	})
+}
+
+// TestReporter_CloseSendsReadbackProbe pins the bug 025 diagnostic
+// behavior: after the terminal UpdateTask commits, Close sends an
+// additional UpdateTask with state.Result=UNSPECIFIED and no steps.
+// This is side-effect-free on gitea/forgejo (their UpdateTaskByState
+// early-returns when task.Status.IsDone()) but the response echoes
+// what the forge currently thinks the task status is, letting us
+// detect drift.
+func TestReporter_CloseSendsReadbackProbe(t *testing.T) {
+	mc := newMockClient()
+	rep := New(mc, 1, 1, time.Hour)
+
+	rep.StartStep(0)
+	rep.FinishStep(0, runnerv1.Result_RESULT_SUCCESS)
+
+	require.NoError(t, rep.Close(context.Background(), runnerv1.Result_RESULT_SUCCESS))
+
+	calls := mc.getTaskCalls()
+	require.GreaterOrEqual(t, len(calls), 2, "Close must send terminal + readback probe")
+
+	// Terminal call: non-UNSPECIFIED Result, populated Steps.
+	terminal := mc.getTerminalCall()
+	require.NotNil(t, terminal)
+	assert.Equal(t, runnerv1.Result_RESULT_SUCCESS, terminal.State.Result)
+	assert.NotEmpty(t, terminal.State.Steps)
+
+	// Readback probe: UNSPECIFIED, no Steps. Must come after the
+	// terminal in call order so it's observing post-commit state.
+	probe := calls[len(calls)-1]
+	assert.Equal(t, runnerv1.Result_RESULT_UNSPECIFIED, probe.State.Result,
+		"readback probe must carry UNSPECIFIED to avoid re-triggering forge-side commit")
+	assert.Empty(t, probe.State.Steps,
+		"readback probe must carry no Steps so it cannot rewrite forge-side records")
+	assert.Equal(t, rep.taskID, probe.State.Id)
 }
