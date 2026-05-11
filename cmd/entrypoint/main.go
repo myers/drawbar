@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/myers/drawbar/pkg/expressions"
@@ -47,7 +50,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
 			os.Exit(1)
 		}
-		if err := runTail(context.Background(), args, os.Stdout); err != nil {
+		// Wire SIGINT/SIGTERM into ctx cancellation so the kubelet's
+		// graceful shutdown signal exits the long-lived follow tail
+		// cleanly. The native sidecar receives SIGTERM after the main
+		// runner container exits; runTail returns ctx.Err() on cancel,
+		// which is fine to silence here.
+		ctx, stop := signal.NotifyContext(context.Background(),
+			syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := runTail(ctx, args, os.Stdout); err != nil &&
+			!errors.Is(err, context.Canceled) {
 			fmt.Fprintf(os.Stderr, "tail: %v\n", err)
 			os.Exit(1)
 		}

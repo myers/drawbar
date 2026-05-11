@@ -174,6 +174,14 @@ cmd_rebuild() {
   make image IMAGE="$IMAGE" VERSION="$VERSION"
   docker push "$IMAGE:$VERSION"
 
+  # Force imagePullPolicy=Always so the rollout actually picks up the
+  # new image. The chart default is IfNotPresent (right for prod, wrong
+  # for dev iteration — kubelet keeps using its cached SHA otherwise).
+  log "Setting imagePullPolicy=Always on runner deployment..."
+  kubectl patch deployment -n "$RUNNER_NS" runner-runner --type=json \
+    -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value": "Always"}]' \
+    2>/dev/null || true
+
   log "Restarting runner deployment..."
   kubectl rollout restart deployment -n "$RUNNER_NS" -l app.kubernetes.io/name=drawbar
   kubectl rollout status deployment -n "$RUNNER_NS" -l app.kubernetes.io/name=drawbar --timeout=60s

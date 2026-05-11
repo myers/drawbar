@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -131,7 +130,7 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	defer cancelStream()
 	stateDone := make(chan streamResult, 1)
 	go func() {
-		off, sErr := streamStateFileWith(streamCtx, executor, namespace, podName, rep)
+		off, sErr := streamStateFileWith(streamCtx, streamer, namespace, podName, rep)
 		stateDone <- streamResult{offset: off, err: sErr}
 	}()
 
@@ -142,16 +141,14 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	// be running.
 	logErr := <-logDone
 
-	// stopAndDrain cancels the live state streamer, awaits its final offset,
-	// and runs a one-shot drain to catch any final lines written between
-	// the last streamed event and container exit. On the post-wait code
-	// path the runner container is already gone and the drain becomes a
-	// best-effort no-op (drainStateFile logs and returns when the exec
-	// against a dead container fails).
+	// stopAndDrain cancels the live state streamer and awaits its result.
+	// No separate post-exit drain step is needed: the state-agent
+	// streams via the kubelet log endpoint, which buffers content even
+	// after the container exits — so the live stream naturally reads
+	// trailing events through EOF. See bug 026.
 	stopAndDrain := func() {
 		cancelStream()
-		res := <-stateDone
-		drainStateFile(ctx, executor, namespace, podName, rep, res.offset)
+		<-stateDone
 	}
 
 	// Wait (bounded) for the runner container to reach Terminated BEFORE
@@ -164,19 +161,11 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 	//     update with Terminated may not have hit the apiserver yet —
 	//     bug 023. A naive read would see Running and report failure.
 	//
-	// The state goroutine keeps consuming events live during the wait, so
-	// step start/end events written while the container finishes are
-	// captured in real time. Cancelling the state stream first would force
-	// drainStateFile to cover the entire wait window in a single one-shot
-	// read, which is best-effort and can lose events if state.jsonl grows
-	// between drain and re-open.
-	//
-	// The state goroutine's reconnect is itself best-effort:
-	// streamStateFileWith retries up to maxAttempts with exponential
-	// backoff and gives up if the apiserver is sustained-flapping. If it
-	// exits before the container terminates, drainStateFile (post-wait,
-	// dead container) won't recover the gap — that case is no worse than
-	// before this fix.
+	// The state goroutine consumes the state-agent sidecar's log stream
+	// live during the wait. Because the agent's logs are buffered by the
+	// kubelet, any state event the agent emitted before its own exit is
+	// still readable here through EOF — no separate drain step needed.
+	// Bug 026.
 	if logErr != nil && !errors.Is(logErr, io.EOF) {
 		slog.Warn("log stream ended before EOF, waiting for container to terminate",
 			"pod", podName, "err", logErr)
@@ -198,165 +187,64 @@ func watchJobWith(ctx context.Context, client kubernetes.Interface, executor Pod
 }
 
 
-// streamStateFileWith maintains a long-lived `entrypoint tail` exec session
-// against /shim/state.jsonl and routes each newline-terminated state event
-// into rep. On transient stream failure it reconnects with --skip <lastOffset>
-// so events are never replayed. After maxStreamAttempts failures in a row it
-// returns. The returned offset is the number of newline-terminated lines
-// successfully processed (whether routed or skipped as malformed).
-func streamStateFileWith(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter) (int, error) {
-	const (
-		initialBackoff = 50 * time.Millisecond
-		maxBackoff     = 2 * time.Second
-		maxAttempts    = 5
-	)
-
-	lastOffset := 0
-	backoff := initialBackoff
-	attempt := 0
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return lastOffset, err
-		}
-
-		cmd := []string{"/shim/entrypoint", "tail",
-			"--skip", strconv.Itoa(lastOffset),
-			"/shim/state.jsonl"}
-		stream, err := executor.ExecStream(ctx, namespace, podName, "runner", cmd)
-		if err != nil {
-			if next, stop := backoffStep(ctx, &attempt, &backoff, maxAttempts, maxBackoff); stop {
-				slog.Error("state stream gave up after retries",
-					"lastOffset", lastOffset, "err", err)
-				return lastOffset, err
-			} else if next != nil {
-				return lastOffset, next
-			}
-			continue
-		}
-
-		// Connect succeeded. The attempt counter is reset only after we
-		// observe at least one full line — otherwise an immediate-EOF cycle
-		// would bypass the maxAttempts cap and busy-reconnect forever.
-		linesRead := 0
-		reader := bufio.NewReader(stream)
-		for {
-			line, rErr := reader.ReadString('\n')
-			if rErr == nil && len(line) > 0 {
-				if linesRead == 0 {
-					attempt = 0
-					backoff = initialBackoff
-				}
-				linesRead++
-				trimmed := strings.TrimRight(line, "\n\r")
-				if trimmed == "" {
-					lastOffset++
-					continue
-				}
-				var ev types.StateEvent
-				if jErr := json.Unmarshal([]byte(trimmed), &ev); jErr != nil {
-					slog.Debug("skipping malformed state event",
-						"line", trimmed, "err", jErr)
-					lastOffset++
-					continue
-				}
-				routeStateEvent(ev, rep)
-				lastOffset++
-				continue
-			}
-			stream.Close()
-			if errors.Is(rErr, context.Canceled) ||
-				errors.Is(rErr, context.DeadlineExceeded) {
-				return lastOffset, rErr
-			}
-			break
-		}
-
-		// If the stream produced no lines, treat it like a failed connect:
-		// rate-limit reconnects so we don't hammer the API during the
-		// startup race where state.jsonl doesn't yet exist.
-		if linesRead == 0 {
-			if next, stop := backoffStep(ctx, &attempt, &backoff, maxAttempts, maxBackoff); stop {
-				slog.Error("state stream produced no lines after retries",
-					"lastOffset", lastOffset)
-				return lastOffset, fmt.Errorf("state stream produced no lines after %d attempts", maxAttempts)
-			} else if next != nil {
-				return lastOffset, next
-			}
-		}
-	}
-}
-
-// backoffStep applies one step of bounded exponential backoff against attempt
-// and *backoff. Returns (nil, true) when maxAttempts is reached, (ctxErr,
-// false) on ctx-cancel during the sleep, (nil, false) otherwise. Mutates
-// *attempt and *backoff in place.
-func backoffStep(ctx context.Context, attempt *int, backoff *time.Duration, maxAttempts int, maxBackoff time.Duration) (error, bool) {
-	*attempt++
-	if *attempt >= maxAttempts {
-		return nil, true
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err(), false
-	case <-time.After(*backoff):
-	}
-	if *backoff < maxBackoff {
-		*backoff *= 2
-		if *backoff > maxBackoff {
-			*backoff = maxBackoff
-		}
-	}
-	return nil, false
-}
-
-// drainStateFile performs a single best-effort one-shot read of any state
-// events written to /shim/state.jsonl after the streaming tail's last
-// observed line. Errors are logged at warn and not returned: by the time we
-// drain, the runner container may already be terminated.
-func drainStateFile(ctx context.Context, executor PodExecutor, namespace, podName string, rep *reporter.Reporter, lastOffset int) {
-	if err := ctx.Err(); err != nil {
-		slog.Warn("post-exit state drain skipped: ctx already canceled",
-			"err", err, "lastOffset", lastOffset)
-		return
-	}
-
-	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	cmd := []string{"/shim/entrypoint", "tail", "--once",
-		"--skip", strconv.Itoa(lastOffset),
-		"/shim/state.jsonl"}
-	stream, err := executor.ExecStream(drainCtx, namespace, podName, "runner", cmd)
+// streamStateFileWith reads state events from the state-agent sidecar's
+// stdout (via the kubelet log endpoint) and routes each newline-terminated
+// state event into rep. The state-agent runs `/shim/entrypoint tail
+// /shim/state.jsonl` for the lifetime of the pod and emits each line on
+// stdout; we just consume that stream.
+//
+// Why logs instead of exec:
+//   - The log endpoint is buffered by the kubelet, so events emitted right
+//     before a container exits are still readable afterwards — no race
+//     between the runner finishing and our reader catching up. This is
+//     specifically the bug 026 fix.
+//   - One reader, no reconnect logic, no exec-into-dying-container failure
+//     mode. We were doing it ourselves for exec; the kubelet already
+//     handles it for logs.
+//   - The agent is a native sidecar (RestartPolicy=Always on an init
+//     container, k8s 1.29+), so it stays alive until termination signal
+//     after the runner exits.
+//
+// Returns the count of newline-terminated lines successfully processed
+// (whether routed or skipped as malformed) — kept on the signature
+// for symmetry with the previous exec-based version, even though the
+// reconnect path no longer needs it.
+func streamStateFileWith(ctx context.Context, streamer LogStreamer, namespace, podName string, rep *reporter.Reporter) (int, error) {
+	stream, err := streamer.StreamLogs(ctx, namespace, podName, "state-agent")
 	if err != nil {
-		slog.Warn("post-exit state drain exec failed",
-			"err", err, "lastOffset", lastOffset, "pod", podName)
-		return
+		return 0, fmt.Errorf("opening state-agent log stream: %w", err)
 	}
 	defer stream.Close()
 
+	lastOffset := 0
 	reader := bufio.NewReader(stream)
 	for {
 		line, rErr := reader.ReadString('\n')
 		if rErr == nil && len(line) > 0 {
 			trimmed := strings.TrimRight(line, "\n\r")
 			if trimmed == "" {
+				lastOffset++
 				continue
 			}
 			var ev types.StateEvent
 			if jErr := json.Unmarshal([]byte(trimmed), &ev); jErr != nil {
 				slog.Debug("skipping malformed state event",
 					"line", trimmed, "err", jErr)
+				lastOffset++
 				continue
 			}
 			routeStateEvent(ev, rep)
+			lastOffset++
 			continue
 		}
-		if rErr != io.EOF {
-			slog.Warn("post-exit state drain stream error",
-				"err", rErr, "lastOffset", lastOffset)
+		if errors.Is(rErr, io.EOF) {
+			return lastOffset, nil
 		}
-		return
+		if errors.Is(rErr, context.Canceled) ||
+			errors.Is(rErr, context.DeadlineExceeded) {
+			return lastOffset, rErr
+		}
+		return lastOffset, rErr
 	}
 }
 

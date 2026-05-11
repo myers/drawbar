@@ -1,6 +1,11 @@
 # Step `end` event from entrypoint not reaching the reporter
 
-**Status: open, surfaced 2026-05-11.** Split out from bug 025
+**Status: fixed 2026-05-11** by introducing a `state-agent` native
+sidecar that owns `entrypoint tail` and stream the events via the
+kubelet log endpoint (which buffers post-exit). See Resolution
+section at the bottom.
+
+**Earlier status: open, surfaced 2026-05-11.** Split out from bug 025
 investigation. Drawbar reports a successfully-completed step as
 `Result=CANCELLED` to the forge because `Close()`'s defensive
 UNSPECIFIED→CANCELLED rewrite fires — i.e. the watcher never
@@ -224,3 +229,57 @@ masking 1.26.1 renderer.
 - Bug 023: post-exit drain race (different framing, may be the
   same root cause).
 - Bug 025: where this was found. Upstream gitea bug, separate.
+
+## Resolution (2026-05-11)
+
+Adopted fix option (a) — sidecar — sketched in `TODO_REFACTOR.md`,
+plus the realization that we don't need to exec into the sidecar
+at all: the kubelet log endpoint already buffers content
+post-exit. The implementation:
+
+1. **`pkg/k8s/builder.go::BuildJob`** adds a native sidecar
+   (init container with `RestartPolicy: Always`, k8s 1.29+)
+   named `state-agent`. It runs the existing
+   `/shim/entrypoint tail /shim/state.jsonl` against the shared
+   `/shim` emptyDir. `setup-shim` now `touch /shim/state.jsonl`
+   so the agent can `os.Open` it without racing the runner's
+   first write.
+2. **`cmd/entrypoint/main.go`** wires `signal.NotifyContext` for
+   SIGINT/SIGTERM in the `tail` subcommand so the kubelet's
+   graceful shutdown signal cancels `runTail` cleanly.
+3. **`pkg/k8s/watcher.go::streamStateFileWith`** rewritten: no
+   more long-lived exec + reconnect loop. It now opens a single
+   log-stream against the `state-agent` container (`Follow: true`)
+   and routes each line through EOF. The kubelet buffers events
+   the agent emitted right before exit, so the live stream
+   naturally reads trailing events through EOF.
+4. **`drainStateFile` removed** — the live log stream reads
+   buffered post-exit content directly, so a separate one-shot
+   drain step is no longer needed.
+5. **`backoffStep` removed** — only `streamStateFileWith` used
+   it, and the log-stream version doesn't need retries.
+
+End-to-end verified against the patched gitea
+(`k3d-k3d-registry:5111/gitea-patched:601c6eb`, which contains
+the bug 025 renderer fix):
+
+| signal | pre-fix (`909daf1`) | post-fix |
+|---|---|---|
+| controller log: `step started` | absent | present |
+| controller log: `step completed` | absent | present |
+| reporter flushState (terminal) `steps` | `0=CANCELLED` | `0=SUCCESS` |
+| gitea API step `conclusion` | `cancelled` | `success` |
+| gitea API step `started_at` | 1970-01-01 epoch | wall-clock time |
+| gitea API step `completed_at` | 1970-01-01 epoch | wall-clock time |
+
+Note this fix also obviates the `Close()` defensive
+UNSPECIFIED→CANCELLED rewrite in `pkg/reporter/reporter.go` for
+healthy runs — by the time `Close` fires, every step's `Result`
+has been routed correctly. The rewrite still matters for genuinely
+incomplete steps (job-level failure with later steps unreached)
+where the runner exits before emitting those steps' `end` events.
+
+This is the seed of the broader state-plane architecture sketched
+in `TODO_REFACTOR.md`. Today the agent does nothing but tail a
+file; over time it can absorb log streaming, workflow command
+parsing, and secret masking — each migration is decoupled.

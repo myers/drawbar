@@ -603,58 +603,58 @@ func (r *recordingExecutor) callAt(i int) []string {
 	return r.calls[i]
 }
 
+// recordingLogStreamer serves a single canned output string from
+// StreamLogs and records which container was asked for. Used by the
+// state-stream-via-logs tests (bug 026 refactor).
+type recordingLogStreamer struct {
+	mu        sync.Mutex
+	calls     []string // container names requested
+	output    string
+	err       error
+}
+
+func (r *recordingLogStreamer) StreamLogs(_ context.Context, _, _, container string) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, container)
+	if r.err != nil {
+		return nil, r.err
+	}
+	return io.NopCloser(strings.NewReader(r.output)), nil
+}
+
+func (r *recordingLogStreamer) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *recordingLogStreamer) callAt(i int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[i]
+}
+
 func TestStreamStateFile_RoutesAllEvents(t *testing.T) {
 	rep := newTestReporter(1, 3)
 	jsonl := `{"event":"start","step":0,"name":"checkout","time":"2026-05-06T14:35:54Z"}
 {"event":"end","step":0,"name":"checkout","exit_code":0,"time":"2026-05-06T14:35:58Z"}
 {"event":"start","step":1,"name":"build","time":"2026-05-06T14:35:58Z"}
 `
-	exec := &recordingExecutor{outputs: []string{jsonl}}
+	streamer := &recordingLogStreamer{output: jsonl}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		// Once exec returns the stream EOF, the function will try to reconnect.
-		// Cancel ctx after a short pause to break it out of the retry loop.
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-
-	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	off, err := streamStateFileWith(context.Background(), streamer, "ns", "pod", rep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if off != 3 {
 		t.Errorf("offset = %d, want 3", off)
 	}
-	// The first call should NOT carry --skip > 0 (skip starts at 0).
-	if got := findFlagValue(exec.callAt(0), "--skip"); got != "0" && got != "" {
-		t.Errorf("first call --skip = %q, want \"0\" or absent", got)
+	if streamer.callCount() != 1 {
+		t.Errorf("call count = %d, want 1 (one log-stream open)", streamer.callCount())
 	}
-}
-
-func TestStreamStateFile_ReconnectAfterError(t *testing.T) {
-	rep := newTestReporter(1, 5)
-	first := `{"event":"start","step":0,"name":"a","time":"t"}
-{"event":"end","step":0,"name":"a","exit_code":0,"time":"t"}
-{"event":"start","step":1,"name":"b","time":"t"}
-`
-	// After 3 routed events, EOF triggers reconnect. Second call returns more.
-	second := `{"event":"end","step":1,"name":"b","exit_code":0,"time":"t"}
-`
-	exec := &recordingExecutor{outputs: []string{first, second}}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
-
-	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
-	if off != 4 {
-		t.Errorf("offset = %d, want 4", off)
-	}
-	if exec.callCount() < 2 {
-		t.Fatalf("expected >= 2 calls, got %d", exec.callCount())
-	}
-	if got := findFlagValue(exec.callAt(1), "--skip"); got != "3" {
-		t.Errorf("second call --skip = %q, want \"3\"", got)
+	if got := streamer.callAt(0); got != "state-agent" {
+		t.Errorf("called container = %q, want state-agent", got)
 	}
 }
 
@@ -663,131 +663,31 @@ func TestStreamStateFile_MalformedLineSkipped(t *testing.T) {
 	jsonl := `{not json}
 {"event":"start","step":0,"name":"a","time":"t"}
 `
-	exec := &recordingExecutor{outputs: []string{jsonl}}
+	streamer := &recordingLogStreamer{output: jsonl}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-
-	off, _ := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	off, err := streamStateFileWith(context.Background(), streamer, "ns", "pod", rep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if off != 2 {
 		t.Errorf("offset = %d, want 2 (both lines counted)", off)
 	}
 }
 
-func TestStreamStateFile_MaxRetries(t *testing.T) {
+func TestStreamStateFile_OpenError(t *testing.T) {
+	// If StreamLogs returns an error (e.g. state-agent container not
+	// yet ready), the function returns the wrapped error without
+	// crashing. The watcher's outer retry/wait logic handles
+	// recovery; we just surface the failure.
 	rep := newTestReporter(1, 0)
-	exec := &recordingExecutor{
-		errs: []error{
-			fmt.Errorf("boom1"),
-			fmt.Errorf("boom2"),
-			fmt.Errorf("boom3"),
-			fmt.Errorf("boom4"),
-			fmt.Errorf("boom5"),
-		},
-	}
+	streamer := &recordingLogStreamer{err: fmt.Errorf("container not running")}
 
-	ctx := context.Background()
-	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
+	off, err := streamStateFileWith(context.Background(), streamer, "ns", "pod", rep)
 	if err == nil {
-		t.Errorf("expected error after max retries")
+		t.Errorf("expected error, got nil")
 	}
 	if off != 0 {
 		t.Errorf("offset = %d, want 0", off)
-	}
-	if exec.callCount() != 5 {
-		t.Errorf("call count = %d, want 5", exec.callCount())
-	}
-}
-
-func TestDrainStateFile_RoutesEvents(t *testing.T) {
-	rep := newTestReporter(1, 2)
-	jsonl := `{"event":"end","step":0,"name":"a","exit_code":0,"time":"t"}
-{"event":"end","step":1,"name":"b","exit_code":1,"time":"t"}
-`
-	exec := &recordingExecutor{outputs: []string{jsonl}}
-
-	drainStateFile(context.Background(), exec, "ns", "pod", rep, 3)
-
-	if exec.callCount() != 1 {
-		t.Errorf("call count = %d, want 1", exec.callCount())
-	}
-	cmd := exec.callAt(0)
-	if findFlagValue(cmd, "--skip") != "3" {
-		t.Errorf("--skip = %q, want \"3\"", findFlagValue(cmd, "--skip"))
-	}
-	hasOnce := false
-	for _, a := range cmd {
-		if a == "--once" {
-			hasOnce = true
-		}
-	}
-	if !hasOnce {
-		t.Errorf("drain command missing --once flag: %v", cmd)
-	}
-}
-
-func TestDrainStateFile_TerminatedContainer(t *testing.T) {
-	rep := newTestReporter(1, 1)
-	exec := &recordingExecutor{errs: []error{fmt.Errorf("container terminated")}}
-
-	// Should not panic, should not block; just log a warning and return.
-	drainStateFile(context.Background(), exec, "ns", "pod", rep, 0)
-}
-
-func TestStreamStateFile_ImmediateEOFAppliesBackoff(t *testing.T) {
-	// When ExecStream succeeds but the returned stream EOFs immediately
-	// (e.g. entrypoint tail finds /shim/state.jsonl missing during the
-	// startup race and exits 1), the loop must NOT busy-reconnect.
-	// Empty outputs (zero lines) trigger this case 5 times in a row;
-	// after 5 fruitless attempts the function should return.
-	rep := newTestReporter(1, 0)
-	exec := &recordingExecutor{
-		outputs: []string{"", "", "", "", ""},
-	}
-
-	ctx := context.Background()
-	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
-	if err == nil {
-		t.Errorf("expected error after 5 unproductive streams")
-	}
-	if off != 0 {
-		t.Errorf("offset = %d, want 0", off)
-	}
-	if exec.callCount() != 5 {
-		t.Errorf("call count = %d, want 5", exec.callCount())
-	}
-}
-
-func TestStreamStateFile_ProductiveStreamResetsAttempts(t *testing.T) {
-	// A stream that delivers at least one line should reset the attempt
-	// counter, so subsequent unproductive cycles get their own retry budget.
-	// Sequence: 4 unproductive, 1 productive (1 line), 5 unproductive.
-	// Without the gate-on-routed fix, the 4 unproductive at the start would
-	// run away. With the fix, attempt accumulates to 4, productive resets it
-	// to 0, then the next 5 unproductive trip the cap.
-	rep := newTestReporter(1, 1)
-	productive := `{"event":"start","step":0,"name":"a","time":"t"}` + "\n"
-	exec := &recordingExecutor{
-		outputs: []string{
-			"", "", "", "",
-			productive,
-			"", "", "", "", "",
-		},
-	}
-
-	ctx := context.Background()
-	off, err := streamStateFileWith(ctx, exec, "ns", "pod", rep)
-	if err == nil {
-		t.Errorf("expected error after final unproductive run")
-	}
-	if off != 1 {
-		t.Errorf("offset = %d, want 1 (one productive line)", off)
-	}
-	if exec.callCount() != 10 {
-		t.Errorf("call count = %d, want 10", exec.callCount())
 	}
 }
 

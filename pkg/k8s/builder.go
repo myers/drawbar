@@ -190,8 +190,12 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 	}
 	delimiter := "MANIFEST_" + hex.EncodeToString(delimBytes)
 
+	// `touch /shim/state.jsonl` so the state-agent sidecar can `os.Open`
+	// it without racing the runner container's first write. The file is
+	// guaranteed to exist for both subsequent containers.
 	setupCmd := fmt.Sprintf(
 		"cp /entrypoint /shim/entrypoint && chmod +x /shim/entrypoint && "+
+			"touch /shim/state.jsonl && "+
 			"cat > /shim/manifest.json << '%s'\n%s\n%s\n"+
 			"exec /shim/entrypoint setup /shim/manifest.json",
 		delimiter, string(manifestJSON), delimiter)
@@ -205,6 +209,28 @@ func BuildJob(cfg JobConfig) (*batchv1.Job, error) {
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "shim", MountPath: "/shim"},
 			{Name: "actions", MountPath: "/actions"},
+		},
+	})
+
+	// 4. State-agent sidecar (native sidecar via RestartPolicy=Always on
+	// an init container, k8s 1.29+). Tails /shim/state.jsonl so the
+	// controller can read lifecycle events even after the runner
+	// container exits — solves bug 026 where the runner's container
+	// SIGKILL'd the tail process before its trailing bytes were read.
+	// Starts after setup-shim (which touches /shim/state.jsonl so this
+	// container can os.Open it without racing), runs for the lifetime
+	// of the pod, and is sent SIGTERM by the kubelet after the main
+	// runner container exits — runTail returns on ctx cancel, exiting
+	// the agent cleanly. See TODO_REFACTOR.md for the broader plan
+	// this is the seed of.
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "state-agent",
+		Image:           controllerImage,
+		RestartPolicy:   ptr.To(corev1.ContainerRestartPolicyAlways),
+		Command:         []string{"/shim/entrypoint", "tail", "/shim/state.jsonl"},
+		SecurityContext: containerSecurity,
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "shim", MountPath: "/shim"},
 		},
 	})
 

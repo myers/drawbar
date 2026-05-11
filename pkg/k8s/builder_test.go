@@ -32,11 +32,17 @@ func TestBuildJob_SingleContainer(t *testing.T) {
 	assert.Equal(t, "drawbar", job.Namespace)
 	assert.Equal(t, "drawbar", job.Labels["app.kubernetes.io/managed-by"])
 
-	// Init containers: just setup-shim (no step init containers anymore).
+	// Init containers: setup-shim then state-agent (native sidecar).
 	initCs := job.Spec.Template.Spec.InitContainers
-	require.Len(t, initCs, 1)
+	require.Len(t, initCs, 2)
 	assert.Equal(t, "setup-shim", initCs[0].Name)
 	assert.Equal(t, "ghcr.io/myers/drawbar:latest", initCs[0].Image)
+	assert.Equal(t, "state-agent", initCs[1].Name)
+	assert.Equal(t, "ghcr.io/myers/drawbar:latest", initCs[1].Image)
+	require.NotNil(t, initCs[1].RestartPolicy)
+	assert.Equal(t, corev1.ContainerRestartPolicyAlways, *initCs[1].RestartPolicy,
+		"state-agent must be a native sidecar (RestartPolicy=Always)")
+	assert.Equal(t, []string{"/shim/entrypoint", "tail", "/shim/state.jsonl"}, initCs[1].Command)
 
 	// Main container: runner.
 	containers := job.Spec.Template.Spec.Containers
@@ -74,8 +80,8 @@ func TestBuildJob_WithServices(t *testing.T) {
 	require.NoError(t, err)
 
 	initCs := job.Spec.Template.Spec.InitContainers
-	// svc-postgres (sidecar) + wait-for-services + setup-shim
-	require.Len(t, initCs, 3)
+	// svc-postgres (sidecar) + wait-for-services + setup-shim + state-agent (sidecar)
+	require.Len(t, initCs, 4)
 
 	assert.Equal(t, "svc-postgres", initCs[0].Name)
 	require.NotNil(t, initCs[0].RestartPolicy)
@@ -83,6 +89,9 @@ func TestBuildJob_WithServices(t *testing.T) {
 
 	assert.Equal(t, "wait-for-services", initCs[1].Name)
 	assert.Equal(t, "setup-shim", initCs[2].Name)
+	assert.Equal(t, "state-agent", initCs[3].Name)
+	require.NotNil(t, initCs[3].RestartPolicy)
+	assert.Equal(t, corev1.ContainerRestartPolicyAlways, *initCs[3].RestartPolicy)
 }
 
 func TestBuildJob_ActionsEmptyDirAndManifestActions(t *testing.T) {
@@ -264,8 +273,8 @@ func TestBuildJob_ServiceSecurityOverride(t *testing.T) {
 	require.NoError(t, err)
 
 	initCs := job.Spec.Template.Spec.InitContainers
-	// svc-buildkit + wait-for-services + setup-shim
-	require.Len(t, initCs, 3)
+	// svc-buildkit + wait-for-services + setup-shim + state-agent
+	require.Len(t, initCs, 4)
 
 	// Sidecar should have the custom SecurityContext with unconfined seccomp.
 	sidecar := initCs[0]
