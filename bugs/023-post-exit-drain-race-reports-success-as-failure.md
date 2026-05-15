@@ -1,6 +1,18 @@
 # Post-exit log drain races container teardown, reports success as failure
 
-**Status: fixed 2026-05-07.** Surfaced 2026-05-07 during capacity-2 shakedown of
+**Status: fixed 2026-05-07; drain-side root cause fully eliminated
+2026-05-15 by bug 026.** The 2026-05-07 fix (wait for
+`State.Terminated` on both log-stream exit paths) stopped the
+*misreported-failure* symptom. But the underlying "post-exit
+drain exec races the dying container" mechanism — fix sketch (2)
+in this doc, explicitly deferred — was only removed by **bug
+026's** state-agent sidecar. State events now stream via the
+kubelet log endpoint (buffered post-exit), so there is no
+post-exit exec drain to race at all. `drainStateFile` and its
+`container not found` warning are deleted. See bug 026's
+Resolution section.
+
+Surfaced 2026-05-07 during capacity-2 shakedown of
 image `main-1778113050-2e31ce18`. When a runner pod's container exits
 cleanly (exitCode 0), drawbar's post-exit log-drain path attempts to
 upgrade an exec connection to the (now-terminated) container, gets
@@ -232,3 +244,21 @@ Regression test: `TestWatchJobWith_EOFWaitsForTerminationStatus` in
 `pkg/k8s/watcher_test.go` reproduces the kubelet-status-update race
 with a fake clientset and exec executor that returns the literal
 "unable to upgrade connection: container not found" string.
+
+### Follow-up: fix sketch (2) delivered by bug 026 (2026-05-15)
+
+The "future work" above is done. Bug 026's state-agent native
+sidecar moved state-event streaming entirely onto the kubelet log
+endpoint (`Follow: true`), which buffers content from terminated
+containers. There is no longer a post-exit exec drain:
+`drainStateFile` and `backoffStep` were deleted, and the
+`post-exit state drain stream error` / `container not found`
+WARN this bug centred on can no longer occur. The trailing state
+events that this Resolution noted "can be missed" are now read
+through EOF from the log buffer.
+
+The 2026-05-07 `State.Terminated` wait stays — it still guards
+`getContainerResult` against the kubelet pod-status-update lag on
+the result-reporting path, which is orthogonal to the drain
+mechanism. Both fixes are load-bearing; neither supersedes the
+other.

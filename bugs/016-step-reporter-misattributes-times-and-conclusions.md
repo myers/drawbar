@@ -1,18 +1,38 @@
 # Step reporter mis-attributes start/end times and conclusion across sequential steps
 
-**Status: fixed-in-part 2026-05-06** in commits `97cfb9f..345fe58`
-(state streaming refactor). The streaming fix addressed the
-lost-trailing-event symptoms — zero durations and mis-attributed
-`started_at`. The remaining symptom from this doc — every step
-reporting `conclusion=failure` when only later steps actually
-failed — was confirmed *still present* by the test-cluster agent
-on image `1a88d9d` (2026-05-09) and has been split out to
-**bug 025**
-(`bugs/025-step-result-fallback-to-job-conclusion.md`).
+**Status: fully resolved 2026-05-15.** The two symptoms in this
+doc split into two independent root causes, both now closed:
 
-See the Resolution section at the bottom of this doc and
+1. **Lost trailing events → zero durations, mis-attributed
+   `started_at`.** First addressed by the 2026-05-06 streaming
+   refactor (`97cfb9f..345fe58`), which reduced but did not
+   eliminate the lifecycle dependency — see **bug 026**. The
+   streaming-tail-via-exec model still raced the runner
+   container's SIGKILL. **Bug 026's fix** (state-agent native
+   sidecar streaming via the kubelet log endpoint, commit on
+   2026-05-15) is the actual cure: the kubelet buffers the
+   trailing events post-exit, so durations and timestamps are
+   now correct end-to-end. Verified against patched gitea.
+
+2. **Every step reporting `conclusion=failure` when only later
+   steps failed.** Split out to **bug 025**. Root cause was
+   *not* drawbar — it was upstream gitea bug
+   [#37592](https://github.com/go-gitea/gitea/pull/37592):
+   `ToActionWorkflowJob` rendered every step's conclusion from
+   `job.Status` instead of `step.Status`. Fixed upstream
+   2026-05-07 (commit `601c6eb`), not yet in a gitea release.
+   Drawbar's per-step Results were correct on the wire the
+   whole time.
+
+So the original "drawbar's reporting layer is loose" framing
+was half right: the timing/duration half was a real drawbar
+lifecycle bug (026), the conclusion half was a gitea renderer
+bug (025). See those docs for specifics.
+
+Historical detail below preserved for context. The Resolution
+section at the bottom describes the 2026-05-06 partial fix;
 `docs/superpowers/specs/2026-05-06-step-state-streaming-design.md`
-for what this fix did cover.
+has that design. The definitive fix is in bug 026.
 
 Surfaced 2026-05-06 while shaking down image
 `main-1778069066-4cb729d9` (the bug 014/015 fix). Drawbar is reporting
